@@ -72,6 +72,13 @@ def init_db():
             error           TEXT,
             error_category  TEXT         -- network / account / unknown
         );
+
+        CREATE TABLE IF NOT EXISTS proxy_usage (
+            proxy           TEXT PRIMARY KEY,
+            used_count      INTEGER NOT NULL DEFAULT 0,
+            last_used_at    REAL,
+            created_at      REAL DEFAULT (strftime('%s', 'now'))
+        );
     """)
     con.commit()
     # 老 DB migrate：error_category 在后期才加，对已建表补列
@@ -99,7 +106,7 @@ def parse_lines(text: str) -> list[dict]:
         if "@" not in email or len(refresh) < 20:
             continue
         out.append({
-            "email": email.lower(),
+            "email": email,
             "password": password,
             "client_id": client_id,
             "refresh_token": refresh,
@@ -107,9 +114,11 @@ def parse_lines(text: str) -> list[dict]:
     return out
 
 
-def import_accounts(text: str) -> dict:
-    """批量入库。已存在的 email 仅在 refresh_token 不同时更新。"""
-    rows = parse_lines(text)
+def import_accounts(rows: list[dict]) -> dict:
+    """批量入库。已存在的 email 仅在 refresh_token 不同时更新。
+
+    调用方负责 email 规范化（如需小写请在外部完成）。
+    """
     now = time.time()
     inserted = updated = skipped = 0
     with _lock:
@@ -157,7 +166,7 @@ def list_accounts(status: str = "", limit: int = 500) -> list[dict]:
 
 def get_account(email: str) -> Optional[dict]:
     con = _conn()
-    cur = con.execute("SELECT * FROM outlook_accounts WHERE email=?", (email.lower(),))
+    cur = con.execute("SELECT * FROM outlook_accounts WHERE email=?", (email,))
     row = cur.fetchone()
     return dict(row) if row else None
 
@@ -167,8 +176,9 @@ def claim_account(email: str) -> Optional[dict]:
 
     failed 也允许重试 claim：之前 OpenAI 风控误判 / 网络抖动等导致 fail 的号
     应允许用户手动重试，已 done 的号才禁止重 claim（防误覆盖凭证）。
+    调用方负责 email 规范化。
     """
-    email = (email or "").strip().lower()
+    email = (email or "").strip()
     if not email:
         return None
     with _lock:
@@ -218,7 +228,7 @@ def mark_done(email: str) -> None:
         con = _conn()
         con.execute(
             "UPDATE outlook_accounts SET status='done', finished_at=?, fail_reason=NULL WHERE email=?",
-            (time.time(), email.lower()),
+            (time.time(), email),
         )
         con.commit()
 
@@ -228,7 +238,7 @@ def mark_failed(email: str, reason: str = "") -> None:
         con = _conn()
         con.execute(
             "UPDATE outlook_accounts SET status='failed', finished_at=?, fail_reason=? WHERE email=?",
-            (time.time(), (reason or "")[:500], email.lower()),
+            (time.time(), (reason or "")[:500], email),
         )
         con.commit()
 
@@ -240,7 +250,7 @@ def release_unused(email: str) -> None:
         con.execute(
             "UPDATE outlook_accounts SET status='available', claimed_at=NULL "
             "WHERE email=? AND status='in_use'",
-            (email.lower(),),
+            (email,),
         )
         con.commit()
 
@@ -249,13 +259,14 @@ def reset_to_available(email: str) -> bool:
     """手动重置单个号：done / failed → available，清空时间戳和失败原因。
 
     场景：注册成功但 refresh_token 没拿到，主人想重新跑一遍这个号。
+    调用方负责 email 规范化。
     """
     with _lock:
         con = _conn()
         rc = con.execute(
             "UPDATE outlook_accounts SET status='available', claimed_at=NULL, "
             "finished_at=NULL, fail_reason=NULL "
-            "WHERE lower(email)=lower(?)",
+            "WHERE email=?",
             (email,),
         )
         con.commit()
@@ -263,7 +274,10 @@ def reset_to_available(email: str) -> bool:
 
 
 def bulk_reset_to_available(emails: list[str]) -> int:
-    """批量重置多个号。返回实际被改的行数。"""
+    """批量重置多个号。返回实际被改的行数。
+
+    调用方负责 email 规范化。
+    """
     if not emails:
         return 0
     with _lock:
@@ -271,7 +285,7 @@ def bulk_reset_to_available(emails: list[str]) -> int:
         rc = con.execute(
             f"UPDATE outlook_accounts SET status='available', claimed_at=NULL, "
             f"finished_at=NULL, fail_reason=NULL "
-            f"WHERE lower(email) IN ({','.join(['lower(?)'] * len(emails))})",
+            f"WHERE email IN ({','.join(['?'] * len(emails))})",
             emails,
         )
         con.commit()
@@ -313,7 +327,7 @@ def release_stale_in_use(stale_seconds: float = 1800) -> int:
 def delete_account(email: str) -> bool:
     with _lock:
         con = _conn()
-        rc = con.execute("DELETE FROM outlook_accounts WHERE email=?", (email.lower(),))
+        rc = con.execute("DELETE FROM outlook_accounts WHERE email=?", (email,))
         con.commit()
         return rc.rowcount > 0
 
@@ -336,8 +350,11 @@ def delete_accounts_by_status(status: str) -> int:
 
 
 def delete_accounts_by_emails(emails: list[str]) -> int:
-    """按 email 列表批量删除。返回受影响行数。"""
-    cleaned = [e.strip().lower() for e in (emails or []) if e and e.strip()]
+    """按 email 列表批量删除。返回受影响行数。
+
+    调用方负责 email 规范化。
+    """
+    cleaned = [e.strip() for e in (emails or []) if e and e.strip()]
     if not cleaned:
         return 0
     with _lock:
@@ -371,8 +388,9 @@ def save_registered(d: dict) -> None:
 
     凭证三件套（access_token / session_token / refresh_token）单独存列；
     其余字段（如 device_id / cookie_header / id_token / 自定义元数据）打包进 extra_json。
+    调用方负责 email 规范化（OEP 等需要保留原始大小写的场景可直接传入原值）。
     """
-    email = (d.get("email") or "").lower()
+    email = (d.get("email") or "")
     if not email:
         return
     extra = {k: v for k, v in d.items() if k not in {
@@ -437,7 +455,7 @@ def list_registered_full(limit: int = 5000) -> list[dict]:
 
 def get_registered(email: str) -> Optional[dict]:
     con = _conn()
-    cur = con.execute("SELECT * FROM registered WHERE email=?", (email.lower(),))
+    cur = con.execute("SELECT * FROM registered WHERE email=?", (email,))
     row = cur.fetchone()
     if not row:
         return None
@@ -454,13 +472,17 @@ def get_registered(email: str) -> Optional[dict]:
 def delete_registered(email: str) -> bool:
     with _lock:
         con = _conn()
-        rc = con.execute("DELETE FROM registered WHERE email=?", (email.lower(),))
+        rc = con.execute("DELETE FROM registered WHERE email=?", (email,))
         con.commit()
         return rc.rowcount > 0
 
 
 def delete_registered_by_emails(emails: list[str]) -> int:
-    cleaned = [e.strip().lower() for e in (emails or []) if e and e.strip()]
+    """按 email 列表批量删除已注册记录。返回受影响行数。
+
+    调用方负责 email 规范化。
+    """
+    cleaned = [e.strip() for e in (emails or []) if e and e.strip()]
     if not cleaned:
         return 0
     with _lock:
@@ -491,7 +513,7 @@ def create_run(run_id: str, email: str, log_path: str) -> None:
         con.execute(
             "INSERT INTO runs(run_id, email, status, started_at, log_path) "
             "VALUES (?, ?, 'running', ?, ?)",
-            (run_id, email.lower(), time.time(), log_path),
+            (run_id, email, time.time(), log_path),
         )
         con.commit()
 
@@ -502,6 +524,23 @@ def finish_run(run_id: str, status: str, error: str = "", category: str = "") ->
         con.execute(
             "UPDATE runs SET status=?, finished_at=?, error=?, error_category=? WHERE run_id=?",
             (status, time.time(), (error or "")[:500], category or None, run_id),
+        )
+        con.commit()
+
+
+def update_run_email(run_id: str, email: str) -> None:
+    """CF / OEP 等无号池模式：claim 后把 runs.email 从占位符换成真实邮箱。
+
+    调用方负责 email 规范化（OEP 需要保留原始大小写时直接传入原值）。
+    """
+    email = (email or "").strip()
+    if not email or "@" not in email:
+        return
+    with _lock:
+        con = _conn()
+        con.execute(
+            "UPDATE runs SET email=? WHERE run_id=?",
+            (email, run_id),
         )
         con.commit()
 
@@ -539,20 +578,25 @@ def set_setting(key: str, value) -> None:
 
 
 def get_mail_config() -> dict:
-    """返回邮箱来源配置（admin_token 隐藏明文）。"""
+    """返回邮箱来源配置（敏感字段隐藏明文）。"""
     return {
-        "mail_source":   get_setting("mail_source", "outlook"),  # outlook / cf_temp
+        "mail_source":   get_setting("mail_source", "outlook"),  # outlook / cf_temp / oep
         "cf_api_url":    get_setting("cf_api_url", ""),
         "cf_admin_token": "***" if get_setting("cf_admin_token") else "",
         "cf_domain":     get_setting("cf_domain", ""),
+        # OutlookEmailPlus 平台接码
+        "oep_api_url":   get_setting("oep_api_url", ""),
+        "oep_api_key":   "***" if get_setting("oep_api_key") else "",
+        "oep_project_key": get_setting("oep_project_key", ""),
+        "oep_caller_id": get_setting("oep_caller_id", "gpt-outlook-register"),
     }
 
 
 def save_mail_config(data: dict) -> None:
-    """保存邮箱配置。admin_token 传 '***' 表示不修改。"""
+    """保存邮箱配置。敏感字段传 '***' 表示不修改。"""
     if "mail_source" in data:
         src = str(data["mail_source"]).strip().lower()
-        if src not in ("outlook", "cf_temp"):
+        if src not in ("outlook", "cf_temp", "oep"):
             src = "outlook"
         set_setting("mail_source", src)
     if "cf_api_url" in data:
@@ -561,11 +605,140 @@ def save_mail_config(data: dict) -> None:
         set_setting("cf_domain", str(data["cf_domain"]).strip())
     if data.get("cf_admin_token") and data["cf_admin_token"] != "***":
         set_setting("cf_admin_token", str(data["cf_admin_token"]).strip())
+    # OEP
+    if "oep_api_url" in data:
+        set_setting("oep_api_url", str(data["oep_api_url"]).strip())
+    if "oep_project_key" in data:
+        set_setting("oep_project_key", str(data["oep_project_key"]).strip())
+    if "oep_caller_id" in data:
+        set_setting("oep_caller_id", str(data["oep_caller_id"]).strip())
+    if data.get("oep_api_key") and data["oep_api_key"] != "***":
+        set_setting("oep_api_key", str(data["oep_api_key"]).strip())
 
 
 def get_cf_admin_token() -> str:
     """内部用：拿明文 admin_token。"""
     return get_setting("cf_admin_token", "")
+
+
+def get_oep_api_key() -> str:
+    """内部用：拿 OEP 平台明文 api_key。"""
+    return get_setting("oep_api_key", "")
+
+
+# ──────────────────────── 代理配置 ────────────────────────
+
+
+def get_proxy_config() -> dict:
+    """返回代理配置（含代理池 + 轮换设置 + 使用上限）。"""
+    return {
+        "proxy":             get_setting("proxy", ""),
+        "proxy_pool":        get_setting("proxy_pool", ""),
+        "auto_rotate_proxy": get_setting("auto_rotate_proxy", "1"),
+        "rotate_proxy_every": get_setting("rotate_proxy_every", "5"),
+        "proxy_max_uses":    get_setting("proxy_max_uses", str(DEFAULT_PROXY_MAX_USES)),
+    }
+
+
+def save_proxy_config(data: dict) -> None:
+    """保存代理配置。"""
+    if "proxy" in data:
+        set_setting("proxy", str(data["proxy"] or "").strip())
+    if "proxy_pool" in data:
+        set_setting("proxy_pool", str(data["proxy_pool"] or "").strip())
+    if "auto_rotate_proxy" in data:
+        set_setting("auto_rotate_proxy", "1" if data["auto_rotate_proxy"] else "0")
+    if "rotate_proxy_every" in data:
+        set_setting("rotate_proxy_every", str(int(data.get("rotate_proxy_every", 5))))
+    if "proxy_max_uses" in data:
+        set_setting("proxy_max_uses", str(max(1, int(data.get("proxy_max_uses", DEFAULT_PROXY_MAX_USES)))))
+
+
+# ──────────────────────── 代理使用统计 ────────────────────────
+
+
+DEFAULT_PROXY_MAX_USES = 10
+
+
+def _default_proxy_max_uses() -> int:
+    """读取前端配置的默认代理使用上限。"""
+    try:
+        return max(1, int(get_setting("proxy_max_uses", str(DEFAULT_PROXY_MAX_USES))))
+    except Exception:
+        return DEFAULT_PROXY_MAX_USES
+
+
+def get_proxy_usage(proxy: str) -> dict:
+    """返回单个代理的使用统计（上限走全局配置）。"""
+    con = _conn()
+    cur = con.execute(
+        "SELECT proxy, used_count, last_used_at FROM proxy_usage WHERE proxy=?",
+        (proxy,),
+    )
+    row = cur.fetchone()
+    base = {
+        "proxy": proxy,
+        "used_count": 0,
+        "last_used_at": 0,
+        "max_uses": _default_proxy_max_uses(),
+    }
+    if row:
+        base.update({k: row[k] for k in ("proxy", "used_count", "last_used_at")})
+    return base
+
+
+def list_proxy_usage() -> list[dict]:
+    """返回所有代理的使用统计（上限走全局配置）。"""
+    max_uses = _default_proxy_max_uses()
+    con = _conn()
+    cur = con.execute(
+        "SELECT proxy, used_count, last_used_at FROM proxy_usage "
+        "ORDER BY used_count DESC, last_used_at DESC"
+    )
+    return [
+        {**dict(r), "max_uses": max_uses}
+        for r in cur.fetchall()
+    ]
+
+
+def is_proxy_available(proxy: str) -> bool:
+    """检查代理是否未达到使用上限。"""
+    usage = get_proxy_usage(proxy)
+    return usage["used_count"] < usage["max_uses"]
+
+
+def record_proxy_usage(proxy: str) -> dict:
+    """记录一次代理使用。返回最新统计。"""
+    if not proxy:
+        return {"proxy": "", "used_count": 0, "max_uses": 0, "last_used_at": 0}
+    now = time.time()
+    with _lock:
+        con = _conn()
+        con.execute(
+            """
+            INSERT INTO proxy_usage(proxy, used_count, last_used_at)
+            VALUES (?, 1, ?)
+            ON CONFLICT(proxy) DO UPDATE SET
+                used_count = used_count + 1,
+                last_used_at = excluded.last_used_at
+            """,
+            (proxy, now),
+        )
+        con.commit()
+    return get_proxy_usage(proxy)
+
+
+def reset_proxy_usage(proxy: str) -> None:
+    """重置单个代理的使用次数。"""
+    if not proxy:
+        return
+    with _lock:
+        con = _conn()
+        con.execute(
+            "UPDATE proxy_usage SET used_count = 0 WHERE proxy=?",
+            (proxy,),
+        )
+        con.commit()
 
 
 # ──────────────────────── SMS 接码配置 ────────────────────────
@@ -575,11 +748,13 @@ def get_sms_config() -> dict:
     """返回 SMS 接码配置（api_key 隐藏明文）。
 
     sms_enabled:        '0'/'1' 是否启用接码（命中 add-phone 时才会用）
-    sms_provider:       smsbower
+    sms_provider:       smsbower / herosms
+    smsbower_api_key:   SmsBower API Key（已设置返回 '***'）
+    herosms_api_key:    HeroSMS API Key（已设置返回 '***'）
     sms_country:        国家代码或 ID（推荐 '52' = Thailand，OpenAI 走 SMS 的唯一稳定国家）
     sms_service:        服务代码（OpenAI = 'dr'）
-    sms_max_price:      号码最高单价（SmsBower / SmsBower 用，单位平台货币；空 / -1 = 不限）
-    sms_reuse_phone:    '0'/'1' 同号复用（SmsBower / SmsBower 支持，省钱）
+    sms_max_price:      号码最高单价（SmsBower / HeroSMS 用，单位平台货币；空 / -1 = 不限）
+    sms_reuse_phone:    '0'/'1' 同号复用（SmsBower / HeroSMS 支持，省钱）
     sms_phone_success_max: 同号最多复用几次（默认 3）
     sms_auto_country:   '0'/'1' 自动选最优国家（按价格 + 库存）
     sms_auto_min_stock: 自动选国家最低库存（默认 20）
@@ -588,26 +763,30 @@ def get_sms_config() -> dict:
     return {
         "sms_enabled":             get_setting("sms_enabled", "0"),
         "sms_provider":            get_setting("sms_provider", "smsbower"),
-        "sms_api_key":             "***" if get_setting("sms_api_key") else "",
+        "smsbower_api_key":        "***" if get_setting("smsbower_api_key") else "",
+        "herosms_api_key":         "***" if get_setting("herosms_api_key") else "",
         "sms_country":             get_setting("sms_country", "52"),
         "sms_service":             get_setting("sms_service", "dr"),
         "sms_max_price":           get_setting("sms_max_price", ""),
         "sms_reuse_phone":         get_setting("sms_reuse_phone", "1"),
         "sms_phone_success_max":   get_setting("sms_phone_success_max", "3"),
         "sms_auto_country":        get_setting("sms_auto_country", "0"),
+        "sms_keep_country":        get_setting("sms_keep_country", "0"),
         "sms_strict_whitelist":    get_setting("sms_strict_whitelist", "0"),
         "sms_allowed_countries":   get_setting("sms_allowed_countries", ""),
         "sms_auto_min_stock":      get_setting("sms_auto_min_stock", "20"),
         "sms_auto_max_price":      get_setting("sms_auto_max_price", ""),
         "sms_max_phone_attempts":  get_setting("sms_max_phone_attempts", ""),
-        "sms_per_phone_timeout":   get_setting("sms_per_phone_timeout", "80"),
+        "sms_resend_interval":     get_setting("sms_resend_interval", "20"),
+        "sms_resend_max":          get_setting("sms_resend_max", "3"),
+        "sms_min_balance":         get_setting("sms_min_balance", ""),
     }
 
 
 def save_sms_config(data: dict) -> None:
-    """保存 SMS 配置。sms_api_key 传 '***' 表示不修改。"""
+    """保存 SMS 配置。各 api_key 传 '***' 表示不修改。"""
     # 校验 provider
-    valid_providers = {"smsbower"}
+    valid_providers = {"smsbower", "herosms"}
     if "sms_provider" in data:
         p = str(data["sms_provider"]).strip().lower()
         if p not in valid_providers:
@@ -617,13 +796,13 @@ def save_sms_config(data: dict) -> None:
     for key in (
         "sms_country", "sms_service", "sms_max_price",
         "sms_phone_success_max", "sms_auto_min_stock", "sms_auto_max_price",
-        "sms_max_phone_attempts", "sms_per_phone_timeout",
-        "sms_allowed_countries",
+        "sms_max_phone_attempts", "sms_resend_interval", "sms_resend_max",
+        "sms_allowed_countries", "sms_min_balance",
     ):
         if key in data:
             set_setting(key, str(data[key]).strip())
     # 布尔字段（前端传 '0'/'1' 或 bool）
-    for key in ("sms_enabled", "sms_reuse_phone", "sms_auto_country", "sms_strict_whitelist"):
+    for key in ("sms_enabled", "sms_reuse_phone", "sms_auto_country", "sms_keep_country", "sms_strict_whitelist"):
         if key in data:
             v = data[key]
             if isinstance(v, bool):
@@ -632,28 +811,38 @@ def save_sms_config(data: dict) -> None:
                 s = str(v).strip().lower()
                 set_setting(key, "1" if s in ("1", "true", "yes", "on") else "0")
     # API key（'***' 不修改）
-    if data.get("sms_api_key") and data["sms_api_key"] != "***":
-        set_setting("sms_api_key", str(data["sms_api_key"]).strip())
+    if data.get("smsbower_api_key") and data["smsbower_api_key"] != "***":
+        set_setting("smsbower_api_key", str(data["smsbower_api_key"]).strip())
+    if data.get("herosms_api_key") and data["herosms_api_key"] != "***":
+        set_setting("herosms_api_key", str(data["herosms_api_key"]).strip())
 
 
 def get_sms_internal_config() -> dict:
     """内部用：拿明文 sms_api_key,供 sms_provider 实例化使用。"""
+    provider = get_setting("sms_provider", "smsbower")
+    if provider == "herosms":
+        api_key = get_setting("herosms_api_key", "")
+    else:
+        api_key = get_setting("smsbower_api_key", "")
     return {
         "sms_enabled":             get_setting("sms_enabled", "0") in ("1", "true"),
-        "sms_provider":            get_setting("sms_provider", "smsbower"),
-        "sms_api_key":             get_setting("sms_api_key", ""),
+        "sms_provider":            provider,
+        "sms_api_key":             api_key,
         "sms_country":             get_setting("sms_country", "52"),
         "sms_service":             get_setting("sms_service", "dr"),
         "sms_max_price":           get_setting("sms_max_price", ""),
         "sms_reuse_phone":         get_setting("sms_reuse_phone", "1") in ("1", "true"),
         "sms_phone_success_max":   get_setting("sms_phone_success_max", "3"),
         "sms_auto_country":        get_setting("sms_auto_country", "0") in ("1", "true"),
+        "sms_keep_country":        get_setting("sms_keep_country", "0") in ("1", "true"),
         "sms_strict_whitelist":    get_setting("sms_strict_whitelist", "0") in ("1", "true"),
         "sms_allowed_countries":   get_setting("sms_allowed_countries", ""),
         "sms_auto_min_stock":      get_setting("sms_auto_min_stock", "20"),
         "sms_auto_max_price":      get_setting("sms_auto_max_price", ""),
         "sms_max_phone_attempts":  get_setting("sms_max_phone_attempts", ""),
-        "sms_per_phone_timeout":   get_setting("sms_per_phone_timeout", "80"),
+        "sms_resend_interval":     get_setting("sms_resend_interval", "20"),
+        "sms_resend_max":          get_setting("sms_resend_max", "3"),
+        "sms_min_balance":         get_setting("sms_min_balance", ""),
     }
 
 

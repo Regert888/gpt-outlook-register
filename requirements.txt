@@ -6,5 +6,5 @@ requests>=2.31.0
 
 # WebUI（可选；只跑 register_outlook.py 命令行不需要）
 fastapi>=0.110.0
-uvicorn[standard]>=0.27.0
+uvicorn[standard]>=0.29.0
 pydantic>=2.5.0

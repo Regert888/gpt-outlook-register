@@ -22,9 +22,13 @@ sys.path.insert(0, str(ROOT))
 from config import Config  # noqa: E402
 from mail_outlook import OutlookMailProvider  # noqa: E402
 from auth_flow import AuthFlow  # noqa: E402
-from sms_provider import PhoneCallbackController  # noqa: E402
+from proxy_utils import mask_proxy_url  # noqa: E402
+from sms_provider import PhoneCallbackController, create_sms_provider  # noqa: E402
 
 from . import db  # noqa: E402
+
+# mail_source 取值里需要"虚拟占位 account、不走本地号池"的模式
+_NON_POOL_SOURCES = ("cf_temp", "oep")
 
 # run_id -> queue of log strings; sentinel = None 表示流结束
 _run_queues: dict[str, queue.Queue] = {}
@@ -87,6 +91,7 @@ _NETWORK_ERROR_PATTERNS = [
     "curl: (35)", "curl: (28)", "curl: (6)", "curl: (7)",
     "remote disconnected", "connection reset", "connection aborted",
     "max retries exceeded",
+    "余额不足", "sms 余额", "接码平台余额",
 ]
 
 
@@ -100,6 +105,7 @@ def classify_error(err: str) -> str:
         "outlook refresh failed", "authentication failed", "authenticate failed",
         "outlook otp timeout", "registration_disallowed",
         "已有账号", "账号被", "refresh_token 失效",
+        "account_deactivated", "deleted or deactivated",
     )):
         return "account"
     if any(p in s for p in _NETWORK_ERROR_PATTERNS):
@@ -132,9 +138,12 @@ def _do_register(
         root_logger.setLevel(logging.INFO)
 
     email = account["email"]
+    # OEP/CF 模式下 email 是 claim 后才确定的，用一个可变引用让 SMS/错误状态事件也能带上真实邮箱。
+    shared_email = {"email": email}
     saved_env = {}
     # 提前读取，避免在 try 块前异常时 except 引用未定义
     mail_source = db.get_setting("mail_source", "outlook")
+    mail = None  # 在 try 里赋值；except 里可能引用
 
     try:
         # 注入环境变量（不污染全局，跑完恢复）
@@ -157,7 +166,19 @@ def _do_register(
         cfg = Config()
         cfg.proxy = (options.get("proxy") or "").strip() or None
 
-        # ─ 邮箱来源路由：outlook 池 vs CF Worker catch-all ─
+        # ─ 代理使用统计 + 上限检查 ─
+        if cfg.proxy:
+            usage = db.get_proxy_usage(cfg.proxy)
+            if usage["used_count"] >= usage["max_uses"]:
+                raise RuntimeError(
+                    f"代理 {mask_proxy_url(cfg.proxy)} 已达到使用上限 ({usage['used_count']}/{usage['max_uses']})"
+                )
+            db.record_proxy_usage(cfg.proxy)
+            logging.getLogger("registrar").info(
+                f"[register] 代理 {mask_proxy_url(cfg.proxy)} 已使用 {usage['used_count'] + 1}/{usage['max_uses']} 次"
+            )
+
+        # ─ 邮箱来源路由：outlook 池 vs CF Worker catch-all vs OEP 平台 ─
         if mail_source == "cf_temp":
             sys_path_root = str(ROOT)
             if sys_path_root not in sys.path:
@@ -178,6 +199,28 @@ def _do_register(
             logging.getLogger("registrar").info(
                 f"[register] 邮箱来源: cf_temp / domain={domain}"
             )
+        elif mail_source == "oep":
+            sys_path_root = str(ROOT)
+            if sys_path_root not in sys.path:
+                sys.path.insert(0, sys_path_root)
+            from mail_oep import OutlookEmailPlusProvider
+
+            oep_url = db.get_setting("oep_api_url", "")
+            oep_key = db.get_oep_api_key()
+            if not oep_url or not oep_key:
+                raise RuntimeError(
+                    "OutlookEmailPlus 未配置完整（缺 api_url / api_key），"
+                    "请去「邮箱配置」Tab 填写"
+                )
+            mail = OutlookEmailPlusProvider(
+                api_url=oep_url,
+                api_key=oep_key,
+                caller_id=db.get_setting("oep_caller_id", "gpt-outlook-register"),
+                project_key=db.get_setting("oep_project_key", ""),
+            )
+            logging.getLogger("registrar").info(
+                f"[register] 邮箱来源: oep / {oep_url}"
+            )
         else:
             mail = OutlookMailProvider(
                 email=account["email"],
@@ -186,7 +229,46 @@ def _do_register(
                 refresh_token=account["refresh_token"],
             )
 
-        flow = AuthFlow(cfg, sms_callback=_build_sms_callback(run_id))
+        # ─ OEP 模式下指定邮箱：让 provider 跳过 claim-random，直接用此邮箱 ─
+        specified_email = (options.get("specified_email") or "").strip() or None
+        if specified_email and mail_source == "oep":
+            ok, msg = mail.check_accessible(specified_email)  # type: ignore[attr-defined]
+            if ok:
+                mail.set_fixed_email(specified_email)  # type: ignore[attr-defined]
+            else:
+                if options.get("strict_email", True):
+                    raise RuntimeError(
+                        f"指定邮箱 {specified_email} 在 OEP 平台不可用 "
+                        f"({msg})；停止注册流程"
+                    )
+                logging.getLogger("registrar").warning(
+                    f"[register] 指定邮箱 {specified_email} 不可用 ({msg})，"
+                    f"回退到 claim-random"
+                )
+
+        if mail is not None:
+            _orig_create_mailbox = mail.create_mailbox
+
+            def _wrapped_create_mailbox():
+                em = _orig_create_mailbox()
+                real_email = em or getattr(mail, "email", "") or email
+                shared_email["email"] = real_email
+                # 把 runs 表里的占位邮箱换成真实邮箱，避免 UI/日志一直显示 placeholder
+                if real_email and "@" in real_email and "@pool.local" not in real_email:
+                    try:
+                        db.update_run_email(run_id, real_email)
+                    except Exception:
+                        pass
+                    _emit_status(
+                        run_id,
+                        "phase",
+                        {"phase": "email_claimed", "email": real_email},
+                    )
+                return em
+
+            mail.create_mailbox = _wrapped_create_mailbox
+
+        flow = AuthFlow(cfg, sms_callback=_build_sms_callback(run_id, shared_email))
         _emit_status(run_id, "phase", {"phase": "starting", "email": email})
         logging.getLogger("registrar").info(f"[register] 开始: {email}")
 
@@ -239,9 +321,12 @@ def _do_register(
 
         # 落库
         db.save_registered(d)
-        # CF 模式下 email 是虚拟占位（cf_placeholder_XXX@cf.local），不操作号池
-        if mail_source != "cf_temp":
+        # CF 模式下 email 是虚拟占位（cf_placeholder_XXX@cf.local），不操作号池；
+        # OEP 模式由 provider 自己回传 claim-complete，也不走本地号池
+        if mail_source not in _NON_POOL_SOURCES:
             db.mark_done(email)
+        if mail_source == "oep" and hasattr(mail, "complete_success"):
+            mail.complete_success("注册成功")
 
         # ─ 可选：导出到 CPA / SUB2API 面板（仅勾选启用时才执行） ─
         _try_export_to_panels(run_id, d)
@@ -268,8 +353,16 @@ def _do_register(
         logging.getLogger("registrar").error(f"[register] 失败 (category={category}): {err}")
         if category != "account":
             logging.getLogger("registrar").error(traceback.format_exc())
-        # CF 模式下不操作号池
-        if mail_source != "cf_temp":
+        # CF / OEP 模式不操作本地号池（OEP 由 provider 自己回传 release/complete）
+        if mail_source == "oep" and mail is not None and hasattr(mail, "release"):
+            # 网络错误 → release 回 available；账号问题 → provider 已在
+            # mark_outlook_dead/mark_outlook_retired 里回传 claim-complete
+            # (provider_blocked→frozen / credential_invalid→retired)；其余默认 release
+            if category == "account" and getattr(mail, "outlook_exhausted", False):
+                pass  # 已 claim-complete，号池状态已更新，无需再 release
+            else:
+                mail.release(f"[{category}] {err}"[:200])
+        elif mail_source not in _NON_POOL_SOURCES:
             if category == "network":
                 db.release_unused(email)
                 logging.getLogger("registrar").warning(
@@ -278,7 +371,15 @@ def _do_register(
             else:
                 db.mark_failed(email, f"[{category}] {err}")
         db.finish_run(run_id, "failed", err, category=category)
-        _emit_status(run_id, "error", {"message": err, "category": category})
+        _emit_status(
+            run_id,
+            "error",
+            {
+                "message": err,
+                "category": category,
+                "email": shared_email.get("email", email),
+            },
+        )
 
     finally:
         # 还原 env
@@ -304,6 +405,7 @@ def _try_export_to_panels(run_id: str, cred: dict) -> None:
     - 任一目标的"启用"开关关闭时,该目标跳过(不发请求);两者都未启用时整段 no-op。
     - 任何异常都不抛,只 emit 日志/状态(不影响注册主流程)。
     """
+    export_email = cred.get("email") or ""
     try:
         cfg = db.get_export_internal_config()
     except Exception as e:
@@ -327,7 +429,7 @@ def _try_export_to_panels(run_id: str, cred: dict) -> None:
         else:
             explog.info(f"[export] {msg}")
         try:
-            _emit_status(run_id, "phase", {"phase": "export", "message": msg, "level": level})
+            _emit_status(run_id, "phase", {"phase": "export", "message": msg, "level": level, "email": export_email})
         except Exception:
             pass
 
@@ -351,16 +453,17 @@ def _try_export_to_panels(run_id: str, cred: dict) -> None:
         summary["sub2api"] = {"ok": bool(results["sub2api"].get("ok")),
                               "message": results["sub2api"].get("message") or results["sub2api"].get("error") or ""}
     try:
-        _emit_status(run_id, "phase", {"phase": "export_done", "summary": summary})
+        _emit_status(run_id, "phase", {"phase": "export_done", "summary": summary, "email": export_email})
     except Exception:
         pass
 
 
-def _build_sms_callback(run_id: str) -> Optional[PhoneCallbackController]:
+def _build_sms_callback(run_id: str, email_ref: Optional[dict] = None) -> Optional[PhoneCallbackController]:
     """根据 webui 配置创建 SMS 接码 controller。
 
     未启用接码或未配置 API key 时返回 None，flow 会回退到环境变量路径。
     log_fn 把租号/等码的状态推到 SSE 流，前端可见。
+    email_ref 是可变引用，OEP/CF 模式下 claim 后真实邮箱会同步进去。
     """
     cfg = db.get_sms_internal_config()
     if not cfg.get("sms_enabled"):
@@ -376,11 +479,20 @@ def _build_sms_callback(run_id: str) -> Optional[PhoneCallbackController]:
         # 既写日志、又通过 _emit_status 推 phase 事件给前端
         smslog.info(f"[sms] {msg}")
         try:
-            _emit_status(run_id, "phase", {"phase": "sms", "message": msg})
+            _emit_status(
+                run_id,
+                "phase",
+                {
+                    "phase": "sms",
+                    "message": msg,
+                    "email": (email_ref or {}).get("email", ""),
+                },
+            )
         except Exception:
             pass
 
     try:
+        _log(f"📡 当前接码平台: {cfg['sms_provider']}")
         return PhoneCallbackController(
             provider_key=cfg["sms_provider"],
             config=cfg,
@@ -388,14 +500,52 @@ def _build_sms_callback(run_id: str) -> Optional[PhoneCallbackController]:
             country=cfg.get("sms_country") or "52",
             log_fn=_log,
             auto_select_country=bool(cfg.get("sms_auto_country")),
+            keep_country=bool(cfg.get("sms_keep_country")),
         )
     except Exception as e:
         smslog.warning(f"[sms] 创建接码 controller 失败: {e}")
         return None
 
 
+def check_sms_balance() -> Optional[float]:
+    """检查接码平台余额是否达到配置的「最低余额」。
+
+    - 未启用接码 / 未配置最低余额：返回 None（不检查）
+    - 查询成功：返回当前余额；低于下限时 raise RuntimeError
+    - 查询本身失败：日志警告后返回 None，不阻塞注册（避免供应商抖动导致全停）
+
+    供 auto-loop worker 每轮 claim 新号前调用，也可在单次注册启动前调用。
+    """
+    cfg = db.get_sms_internal_config()
+    if not cfg.get("sms_enabled"):
+        return None
+    try:
+        min_balance = float(cfg.get("sms_min_balance") or 0)
+    except (TypeError, ValueError):
+        min_balance = 0.0
+    if min_balance <= 0:
+        return None
+    smslog = logging.getLogger("registrar")
+    try:
+        balance = create_sms_provider(cfg["sms_provider"], cfg).get_balance()
+        smslog.info(f"[sms] 余额查询: {cfg['sms_provider']} 当前 {balance} (下限 {min_balance})")
+        if balance < min_balance:
+            raise RuntimeError(
+                f"[sms] 接码平台余额不足: {cfg['sms_provider']} 当前余额 {balance} "
+                f"低于配置下限 {min_balance}，停止执行注册"
+            )
+        return balance
+    except RuntimeError:
+        raise
+    except Exception as e:
+        smslog.warning(f"[sms] 余额查询失败({e})，跳过余额下限检查")
+        return None
+
+
 def start_registration(account: dict, options: dict) -> str:
     """启动一次注册任务，返回 run_id。"""
+    # 启动前先查接码平台余额：不足直接失败，不创建 run、不消耗号码
+    check_sms_balance()
     run_id = uuid.uuid4().hex[:12]
     log_file = LOG_DIR / f"{run_id}.log"
     db.create_run(run_id, account["email"], str(log_file))
@@ -421,3 +571,5 @@ def get_run_queue(run_id: str) -> Optional[queue.Queue]:
 def remove_run_queue(run_id: str) -> None:
     with _lock:
         _run_queues.pop(run_id, None)
+
+

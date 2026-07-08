@@ -52,7 +52,9 @@ class BaseSmsProvider(ABC):
         ...
 
     @abstractmethod
-    def get_code(self, activation_id: str, *, timeout: int = 180) -> str:
+    def get_code(self, activation_id: str, *, timeout: int = 180,
+                 resend_interval: Optional[int] = None,
+                 resend_max: Optional[int] = None) -> str:
         ...
 
     @abstractmethod
@@ -222,6 +224,7 @@ def _make_sms_candidate(activation_id: str, source: str, code) -> Optional[dict]
 class SmsBowerProvider(BaseSmsProvider):
     """SmsBower (smsbower.page) —— 支持号码复用 + resend + V2 API。"""
 
+    provider_name = "smsbower"
     BASE_URL = "https://smsbower.page/stubs/handler_api.php"
     auto_report_success_on_code = False  # 等业务侧确认才报成功（便于号码复用）
 
@@ -264,7 +267,7 @@ class SmsBowerProvider(BaseSmsProvider):
         text = self._request({"action": "getBalance"}).text.strip()
         if text.startswith("ACCESS_BALANCE:"):
             return float(text.split(":", 1)[1])
-        raise RuntimeError(f"SmsBower getBalance 失败: {text}")
+        raise RuntimeError(f"{self.provider_name} getBalance 失败: {text}")
 
     def get_prices(self, service: Optional[str] = None, country=None) -> dict:
         params = {"action": "getPrices"}
@@ -275,7 +278,7 @@ class SmsBowerProvider(BaseSmsProvider):
         data = self._request(params).json()
         if isinstance(data, dict):
             return data
-        raise RuntimeError("SmsBower getPrices 返回结构异常")
+        raise RuntimeError(f"{self.provider_name} getPrices 返回结构异常")
 
     def get_top_countries(self, service: Optional[str] = None) -> list[dict]:
         """按价格 + 库存排序返回国家列表。"""
@@ -377,7 +380,7 @@ class SmsBowerProvider(BaseSmsProvider):
         try:
             rows = self.get_top_countries(service=service)
         except Exception as exc:
-            logger.warning("SmsBower get_best_country 查询失败: %s", exc)
+            logger.warning("%s get_best_country 查询失败: %s", self.provider_name, exc)
             return None
         if not rows:
             return None
@@ -404,9 +407,9 @@ class SmsBowerProvider(BaseSmsProvider):
                 # 非白名单国家 → warn 一下（不阻止）
                 if not strict_whitelist and cid not in OPENAI_SMS_COUNTRIES:
                     logger.warning(
-                        "SmsBower 自动选了非 OpenAI-SMS 白名单国家 country=%s price=%s "
+                        "%s 自动选了非 OpenAI-SMS 白名单国家 country=%s price=%s "
                         "（OpenAI 可能让此号用 WhatsApp 验证 → 收不到 SMS）",
-                        cid, price,
+                        self.provider_name, cid, price,
                     )
                 return cid
             return None
@@ -417,6 +420,7 @@ class SmsBowerProvider(BaseSmsProvider):
 
     def _cache_identity(self, service: str, country: str) -> dict:
         return {
+            "provider": getattr(self, "provider_name", self.__class__.__name__),
             "api_key_hash": _hash_secret(self.api_key),
             "service": str(service),
             "country": str(country),
@@ -477,13 +481,13 @@ class SmsBowerProvider(BaseSmsProvider):
         # 用户配了 max_price 才传，空 / <=0 时根本不传（让平台用默认）
         if self.max_price > 0:
             common["maxPrice"] = self.max_price
-        logger.info("SmsBower %s: service=%s country=%s maxPrice=%s",
-                    action, service, country, common.get("maxPrice", "未设置"))
+        logger.info("%s %s: service=%s country=%s maxPrice=%s",
+                    self.provider_name, action, service, country, common.get("maxPrice", "未设置"))
 
         try:
             resp = self._request(common)
             resp_text = resp.text.strip()
-            logger.info("SmsBower %s resp: status=%s text=%s", action, resp.status_code, resp_text[:500])
+            logger.info("%s %s resp: status=%s text=%s", self.provider_name, action, resp.status_code, resp_text[:500])
 
             # V2 返回 JSON
             if action == "getNumberV2":
@@ -585,7 +589,7 @@ class SmsBowerProvider(BaseSmsProvider):
                             )
                             self.current_activation = activation
                             if len(country_candidates) > 1:
-                                logger.info("SmsBower 在国家 %s 租到号 %s (action=%s)", cid, phone, action)
+                                logger.info("%s 在国家 %s 租到号 %s (action=%s)", self.provider_name, cid, phone, action)
                             return activation
                         except Exception as e:
                             msg = str(e)[:120]
@@ -594,7 +598,7 @@ class SmsBowerProvider(BaseSmsProvider):
                             continue  # 同国家试下个 action
 
                 detail = " | ".join(failures) if failures else "未知"
-                raise RuntimeError(f"SmsBower 依次尝试 {len(country_candidates)} 个候选国家全失败: {detail}") from last_exc
+                raise RuntimeError(f"{self.provider_name} 依次尝试 {len(country_candidates)} 个候选国家全失败: {detail}") from last_exc
 
     # ---- 等 code / 状态查询 ----
 
@@ -662,7 +666,7 @@ class SmsBowerProvider(BaseSmsProvider):
                             return {"status": "ok", "code": code,
                                     "sms_key": result.get("sms_key") or ""}
                 except Exception as e:
-                    logger.debug("SmsBower status %s 失败: %s", src, e)
+                    logger.debug("%s status %s 失败: %s", self.provider_name, src, e)
 
             elapsed = time.time() - start
             # OpenAI 端 resend：固定间隔触发，最多 N 次
@@ -672,8 +676,8 @@ class SmsBowerProvider(BaseSmsProvider):
                     self._resend_callback()
                     openai_resend_count = expected_resend_count
                     logger.info(
-                        "SmsBower: 已请求 OpenAI 端 resend (第 %d/%d 次, elapsed=%ds)",
-                        openai_resend_count, openai_resend_max, int(elapsed),
+                        "%s: 已请求 OpenAI 端 resend (第 %d/%d 次, elapsed=%ds)",
+                        self.provider_name, openai_resend_count, openai_resend_max, int(elapsed),
                     )
                 except Exception as e:
                     logger.warning("OpenAI resend callback 失败: %s", e)
@@ -688,28 +692,102 @@ class SmsBowerProvider(BaseSmsProvider):
             time.sleep(poll)
         return None
 
-    def get_code(self, activation_id: str, *, timeout: int = 180) -> str:
+    def get_code(self, activation_id: str, *, timeout: int = 180,
+                 resend_interval: Optional[int] = None,
+                 resend_max: Optional[int] = None) -> str:
         # ⚠️ 不再用 cache.remaining 延长 timeout：
         # 用户给的 timeout 就是真 timeout，超时就让上层换号或换 attempt。
         # （旧逻辑会被拉到 20 分钟号码生命周期，OpenAI 端 phone-otp challenge 等不了那么久）
-        candidate = self.wait_for_code(activation_id, timeout=timeout)
+        kwargs: dict = {"timeout": timeout}
+        if resend_interval is not None:
+            kwargs["openai_resend_interval"] = resend_interval
+        if resend_max is not None:
+            kwargs["openai_resend_max"] = resend_max
+        candidate = self.wait_for_code(activation_id, **kwargs)
         self.last_code_result = candidate
         return str((candidate or {}).get("code") or "")
 
     # ---- 状态报告 ----
 
-    def cancel(self, activation_id: str) -> bool:
+    @staticmethod
+    def _is_cancel_response_ok(resp: requests.Response) -> bool:
+        """判断 cancel/setStatus 响应是否表示退款成功。
+
+        实测两平台的成功指纹（唯一精确匹配，不做模糊判断）：
+          - hero-sms  cancelActivation  → HTTP 204 + 空 body
+          - smsbower  setStatus=8       → HTTP 200 + 纯文本 "ACCESS_CANCEL"
+
+        其它一律判失败（包括 200 + BAD_ACTION/BAD_STATUS 这类错误响应）。
+        """
         try:
-            resp = self._request({"action": "cancelActivation", "id": activation_id})
-            ok = resp.status_code == 204 or "ACCESS_CANCEL" in resp.text
+            if resp.status_code >= 400:
+                return False
+            if resp.status_code == 204:
+                return True
+            text = (resp.text or "").strip()
+            if "ACCESS_CANCEL" in text:
+                return True
+            return False
         except Exception:
-            ok = False
+            return False
+
+    @staticmethod
+    def _is_early_cancel_denied(status_code: int, text: str) -> bool:
+        """识别 SmsBower/HeroSMS 的 EARLY_CANCEL_DENIED（号未到最小激活时长）。"""
+        if status_code != 409:
+            return False
+        return "EARLY_CANCEL_DENIED" in (text or "").upper()
+
+    def _raw_request(self, params: dict) -> requests.Response:
+        """不走 raise_for_status 的原始请求，用于 cancel/debug 时拿到真实响应。"""
+        payload = dict(params)
+        payload["api_key"] = self.api_key
+        return requests.get(self.BASE_URL, params=payload, timeout=30, proxies=self._proxies)
+
+    def cancel(self, activation_id: str) -> bool:
+        activation_id = str(activation_id)
+        ok = False
+        last_status = 0
+        last_text = ""
+        # 1) 先尝试 cancelActivation（不走 raise_for_status，拿到真实响应）
+        try:
+            resp = self._raw_request({"action": "cancelActivation", "id": activation_id})
+            last_status, last_text = resp.status_code, resp.text
+            ok = self._is_cancel_response_ok(resp)
+            logger.info("%s cancel cancelActivation (id=%s) -> %s %s",
+                        self.provider_name, activation_id, resp.status_code, resp.text[:200])
+        except Exception as e:
+            logger.warning("%s cancel cancelActivation 异常 (id=%s): %s",
+                           self.provider_name, activation_id, e)
+        # 1.5) EARLY_CANCEL_DENIED：号还没到最小激活时长，丢后台队列等够再重试，不阻塞主流程
+        if not ok and self._is_early_cancel_denied(last_status, last_text):
+            _enqueue_bg_cancel(
+                api_key=self.api_key, base_url=self.BASE_URL, proxies=self._proxies,
+                activation_id=activation_id, provider_name=self.provider_name,
+            )
+            logger.info("%s ⏳ 号未到最小激活时长，已转入后台取消队列 (id=%s, 满 120s 后取消)",
+                        self.provider_name, activation_id)
+            with _SMS_CACHE_LOCK:
+                cache = _SMS_CACHE
+                if cache and str(cache.get("activation_id")) == str(activation_id):
+                    self._clear_cache()
+            return True  # 已安排后台取消，对主流程而言算"已处理"
+        # 2) fallback setStatus=8
         if not ok:
             try:
-                resp = self._request({"action": "setStatus", "id": activation_id, "status": 8})
-                ok = "ACCESS_CANCEL" in resp.text
-            except Exception:
-                ok = False
+                resp = self._raw_request({"action": "setStatus", "id": activation_id, "status": 8})
+                last_status, last_text = resp.status_code, resp.text
+                ok = self._is_cancel_response_ok(resp)
+                logger.info("%s cancel setStatus=8 (id=%s) -> %s %s",
+                            self.provider_name, activation_id, resp.status_code, resp.text[:200])
+            except Exception as e:
+                logger.warning("%s cancel setStatus=8 异常 (id=%s): %s",
+                               self.provider_name, activation_id, e)
+        if not ok:
+            logger.warning("%s cancel 退款失败 (activation_id=%s) last_status=%s last_text=%s",
+                           self.provider_name, activation_id, last_status, last_text)
+        logger.info("%s cancel 退款判定 ok=%s (activation_id=%s) status=%s body=%s",
+                    self.provider_name, ok, activation_id, last_status, last_text[:200])
         with _SMS_CACHE_LOCK:
             cache = _SMS_CACHE
             if cache and str(cache.get("activation_id")) == str(activation_id):
@@ -777,17 +855,15 @@ class SmsBowerProvider(BaseSmsProvider):
             pass
 
     def mark_send_failed(self, activation_id: str, reason: str = "") -> None:
-        # 业务侧拒了这个号 → cancel 退款（号根本没用上，不能让主人白花钱）
-        cancel_ok = False
+        # 业务侧拒了这个号 → 立即 cancel 退款（号根本没用上，不能让主人白花钱）
+        # 统一走 cancel()：先 cancelActivation，失败再 fallback setStatus=8
         try:
-            resp = self._request({"action": "setStatus", "id": activation_id, "status": 8})
-            cancel_ok = "ACCESS_CANCEL" in resp.text or resp.status_code in (200, 204)
-        except Exception:
-            pass
-        # 简化原因显示：只保留前 80 字符
-        short_reason = (reason or "未知原因")[:80]
-        logger.info("SmsBower 号 activation_id=%s cancel 退款 %s (原因: %s)",
-                    activation_id, "✅" if cancel_ok else "❌", short_reason)
+            cancel_ok = self.cancel(activation_id)
+        except Exception as e:
+            cancel_ok = False
+            logger.warning("mark_send_failed cancel 异常 (activation_id=%s): %s", activation_id, e)
+        logger.info("%s 号 activation_id=%s cancel 退款 %s (原因: %s)",
+                    self.provider_name, activation_id, "✅" if cancel_ok else "❌", reason or "未知原因")
         # 同时清掉复用缓存（避免下次注册又拿到这个被拒的号）
         with _SMS_CACHE_LOCK:
             cache = _SMS_CACHE
@@ -802,6 +878,118 @@ class SmsBowerProvider(BaseSmsProvider):
 
 
 
+class HeroSmsProvider(SmsBowerProvider):
+    """HeroSMS (hero-sms.com) —— 与 SmsBower 使用同一套 SMS-Activate 兼容协议。
+
+    支持 getNumber / getStatus / setStatus / getPrices / getTopCountriesByService，
+    号码复用、resend、自动选国家等能力直接继承自 SmsBowerProvider。
+    """
+
+    provider_name = "herosms"
+    BASE_URL = "https://hero-sms.com/stubs/handler_api.php"
+
+
+# ---------------------------------------------------------------------------
+# 后台取消队列：EARLY_CANCEL_DENIED（号未到最小激活时长）时不阻塞主流程，
+# 把 cancel 任务丢到后台线程，等够 minActivationTime 再重试 cancelActivation/setStatus=8。
+# ---------------------------------------------------------------------------
+
+import queue as _queue
+
+_BG_CANCEL_Q: "_queue.Queue[dict]" = _queue.Queue()
+_BG_CANCEL_THREAD: Optional[threading.Thread] = None
+_BG_CANCEL_LOCK = threading.Lock()
+
+
+def _enqueue_bg_cancel(*, api_key: str, base_url: str, proxies: Optional[dict],
+                       activation_id: str, provider_name: str) -> None:
+    """把一个 cancel 任务丢到后台队列；主流程立即返回。
+
+    入队时存上时间戳 ts；worker FIFO 一个个处理，取出后算「距 ts 是否满 120s」，
+    不够就补睡剩余时间，再 cancel。队列先进先出，无需 pending/批量。
+    """
+    _BG_CANCEL_Q.put({
+        "api_key": api_key, "base_url": base_url, "proxies": proxies,
+        "activation_id": str(activation_id),
+        "provider_name": provider_name,
+        "ts": time.time(),
+    })
+    _ensure_bg_cancel_thread()
+
+
+def _ensure_bg_cancel_thread() -> None:
+    global _BG_CANCEL_THREAD
+    if _BG_CANCEL_THREAD and _BG_CANCEL_THREAD.is_alive():
+        return
+    with _BG_CANCEL_LOCK:
+        if _BG_CANCEL_THREAD and _BG_CANCEL_THREAD.is_alive():
+            return
+        t = threading.Thread(target=_bg_cancel_worker, daemon=True, name="sms-bg-cancel")
+        t.start()
+        _BG_CANCEL_THREAD = t
+
+
+def _bg_cancel_once(api_key: str, base_url: str, proxies: Optional[dict],
+                    activation_id: str, provider_name: str) -> tuple:
+    """执行一次 cancelActivation + fallback setStatus=8，返回 (ok, last_status, last_text)。"""
+    ok = False
+    last_status = 0
+    last_text = ""
+    base_params = {"api_key": api_key}
+    try:
+        resp = requests.get(base_url, params={**base_params, "action": "cancelActivation",
+                                              "id": activation_id}, timeout=30, proxies=proxies)
+        last_status, last_text = resp.status_code, resp.text
+        ok = SmsBowerProvider._is_cancel_response_ok(resp)
+        logger.info("[bg-cancel] %s cancelActivation (id=%s) -> %s %s",
+                    provider_name, activation_id, resp.status_code, resp.text[:200])
+    except Exception as e:
+        logger.warning("[bg-cancel] %s cancelActivation 异常 (id=%s): %s", provider_name, activation_id, e)
+    if not ok:
+        try:
+            resp = requests.get(base_url, params={**base_params, "action": "setStatus",
+                                                  "id": activation_id, "status": 8}, timeout=30, proxies=proxies)
+            last_status, last_text = resp.status_code, resp.text
+            ok = SmsBowerProvider._is_cancel_response_ok(resp)
+            logger.info("[bg-cancel] %s setStatus=8 (id=%s) -> %s %s",
+                        provider_name, activation_id, resp.status_code, resp.text[:200])
+        except Exception as e:
+            logger.warning("[bg-cancel] %s setStatus=8 异常 (id=%s): %s", provider_name, activation_id, e)
+    logger.info("[bg-cancel] %s 判定 ok=%s (id=%s) status=%s body=%s",
+                provider_name, ok, activation_id, last_status, last_text[:200])
+    return ok, last_status, last_text
+
+
+_BG_CANCEL_MIN_WAIT = 120  # 距入队时间戳至少满 120s 才取消（号要过 minActivationTime）
+
+
+def _bg_cancel_worker() -> None:
+    while True:
+        item = _BG_CANCEL_Q.get()  # FIFO，阻塞等任务
+        try:
+            aid = item["activation_id"]
+            tag = item.get("provider_name", "sms")
+            # 距入队时间戳还差多少到 120s；不够就补睡
+            elapsed = time.time() - float(item.get("ts") or 0)
+            remaining = _BG_CANCEL_MIN_WAIT - elapsed
+            if remaining > 0:
+                logger.info("[bg-cancel] %s activation_id=%s 还需等 %.0fs",
+                            tag, aid, remaining)
+                time.sleep(remaining)
+            ok, status, text = _bg_cancel_once(
+                item["api_key"], item["base_url"], item.get("proxies"), aid, tag
+            )
+            if ok:
+                logger.info("[bg-cancel] ✅ %s 后台取消成功 activation_id=%s", tag, aid)
+            else:
+                logger.warning("[bg-cancel] ❌ %s 后台取消失败 activation_id=%s last=%s %s",
+                               tag, aid, status, text[:200])
+        except Exception as e:
+            logger.warning("[bg-cancel] worker 异常: %s", e)
+        finally:
+            _BG_CANCEL_Q.task_done()
+
+
 # ---------------------------------------------------------------------------
 # 工厂 + 回调控制器（注入到 auth_flow）
 # ---------------------------------------------------------------------------
@@ -810,7 +998,7 @@ class SmsBowerProvider(BaseSmsProvider):
 def create_sms_provider(provider_key: str, config: dict) -> BaseSmsProvider:
     """从配置创建 provider 实例。
 
-    provider_key: smsbower / smsbower
+    provider_key: smsbower / herosms
     config 字段：sms_api_key / sms_country / sms_service / sms_max_price /
                 sms_reuse_phone / sms_phone_success_max
     """
@@ -827,14 +1015,20 @@ def create_sms_provider(provider_key: str, config: dict) -> BaseSmsProvider:
     reuse = _safe_bool(config.get("sms_reuse_phone"), True)
     succ_max = max(0, _safe_int(config.get("sms_phone_success_max"), 3))
 
+    common_kwargs = dict(
+        api_key=api_key,
+        default_service=service,
+        default_country=country or SMS_DEFAULT_COUNTRY,
+        max_price=max_price,
+        proxy=proxy,
+        reuse_phone_to_max=reuse,
+        phone_success_max=succ_max,
+    )
+
     if pk in ("smsbower", "sms_bower"):
-        return SmsBowerProvider(api_key=api_key,
-                                default_service=service,
-                                default_country=country or SMS_DEFAULT_COUNTRY,
-                                max_price=max_price,
-                                proxy=proxy,
-                                reuse_phone_to_max=reuse,
-                                phone_success_max=succ_max)
+        return SmsBowerProvider(**common_kwargs)
+    if pk in ("herosms", "hero_sms"):
+        return HeroSmsProvider(**common_kwargs)
     raise RuntimeError(f"未知接码服务: {provider_key}")
 
 
@@ -861,6 +1055,7 @@ class PhoneCallbackController:
         country: str = "",
         log_fn: Optional[Callable[[str], None]] = None,
         auto_select_country: bool = False,
+        keep_country: bool = False,
     ):
         self.provider_key = provider_key
         self.config = dict(config or {})
@@ -868,10 +1063,12 @@ class PhoneCallbackController:
         self.country = country
         self.log = log_fn or logger.info
         self.auto_select_country = bool(auto_select_country)
+        self.keep_country = bool(keep_country)
         self.provider: Optional[BaseSmsProvider] = None
         self.activation: Optional[SmsActivation] = None
         self.completed = False
         self._verify_lock_acquired = False
+        self._last_country: Optional[str] = None
 
     def _provider(self) -> BaseSmsProvider:
         if self.provider is None:
@@ -890,51 +1087,70 @@ class PhoneCallbackController:
         allowed_raw = str(self.config.get("sms_allowed_countries") or "").strip()
         allowed_list = [c.strip() for c in allowed_raw.replace(";", ",").split(",") if c.strip()]
 
-        effective_country = self.country
-        country_candidates: list[str] = []
+        raw_candidates: list[str] = []
 
-        if self.auto_select_country and isinstance(provider, SmsBowerProvider):
-            if allowed_list:
-                self.log(f"🔍 自动选号: 从主人勾选的 {len(allowed_list)} 个国家依次尝试（按价格升序）")
-                try:
-                    rows = provider.get_top_countries(service=self.service)
-                    # 按价格升序排，只保留在 allowed_list 中的
-                    in_allow = [r for r in rows if str(r.get("country") or "") in allowed_list]
-                    ordered_allowed = [str(r["country"]) for r in in_allow]
-                    # 把 allowed 里没在排名中出现的也加在最后
-                    appended = [c for c in allowed_list if c not in ordered_allowed]
-                    country_candidates = ordered_allowed + appended
-                    self.log(f"  候选顺序: {','.join(country_candidates)}")
-                except Exception as e:
-                    self.log(f"  排名查询失败({e})，按主人勾选的原始顺序尝试")
-                    country_candidates = list(allowed_list)
+        # 如果要求同一账号保持国家不变，且已经租过号，则沿用上次国家
+        if self.keep_country and self._last_country:
+            self.log(f"🔒 同一账号保持国家不变: 沿用 {self._last_country} {SMS_COUNTRY_NAMES_CN.get(self._last_country, '')}")
+            raw_candidates = [self._last_country]
+
+        if not raw_candidates:
+            if self.auto_select_country and isinstance(provider, SmsBowerProvider):
+                if allowed_list:
+                    self.log(f"🔍 自动选号: 从主人勾选的 {len(allowed_list)} 个国家依次尝试（按价格升序）")
+                    try:
+                        rows = provider.get_top_countries(service=self.service)
+                        # 按价格升序排，只保留在 allowed_list 中的
+                        in_allow = [r for r in rows if str(r.get("country") or "") in allowed_list]
+                        ordered_allowed = [str(r["country"]) for r in in_allow]
+                        # 把 allowed 里没在排名中出现的也加在最后
+                        appended = [c for c in allowed_list if c not in ordered_allowed]
+                        raw_candidates = ordered_allowed + appended
+                        self.log(f"  候选顺序: {','.join(raw_candidates)}")
+                    except Exception as e:
+                        self.log(f"  排名查询失败({e})，按主人勾选的原始顺序尝试")
+                        raw_candidates = list(allowed_list)
+                else:
+                    # 未多选时，按价格+库存排序
+                    self.log("🔍 自动选号（未指定允许国家，按全平台价格+库存挑最优）...")
+                    try:
+                        rows = provider.get_top_countries(service=self.service)
+                        min_stock = _safe_int(self.config.get("sms_auto_min_stock"), 20)
+                        max_price = _safe_float(self.config.get("sms_auto_max_price"), 0)
+                        strict_whitelist = _safe_bool(self.config.get("sms_strict_whitelist"), False)
+
+                        def _qualifies(row: dict, stock_threshold: int) -> bool:
+                            cid = str(row.get("country") or "")
+                            if strict_whitelist and cid not in OPENAI_SMS_COUNTRIES:
+                                return False
+                            if max_price > 0 and (row.get("price") or 0) > max_price:
+                                return False
+                            return (row.get("count") or 0) >= stock_threshold
+
+                        # 先按正常库存阈值
+                        raw_candidates = [str(r["country"]) for r in rows if _qualifies(r, min_stock)]
+                        if not raw_candidates:
+                            raw_candidates = [str(r["country"]) for r in rows if _qualifies(r, 1)]
+                        if raw_candidates:
+                            labels = []
+                            for cid in raw_candidates[:5]:
+                                name = SMS_COUNTRY_NAMES_CN.get(cid, "未知")
+                                wl = "✅白名单" if cid in OPENAI_SMS_COUNTRIES else "⚠️非白名单"
+                                labels.append(f"{cid} {name}[{wl}]")
+                            self.log(f"✅ 自动选择国家候选: {' > '.join(labels)}{' ...' if len(raw_candidates) > 5 else ''}")
+                        else:
+                            self.log("⚠️ 未找到满足条件的国家，使用默认 country")
+                            raw_candidates = [self.country] if self.country else []
+                    except Exception as e:
+                        self.log(f"⚠️ 国家智能选择失败({e})，使用默认 country")
+                        raw_candidates = [self.country] if self.country else []
             else:
-                # 未多选时，单纯按价格选最便宜（默认非严格白名单）
-                self.log("🔍 自动选号（未指定允许国家，按全平台价格+库存挑最优）...")
-                try:
-                    best = provider.get_best_country(
-                        service=self.service,
-                        min_stock=_safe_int(self.config.get("sms_auto_min_stock"), 20),
-                        max_price=_safe_float(self.config.get("sms_auto_max_price"), 0),
-                        strict_whitelist=_safe_bool(self.config.get("sms_strict_whitelist"), False),
-                    )
-                    if best:
-                        name_cn = SMS_COUNTRY_NAMES_CN.get(best, "未知")
-                        in_wl = best in OPENAI_SMS_COUNTRIES
-                        wl_label = "✅ OpenAI SMS 白名单" if in_wl else "⚠️ 非白名单"
-                        self.log(f"✅ 自动选择国家: {best} {name_cn}  [{wl_label}]")
-                        country_candidates = [best]
-                    else:
-                        self.log("⚠️ 未找到满足条件的国家，使用默认 country")
-                        country_candidates = [self.country] if self.country else []
-                except Exception as e:
-                    self.log(f"⚠️ 国家智能选择失败({e})，使用默认 country")
-                    country_candidates = [self.country] if self.country else []
-        else:
-            # 没启用自动选号 → 强制用默认国家
-            country_candidates = [self.country] if self.country else []
+                # 没启用自动选号 → 强制用默认国家
+                raw_candidates = [self.country] if self.country else []
 
+        country_candidates = list(raw_candidates)
         if not country_candidates:
+            self.log(f"⚠️ 没有候选国家，fallback 默认国家 {SMS_DEFAULT_COUNTRY}")
             country_candidates = [SMS_DEFAULT_COUNTRY]
 
         country_label_log = ",".join(
@@ -953,18 +1169,25 @@ class PhoneCallbackController:
 
         reused = bool((self.activation.metadata or {}).get("reused"))
         used_country = self.activation.country or country_candidates[0]
+        if self.keep_country:
+            self._last_country = used_country
         used_country_label = f"{used_country} {SMS_COUNTRY_NAMES_CN.get(used_country, '')}"
         self.log(f"✅ 已租到号码{'(复用)' if reused else ''}: {self.activation.phone_number} "
                  f"国家={used_country_label} (activation_id={self.activation.activation_id})")
         return self.activation.phone_number
 
-    def get_code(self, timeout: int = 180) -> str:
+    def get_code(self, timeout: int = 180, *,
+                 resend_interval: Optional[int] = None,
+                 resend_max: Optional[int] = None) -> str:
         """阶段 2：等待 SMS 验证码。"""
         if not self.activation:
             raise RuntimeError("PhoneCallbackController: 未先 get_phone")
         provider = self._provider()
         self.log(f"⏳ 等待 SMS 验证码... (activation_id={self.activation.activation_id} timeout={timeout}s)")
-        code = provider.get_code(self.activation.activation_id, timeout=timeout)
+        code = provider.get_code(
+            self.activation.activation_id, timeout=timeout,
+            resend_interval=resend_interval, resend_max=resend_max,
+        )
         if code:
             self.log(f"✅ 收到 SMS 验证码: {code}")
             if getattr(provider, "auto_report_success_on_code", True):
@@ -1014,10 +1237,11 @@ class PhoneCallbackController:
         """流程结束（成功或失败）调用：释放未完成的号、解锁。"""
         if self.activation and not self.completed and self.provider:
             try:
-                self.provider.cancel(self.activation.activation_id)
-                self.log(f"🗑️ 已释放未使用号码: activation_id={self.activation.activation_id}")
-            except Exception:
-                pass
+                ok = self.provider.cancel(self.activation.activation_id)
+                status = "✅已退款" if ok else "❌退款失败"
+                self.log(f"🗑️ 已释放未使用号码: activation_id={self.activation.activation_id} ({status})")
+            except Exception as e:
+                self.log(f"🗑️ 释放号码异常: activation_id={self.activation.activation_id}, {e}")
         self._release_lock()
 
     def _release_lock(self) -> None:

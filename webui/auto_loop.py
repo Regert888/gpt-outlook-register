@@ -13,11 +13,15 @@ from __future__ import annotations
 import json
 import logging
 import queue
+import random
 import threading
 import time
 from typing import Optional
 
+from proxy_utils import mask_proxy_url, parse_proxy_pool
+
 from . import db, registrar
+
 
 logger = logging.getLogger("auto_loop")
 
@@ -26,17 +30,6 @@ class AutoLoopState:
     STOPPED = "stopped"
     RUNNING = "running"
     PAUSED = "paused"
-
-
-def _parse_proxy_pool(text: str) -> list[str]:
-    """把多行代理字符串拆成列表。空行 / # 开头注释跳过。"""
-    out: list[str] = []
-    for line in (text or "").splitlines():
-        s = line.strip()
-        if s and not s.startswith("#"):
-            out.append(s)
-    return out
-
 
 class AutoLoopController:
     """多 worker auto-loop 控制器。
@@ -73,6 +66,13 @@ class AutoLoopController:
         # 代理池 / 并发数
         self._proxy_pool: list[str] = []
         self._concurrency: int = 1
+        # 代理池轮换状态
+        self._auto_rotate_proxy: bool = True
+        self._proxy_rotation_interval: int = 5
+        self._proxy_rr_index: int = 0
+        self._proxy_start_offset: int = 0
+        self._accounts_started: int = 0
+        self._current_batch_proxy: str = ""
 
     # ──────────────────────── 公共 API ────────────────────────
 
@@ -94,7 +94,24 @@ class AutoLoopController:
             # 解析并发参数
             self._concurrency = max(1, min(20, int(self._options.get("concurrency") or 1)))
             pool_text = self._options.get("proxy_pool") or ""
-            self._proxy_pool = _parse_proxy_pool(pool_text)
+            self._proxy_pool = parse_proxy_pool(pool_text)
+            self._auto_rotate_proxy = bool(self._options.get("auto_rotate_proxy", True))
+            self._proxy_rotation_interval = max(
+                1, int(self._options.get("rotate_proxy_every") or 5)
+            )
+            # 代理池随机起始位置，避免每次重启都从头开始
+            if self._proxy_pool:
+                self._proxy_start_offset = random.randint(0, len(self._proxy_pool) - 1)
+                self._proxy_rr_index = self._proxy_start_offset
+                logger.info(
+                    f"[auto-loop] 代理池大小={len(self._proxy_pool)}, "
+                    f"随机起始偏移={self._proxy_start_offset}"
+                )
+            else:
+                self._proxy_start_offset = 0
+                self._proxy_rr_index = 0
+            self._accounts_started = 0
+            self._current_batch_proxy = ""
             # 启 manage 线程
             self._manage_thread = threading.Thread(
                 target=self._manage_loop, daemon=True, name="auto-loop-manage"
@@ -179,6 +196,8 @@ class AutoLoopController:
                 "registered_fail": self._registered_fail,
                 "concurrency": self._concurrency,
                 "proxy_pool_size": len(self._proxy_pool),
+                "auto_rotate_proxy": self._auto_rotate_proxy,
+                "rotate_proxy_every": self._proxy_rotation_interval,
                 "workers": workers_info,
                 "last_message": self._last_message,
                 "pool_stats": stats,
@@ -199,10 +218,80 @@ class AutoLoopController:
         self._broadcast("state", self._snapshot())
 
     def _proxy_for_worker(self, worker_id: int) -> str:
-        """按 worker_id 从代理池里挑一个代理。空池时回退到 options.proxy。"""
+        """按 worker_id 固定分配代理（不轮换），加上随机起始偏移。空池时回退到 options.proxy。"""
         if self._proxy_pool:
-            return self._proxy_pool[worker_id % len(self._proxy_pool)]
+            idx = (worker_id + self._proxy_start_offset) % len(self._proxy_pool)
+            proxy = self._proxy_pool[idx]
+            logger.info(
+                f"[auto-loop] worker-{worker_id} 固定代理: {mask_proxy_url(proxy)} "
+                f"(池索引={idx}, 偏移={self._proxy_start_offset})"
+            )
+            return proxy
         return self._options.get("proxy", "") or ""
+
+    def _pick_proxy_for_run(self, worker_id: int) -> str:
+        """根据前端配置决定代理分配策略，并跳过已达使用上限的代理。
+
+        - 未启用轮换：每个 worker 优先固定代理， exhausted 则顺延
+        - 启用轮换：每跑 `rotate_proxy_every` 个账号，全局切换到下一条可用代理
+        """
+        # 单代理模式
+        if not self._proxy_pool:
+            proxy = self._options.get("proxy", "") or ""
+            if proxy:
+                if not db.is_proxy_available(proxy):
+                    raise RuntimeError(f"代理 {mask_proxy_url(proxy)} 已达到使用上限")
+                logger.info(
+                    f"[auto-loop] worker-{worker_id} 使用单代理: {mask_proxy_url(proxy)}"
+                )
+            return proxy
+
+        # 固定代理模式：先按 worker 取，耗尽则顺延找可用
+        if not self._auto_rotate_proxy:
+            for i in range(len(self._proxy_pool)):
+                idx = (worker_id + self._proxy_start_offset + i) % len(self._proxy_pool)
+                proxy = self._proxy_pool[idx]
+                if db.is_proxy_available(proxy):
+                    logger.info(
+                        f"[auto-loop] worker-{worker_id} 固定代理: {mask_proxy_url(proxy)} "
+                        f"(池索引={idx}, 偏移={self._proxy_start_offset})"
+                    )
+                    return proxy
+            raise RuntimeError("代理池所有代理均已达到使用上限")
+
+        # 轮换模式
+        with self._lock:
+            rotated = False
+            need_rotate = (
+                self._accounts_started % self._proxy_rotation_interval == 0
+                or not self._current_batch_proxy
+                or not db.is_proxy_available(self._current_batch_proxy)
+            )
+            if need_rotate:
+                found = False
+                for _ in range(len(self._proxy_pool)):
+                    idx = self._proxy_rr_index % len(self._proxy_pool)
+                    proxy = self._proxy_pool[idx]
+                    self._proxy_rr_index += 1
+                    if db.is_proxy_available(proxy):
+                        self._current_batch_proxy = proxy
+                        found = True
+                        break
+                if not found:
+                    raise RuntimeError("代理池所有代理均已达到使用上限")
+                rotated = True
+
+            proxy = self._current_batch_proxy
+            self._accounts_started += 1
+            account_no = self._accounts_started
+            interval = self._proxy_rotation_interval
+            logger.info(
+                f"[auto-loop] worker-{worker_id} 第 {account_no} 个账号 "
+                f"使用代理: {mask_proxy_url(proxy)} "
+                f"(本批第 {((account_no - 1) % interval) + 1}/{interval} 个, "
+                f"{'已轮换' if rotated else '同批复用'})"
+            )
+            return proxy
 
     def _record_finish(self, ok: bool, category: str):
         """worker 结束一个 run 后调，更新计数 + 熔断。"""
@@ -260,16 +349,23 @@ class AutoLoopController:
             with self._lock:
                 self._state = AutoLoopState.STOPPED
                 self._worker_status.clear()
-                self._last_message = (
-                    f"已停止（成功 {self._registered_ok} / 失败 {self._registered_fail}）"
-                )
+                # 若中途已被熔断（余额不足 / 连续网络错误）就保留原因，
+                # 否则用通用的"已停止（成功/失败）"汇总
+                if not self._last_break_reason:
+                    self._last_message = (
+                        f"已停止（成功 {self._registered_ok} / 失败 {self._registered_fail}）"
+                    )
+                else:
+                    self._last_message = (
+                        f"已停止：{self._last_break_reason} "
+                        f"（成功 {self._registered_ok} / 失败 {self._registered_fail}）"
+                    )
             self._broadcast("state", self._snapshot())
 
     def _worker_loop(self, worker_id: int):
         """单 worker 循环：claim → 跑 → 等结束 → 继续。"""
         idle_round = 0
-        proxy = self._proxy_for_worker(worker_id)
-        logger.info(f"[worker-{worker_id}] 启动 (proxy={proxy or '直连'})")
+        logger.info(f"[worker-{worker_id}] 启动")
 
         while True:
             # 检查停止
@@ -284,11 +380,26 @@ class AutoLoopController:
                 if self._stop_event.is_set():
                     return
 
-            # claim 下一个号（CF 模式用虚拟占位，无需 outlook 号池）
+            # 余额下限检查：每个 worker 在 claim 新号前查一次接码平台余额，
+            # 不足则触发整体停止（其它 worker 下一轮也会命中并退出）
+            try:
+                registrar.check_sms_balance()
+            except RuntimeError as e:
+                reason = str(e)
+                logger.warning(f"[worker-{worker_id}] {reason}")
+                with self._lock:
+                    self._stop_event.set()
+                    self._state = AutoLoopState.STOPPED
+                    self._last_break_reason = reason
+                    self._last_message = reason
+                self._broadcast("circuit_break", {"reason": reason})
+                return
+
+            # claim 下一个号（CF / OEP 模式用虚拟占位，无需 outlook 号池）
             mail_source = db.get_setting("mail_source", "outlook")
-            if mail_source == "cf_temp":
+            if mail_source in ("cf_temp", "oep"):
                 account = {
-                    "email": f"cf_placeholder_{int(time.time())}_{worker_id}@cf.local",
+                    "email": f"placeholder_{int(time.time())}_{worker_id}@pool.local",
                     "password": "", "client_id": "", "refresh_token": "",
                 }
             else:
@@ -311,7 +422,8 @@ class AutoLoopController:
                 continue
             idle_round = 0
 
-            # 给这个 run 注入 worker 自己的代理
+            # 根据配置取代理：固定 or 按账号批量轮换
+            proxy = self._pick_proxy_for_run(worker_id)
             run_options = dict(self._options)
             if proxy:
                 run_options["proxy"] = proxy
@@ -321,7 +433,7 @@ class AutoLoopController:
                 run_id = registrar.start_registration(account, run_options)
             except Exception as e:
                 logger.exception(f"[worker-{worker_id}] 启动注册失败: {e}")
-                if mail_source != "cf_temp":
+                if mail_source not in ("cf_temp", "oep"):
                     db.release_unused(account["email"])
                 time.sleep(2)
                 continue
@@ -342,7 +454,9 @@ class AutoLoopController:
             })
 
             # 等当前 run 跑完
-            ok, category = self._wait_run_finish(run_id)
+            ok, category, finished_email = self._wait_run_finish(run_id)
+            # 无号池模式 create_mailbox 后 runs.email 会被更新为真实邮箱
+            display_email = finished_email or account["email"]
 
             with self._lock:
                 self._worker_status.pop(worker_id, None)
@@ -350,7 +464,7 @@ class AutoLoopController:
             self._broadcast("state", self._snapshot())
             self._broadcast("run_finished", {
                 "worker_id": worker_id,
-                "email": account["email"],
+                "email": display_email,
                 "run_id": run_id,
                 "ok": ok,
                 "category": category,
@@ -364,26 +478,27 @@ class AutoLoopController:
                         break
                     time.sleep(0.1)
 
-    def _wait_run_finish(self, run_id: str, timeout: int = 1800) -> tuple[bool, str]:
-        """轮询 runs 表，等 run 跑完。"""
+    def _wait_run_finish(self, run_id: str, timeout: int = 1800) -> tuple[bool, str, str]:
+        """轮询 runs 表，等 run 跑完。返回 (ok, category, email)。"""
         deadline = time.time() + timeout
         while time.time() < deadline:
             if self._stop_event.is_set():
-                return False, ""
+                return False, "", ""
             con = db._conn()
             cur = con.execute(
-                "SELECT status, error_category FROM runs WHERE run_id=?", (run_id,)
+                "SELECT status, error_category, email FROM runs WHERE run_id=?", (run_id,)
             )
             row = cur.fetchone()
             if row:
                 st = row["status"]
+                email = (row["email"] or "")
                 if st == "done":
-                    return True, ""
+                    return True, "", email
                 if st == "failed":
-                    return False, (row["error_category"] or "")
+                    return False, (row["error_category"] or ""), email
             time.sleep(1)
         logger.warning(f"run {run_id} 等了 {timeout}s 没结束，超时放弃")
-        return False, ""
+        return False, "", ""
 
 
 # 全局单例
