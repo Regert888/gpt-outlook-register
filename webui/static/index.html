@@ -55,6 +55,15 @@
         <input id="regOtpTimeout" type="number" value="180" min="30" max="600">
       </label>
 
+      <label class="check" title="勾选时：若上面填了指定邮箱但该邮箱不可用，直接报错停止，不会自动换号">
+        <input type="checkbox" id="regStrictEmail" checked>
+        <b>指定邮箱不可用时停止</b> <small>（不自动换号）</small>
+      </label>
+      <label class="check" title="勾选时：如果下方填写了代理池，单个注册会从代理池中随机选择一条代理；默认使用上面的单代理">
+        <input type="checkbox" id="regRandomProxyFromPool">
+        <b>如果填写了代理池，从代理池中随机选代理</b>
+      </label>
+
       <div class="row">
         <button id="btnRun" class="primary">▶ 开始注册（单个）</button>
         <span id="runStatus" class="result"></span>
@@ -74,10 +83,28 @@
         </label>
       </div>
       <div class="row">
-        <label class="check inline-check" style="width:100%" title="多代理池：每行一个，worker 按顺序轮流取；如果留空则所有 worker 都用上面的「代理」字段">
+        <label class="check inline-check" style="width:100%" title="多代理池：每行一个；配合「自动轮换」可按账号批量切换">
           <span style="white-space:nowrap">代理池:</span>
-          <textarea id="autoProxyPool" rows="3" placeholder="留空 = 所有 worker 用同一个代理&#10;每行一个代理，并发 N 时 worker 0~N 依次用&#10;例：&#10;socks5://127.0.0.1:7890&#10;socks5://127.0.0.1:7891&#10;http://1.2.3.4:8080" style="flex:1;font-family:monospace;font-size:12px;margin-left:4px"></textarea>
+          <textarea id="autoProxyPool" rows="3" placeholder="留空 = 所有 worker 用同一个代理&#10;每行一个代理，配合自动轮换使用&#10;例：&#10;socks5://127.0.0.1:7890&#10;socks5://127.0.0.1:7891&#10;http://1.2.3.4:8080" style="flex:1;font-family:monospace;font-size:12px;margin-left:4px"></textarea>
         </label>
+      </div>
+      <div class="row">
+        <label class="check inline-check" title="开启后按账号批量切换代理池，避免同一 IP 跑太多号">
+          <input type="checkbox" id="autoRotateProxy" checked>
+          <b>自动轮换代理</b>
+        </label>
+        <label class="check inline-check" title="1 = 每个账号都换；N = 每 N 个账号换一条代理">
+          每 <input id="rotateProxyEvery" type="number" value="5" min="1" max="1000" style="width:60px;display:inline-block;margin:0 4px"> 个账号换一条代理
+        </label>
+        <label class="check inline-check" title="单个代理累计使用次数达到上限后自动跳过">
+          代理上限 <input id="proxyMaxUses" type="number" value="10" min="1" max="100000" style="width:70px;display:inline-block;margin:0 4px"> 次
+        </label>
+      </div>
+      <div class="row">
+        <button id="btnSaveProxyCfg" type="button">💾 保存代理配置</button>
+        <button id="btnTestProxyPool" type="button" title="并发测试代理池里每条代理的 chatgpt.com 连通性">🔌 测试代理池</button>
+        <span id="proxyTestResult" class="result"></span>
+        <span id="proxyCfgResult" class="result"></span>
       </div>
       <div class="row">
         <span id="autoStatus" class="auto-status">⚪ 未运行</span>
@@ -87,8 +114,16 @@
 
   <!-- 右：日志 + 列表 -->
   <section class="card">
-    <h2>📜 实时日志</h2>
+    <div class="row" style="justify-content:space-between;margin-top:0">
+      <h2>📜 实时日志</h2>
+      <div class="log-actions">
+        <button id="btnCopyLog" title="复制当前全部日志到剪贴板">📋 复制日志</button>
+        <button id="btnFullscreenLog" title="放大查看运行日志">⛶ 放大日志</button>
+      </div>
+    </div>
     <div id="logBox" class="log"></div>
+    <button id="btnCloseLogExpand" class="log-close hidden" title="关闭">✕</button>
+    <div id="logBackdrop" class="log-backdrop hidden"></div>
 
     <div class="tabs">
       <button class="tab active" data-tab="pool">号池</button>
@@ -174,8 +209,9 @@
       <h3 style="margin:0 0 12px;color:var(--pink-dark)">📧 邮箱来源配置</h3>
       <p class="hint">
         OpenAI 注册需要邮箱收 OTP。可选 Outlook 接码池（从号池 claim），
-        或者用主人自己的 CF Worker 自建 catch-all 邮箱
-        (<a href="https://github.com/dreamhunter2333/cloudflare_temp_email" target="_blank" rel="noopener" class="brand-link">cloudflare_temp_email</a>)。
+        CF Worker 自建 catch-all 邮箱
+        (<a href="https://github.com/dreamhunter2333/cloudflare_temp_email" target="_blank" rel="noopener" class="brand-link">cloudflare_temp_email</a>)，
+        或对接 <a href="https://github.com/ZeroPointSix/outlookEmailPlus" target="_blank" rel="noopener" class="brand-link">OutlookEmailPlus</a> 平台（Graph 读信，绕过 IMAP "not connected"）。
       </p>
       <div class="form">
         <fieldset>
@@ -188,9 +224,14 @@
             <input type="radio" name="mailSource" value="cf_temp" id="msCfTemp">
             CF Temp Email <small>（cloudflare_temp_email 自建 catch-all）</small>
           </label>
+          <label class="check">
+            <input type="radio" name="mailSource" value="oep" id="msOep">
+            OutlookEmailPlus 平台 <small>（对接远端池，Graph API 取码）</small>
+          </label>
         </fieldset>
 
-        <div id="cfTempCfg" class="hidden">
+        <div id="cfTempCfg" class="hidden cfg-box">
+          <div class="cfg-box-head">CF Temp Email</div>
           <label>API URL <small>（Worker 部署地址，如 https://mail.example.com）</small>
             <input id="cfApiUrl" placeholder="https://mail.example.com">
           </label>
@@ -206,9 +247,29 @@
           </p>
         </div>
 
+        <div id="oepCfg" class="hidden cfg-box">
+          <div class="cfg-box-head">OutlookEmailPlus</div>
+          <label>API URL <small>（OutlookEmailPlus 部署地址，如 https://example.com:9967）</small>
+            <input id="oepApiUrl" placeholder="https://example.com:9967">
+          </label>
+          <label>API Key <small>（平台 X-API-Key）</small>
+            <input id="oepApiKey" placeholder="留空表示不修改（已设置）" type="password">
+          </label>
+          <label>Project Key <small>（可选，多租户隔离；留空=公共池）</small>
+            <input id="oepProjectKey" placeholder="project-A">
+          </label>
+          <label>Caller ID <small>（调用方标识，默认 gpt-outlook-register）</small>
+            <input id="oepCallerId" placeholder="gpt-outlook-register">
+          </label>
+          <p class="hint">
+            ✅ 平台用 Graph API 优先读信，能绕过本地 IMAP 的 "User is authenticated but not connected" 问题。
+            注册成功/失败会自动回传 claim-complete / claim-release。
+          </p>
+        </div>
+
         <div class="row">
           <button id="btnSaveMailCfg" class="primary">💾 保存配置</button>
-          <button id="btnTestMail">🔌 测试 CF 连通性</button>
+          <button id="btnTestMail">🔌 测试连通性</button>
           <span id="mailCfgResult" class="result"></span>
         </div>
       </div>
@@ -228,11 +289,22 @@
             <input type="radio" name="smsProvider" value="smsbower" id="spSmsbower" checked>
             SmsBower <small>（smsbower.page，支持号码复用 + V2 API + auto-resend）</small>
           </label>
+          <label class="check">
+            <input type="radio" name="smsProvider" value="herosms" id="spHerosms">
+            HeroSMS <small>（hero-sms.com，与 SmsBower 同协议，支持号码复用）</small>
+          </label>
         </fieldset>
 
-        <label>API Key
-          <input id="smsApiKey" placeholder="留空表示不修改（已设置）" type="password">
-        </label>
+        <div id="smsbowerKeyRow">
+          <label>SmsBower API Key
+            <input id="smsbowerApiKey" placeholder="留空表示不修改（已设置）" type="password">
+          </label>
+        </div>
+        <div id="herosmsKeyRow">
+          <label>HeroSMS API Key
+            <input id="herosmsApiKey" placeholder="留空表示不修改（已设置）" type="password">
+          </label>
+        </div>
 
         <div class="row">
           <label style="flex:1">默认国家 <small>（不启用自动选号时强制用这个）</small>
@@ -244,17 +316,17 @@
         </div>
 
         <div class="row">
-          <label style="flex:1">号码最高单价 <small>（SmsBower，单位平台货币；空 = 不限）</small>
+          <label style="flex:1">号码最高单价 <small>（SmsBower / HeroSMS，单位平台货币；空 = 不限）</small>
             <input id="smsMaxPrice" placeholder="0.5">
           </label>
-          <label style="flex:1">同号成功复用上限 <small>（SmsBower，默认 3）</small>
+          <label style="flex:1">同号成功复用上限 <small>（SmsBower / HeroSMS，默认 3）</small>
             <input id="smsPhoneSuccessMax" placeholder="3" type="number" min="0" max="10">
           </label>
         </div>
 
         <label class="check">
           <input type="checkbox" id="smsReusePhone">
-          <b>启用号码复用</b> <small>（SmsBower：同一个号在生命周期内复用多次，省钱）</small>
+          <b>启用号码复用</b> <small>（SmsBower / HeroSMS：同一个号在生命周期内复用多次，省钱）</small>
         </label>
 
         <fieldset>
@@ -262,6 +334,10 @@
           <label class="check">
             <input type="checkbox" id="smsAutoCountry">
             <b>启用自动选国家</b> <small>（从下面"允许的国家"里按价格 + 库存自动挑最优）</small>
+          </label>
+          <label class="check">
+            <input type="checkbox" id="smsKeepCountry">
+            <b>同一账号保持国家不变</b> <small>（本次注册流程内第一次租到哪个国家，后续换号就一直用该国）</small>
           </label>
           <div class="row">
             <label style="flex:1">最低库存
@@ -282,6 +358,8 @@
             <em style="grid-column:1/-1;color:#aaa;font-size:12px">加载中...</em>
           </div>
           <div class="row" style="margin-top:6px">
+            <button type="button" id="btnSelectAllAllowedCountries">✅ 全选</button>
+            <button type="button" id="btnInvertAllowedCountries">🔄 反选</button>
             <button type="button" id="btnClearAllowedCountries">🗑️ 清空</button>
             <span id="smsAllowedCountryCount" style="font-size:12px;color:var(--pink-dark);margin-left:8px"></span>
           </div>
@@ -290,22 +368,38 @@
         <fieldset>
           <legend>失败重试策略</legend>
           <div class="row">
-            <label style="flex:1">最多换号次数 <small>（空 = 用平台默认: 默认 3；自定义请填正整数）</small>
-              <input id="smsMaxPhoneAttempts" placeholder="留空使用平台默认" type="number" min="1" max="20">
+            <label style="flex:1">最多换号次数 <small>（空 = 默认 8；自定义请填正整数）</small>
+              <input id="smsMaxPhoneAttempts" placeholder="留空 = 默认 8" type="number" min="1" max="30">
             </label>
-            <label style="flex:1">单号等待秒数 <small>（默认 80 = 20s × 3 次 OpenAI resend + 20s 缓冲）</small>
-              <input id="smsPerPhoneTimeout" placeholder="80" type="number" min="40" max="600">
+            <label style="flex:1">resend 间隔秒数 <small>（默认 20；OpenAI 端重发 OTP 的间隔）</small>
+              <input id="smsResendInterval" placeholder="20" type="number" min="10" max="300">
+            </label>
+            <label style="flex:1">resend 最多次数 <small>（默认 3；单号窗口内最多重发几次）</small>
+              <input id="smsResendMax" placeholder="3" type="number" min="1" max="5">
             </label>
           </div>
           <p class="hint" style="margin:6px 0 0;font-size:12px">
-            💡 流程：每号窗口内每 20s 触发一次 OpenAI 端 resend（最多 3 次）。
+            💡 单号等待窗口 = 间隔 × 次数 + 20s 缓冲
+            （当前 <span id="smsPerPhoneHint">80</span>s）。
             失败时立刻 cancel 当前号 + 换新号继续，不浪费时间。
+          </p>
+        </fieldset>
+
+        <fieldset>
+          <legend>余额下限保护</legend>
+          <label>最低余额 <small>（注册前查询接码平台余额；低于此值停止执行注册，避免白跑。空 / 0 = 不检查）</small>
+            <input id="smsMinBalance" placeholder="留空 = 不检查" type="number" min="0" step="0.01">
+          </label>
+          <p class="hint" style="margin:6px 0 0;font-size:12px">
+            💡 余额查询失败不会阻塞注册（避免供应商临时抖动导致全停）。
+            余额不足时，单个注册直接报错；批量自动跑会在连续触发后熔断暂停。
           </p>
         </fieldset>
 
         <div class="row">
           <button id="btnSaveSmsCfg" class="primary">💾 保存配置</button>
-          <button id="btnTestSms">🔌 测试余额</button>
+          <button id="btnTestSmsbower" type="button">🔌 测试 SmsBower 余额</button>
+          <button id="btnTestHerosms" type="button">🔌 测试 HeroSMS 余额</button>
           <span id="smsCfgResult" class="result"></span>
         </div>
       </div>

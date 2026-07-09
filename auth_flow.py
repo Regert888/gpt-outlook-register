@@ -79,6 +79,7 @@ class AuthFlow:
         self._is_existing_account = False
         self._existing_email_verification_mode = ""
         self._existing_page_type = ""
+        self._current_mail_provider = None
         self._manual_login_verifier = (os.getenv("LOGIN_VERIFIER", "") or "").strip()
         self._captured_login_verifier = ""
         self._oauth_client_secret = (os.getenv("OAUTH_CLIENT_SECRET", "") or "").strip()
@@ -458,6 +459,12 @@ class AuthFlow:
         msg = str(exc).lower()
         return "registration_disallowed" in msg
 
+    @staticmethod
+    def _is_account_deactivated_error(exc: Exception) -> bool:
+        """OpenAI 账号已被删除/停用 (403 account_deactivated) — 永久不可逆。"""
+        msg = str(exc).lower()
+        return "account_deactivated" in msg or "deleted or deactivated" in msg
+
     def _get_cookie_value_by_name(self, name: str) -> str:
         """按 cookie 名称获取值（忽略 domain 冲突）。"""
         try:
@@ -536,6 +543,19 @@ class AuthFlow:
     @staticmethod
     def _env_flag(name: str, default: str = "0") -> bool:
         return str(os.getenv(name, default)).lower() in ("1", "true", "yes", "on")
+
+    def _human_delay(self, label: str = "") -> None:
+        """模拟人类操作间隔：随机 sleep 4~10s。
+
+        主链路步骤间调用，避免 CSRF→signup→OTP 背靠背瞬间完成被风控识别。
+        设 HUMAN_DELAY=0 可关闭（批量快速测试用）。
+        """
+        if not self._env_flag("HUMAN_DELAY", "1"):
+            return
+        wait = random.uniform(4.0, 10.0)
+        tag = f" [{label}]" if label else ""
+        logger.info(f"[human]{tag} 等待 {wait:.1f}s 模拟人类操作...")
+        time.sleep(wait)
 
     @staticmethod
     def _b64url_no_pad(raw: bytes) -> str:
@@ -855,8 +875,11 @@ class AuthFlow:
             except Exception:
                 msg = resp.text[:150]
                 code = ""
-            # 抛异常时只带 message（不带完整 JSON），让上层日志更简洁
-            raise RuntimeError(msg or f"HTTP {resp.status_code}")
+            # 抛异常时带 message + code（方便上层识别 voip_phone_disallowed 等）
+            err_text = msg or f"HTTP {resp.status_code}"
+            if code:
+                err_text = f"{err_text} (code={code})"
+            raise RuntimeError(err_text)
 
         try:
             return resp.json() if resp is not None else {}
@@ -943,11 +966,12 @@ class AuthFlow:
     def _handle_add_phone_via_sms(self, continue_url: str = "") -> str:
         """走 SMS 接码 controller：租号 → add-phone/send → 等 SMS → validate。
 
-        支持平台：SmsBower（smsbower.page）。
-        单号窗口 80s（每 20s × 3 触发一次 OpenAI 端 resend）；失败自动 cancel + 换新号。
-        最多换号次数默认 3，主人可在 WebUI / 环境变量 OPENAI_PHONE_MAX_ATTEMPTS 自定义。
+        支持平台：SmsBower（smsbower.page）、HeroSMS（hero-sms.com）。
+        单号窗口 = resend 间隔 × 次数 + 20s 缓冲（默认 20s × 3 = 80s）；失败自动 cancel + 换新号。
+        最多换号次数默认 8，主人可在 WebUI / 环境变量 OPENAI_PHONE_MAX_ATTEMPTS 自定义。
         """
         ctrl = self._sms_callback
+        logger.info("[sms] 命中 add-phone，使用接码平台: %s", getattr(ctrl, "provider_key", "unknown"))
         try:
             ctrl.set_resend_callback(self._phone_otp_resend)
         except Exception:
@@ -984,13 +1008,20 @@ class AuthFlow:
             except Exception:
                 return int(default)
 
-        # 单号等待窗口（秒）：默认 80 = 20×3 + 20 缓冲
-        per_phone_timeout = max(40, _read_int(
-            "sms_per_phone_timeout", "OPENAI_PHONE_OTP_TIMEOUT", "80", min_v=40
-        ))
-        # 最多换几个号（默认 3）
+        # OpenAI resend 间隔（秒）：默认 20
+        resend_interval = _read_int(
+            "sms_resend_interval", "OPENAI_PHONE_RESEND_INTERVAL", "20", min_v=10
+        )
+        # OpenAI resend 最多次数：默认 3
+        resend_max = _read_int(
+            "sms_resend_max", "OPENAI_PHONE_RESEND_MAX", "3", min_v=1
+        )
+        # 单号等待窗口（秒）= resend 间隔 × 次数 + 20s 缓冲
+        per_phone_timeout = max(resend_interval * resend_max + 20, 60)
+
+        # 最多换几个号（默认 8）
         max_phone_attempts = _read_int(
-            "sms_max_phone_attempts", "OPENAI_PHONE_MAX_ATTEMPTS", "3"
+            "sms_max_phone_attempts", "OPENAI_PHONE_MAX_ATTEMPTS", "8"
         )
         # 单号内 code validate 失败后的重试次数（如果还有时间）
         max_code_retries_per_phone = _read_int(
@@ -998,15 +1029,17 @@ class AuthFlow:
         )
 
         logger.info(
-            "[sms] 配置: provider=%s 单号窗口=%ds 最多换号=%d 单号内验证重试=%d",
-            provider_key, per_phone_timeout, max_phone_attempts, max_code_retries_per_phone,
+            "[sms] 配置: provider=%s resend=%ds×%d 单号窗口=%ds 最多换号=%d 单号内验证重试=%d",
+            provider_key, resend_interval, resend_max, per_phone_timeout,
+            max_phone_attempts, max_code_retries_per_phone,
         )
 
         # OpenAI "号已被使用 / 不允许" 类错误关键字
         _PHONE_REJECTED_PATTERNS = (
             "phone_number_already_in_use", "already_in_use", "already_taken",
             "phone_already_verified", "already_verified",
-            "disallowed_phone", "invalid_phone_number", "phone_number_invalid",
+            "disallowed_phone", "invalid_phone_number", "invalid phone number",
+            "phone_number_invalid", "voip_phone_disallowed",
             "blocked_phone", "phone_number_blocked",
             "suspicious behavior from phone",  # OpenAI 风控：号段可疑
         )
@@ -1033,6 +1066,9 @@ class AuthFlow:
             # 阶段 2：通知 OpenAI 发码到这个号
             send_resp = None
             try:
+                # 每次 POST add-phone/send 前模拟人类操作间隔，避免背靠背触发风控/频控
+                if phone_attempt > 1:
+                    self._human_delay("sms_retry")
                 logger.info("[sms] 📤 准备 POST add-phone/send (phone=%s) ...", phone)
                 send_resp = self._add_phone_send(phone)
                 logger.info("[sms] ✅ POST add-phone/send 成功 (phone=%s)", phone)
@@ -1075,7 +1111,7 @@ class AuthFlow:
 
             ctrl.mark_send_succeeded()
 
-            # 阶段 3：等 SMS code（SmsBower 内部会按 20s × 3 调 OpenAI resend）
+            # 阶段 3：等 SMS code（SmsBower 内部按配置的 interval × max 调 OpenAI resend）
             phone_start = time.time()
             seen_codes: set[str] = set()
             code_attempt = 0
@@ -1090,7 +1126,11 @@ class AuthFlow:
                     "[sms] 号 %s 第 %d/%d 次等 SMS (剩余 %ds)",
                     phone, code_attempt, max_code_retries_per_phone, int(remaining),
                 )
-                code = ctrl.get_code(timeout=int(remaining))
+                code = ctrl.get_code(
+                    timeout=int(remaining),
+                    resend_interval=resend_interval,
+                    resend_max=resend_max,
+                )
                 if not code:
                     break  # 超时换号
                 if code in seen_codes:
@@ -1495,6 +1535,7 @@ class AuthFlow:
         logger.info("检查网络连通性...")
         try:
             resp = self.session.get("https://cloudflare.com/cdn-cgi/trace", timeout=15)
+            self._trace_http("check_proxy_cloudflare_trace", resp)
             if resp.status_code == 200:
                 loc = re.search(r"loc=(\w+)", resp.text)
                 ip = re.search(r"ip=([^\n]+)", resp.text)
@@ -1510,6 +1551,7 @@ class AuthFlow:
                 headers=csrf_headers,
                 timeout=20,
             )
+            self._trace_http("check_proxy_chatgpt_csrf", csrf_resp)
             if csrf_resp.status_code == 200:
                 logger.info("chatgpt csrf 连通正常")
                 return True
@@ -1533,6 +1575,7 @@ class AuthFlow:
                     headers=headers,
                     timeout=30,
                 )
+                self._trace_http(f"chatgpt_csrf_attempt_{attempt + 1}", resp)
             except Exception as e:
                 if self._is_tls_error(e) and self._rotate_impersonate_session():
                     continue
@@ -1926,7 +1969,17 @@ class AuthFlow:
         if resp.status_code != 200:
             body = (resp.text or "")
             logger.warning(f"verify_otp FULL body ({resp.status_code}): {body[:2000]}")
-            raise RuntimeError(f"OTP 验证失败: {resp.status_code} - {body[:260]}")
+            err = RuntimeError(f"OTP 验证失败: {resp.status_code} - {body[:260]}")
+            if self._is_account_deactivated_error(err):
+                mail = getattr(self, "_current_mail_provider", None)
+                if mail is not None and hasattr(mail, "mark_outlook_retired"):
+                    try:
+                        mail.mark_outlook_retired(
+                            "OpenAI 账号已被删除/停用 (account_deactivated)"
+                        )
+                    except Exception:
+                        pass
+            raise err
         logger.info("OTP 验证成功")
         try:
             return resp.json()
@@ -2578,6 +2631,7 @@ class AuthFlow:
     # ── 完整注册流程 ──
     def run_register(self, mail_provider: MailProvider) -> AuthResult:
         """执行完整注册流程"""
+        self._current_mail_provider = mail_provider
         # 检查网络
         if not self.check_proxy():
             logger.warning("网络预检查未通过，继续尝试注册链路以获取精确错误...")
@@ -2587,10 +2641,15 @@ class AuthFlow:
         self.result.email = email
 
         # 登录/注册链路
+        self._human_delay("csrf")
         csrf_token = self.get_csrf_token()
+        self._human_delay("auth_url")
         auth_url = self.get_auth_url(csrf_token)
+        self._human_delay("oauth_init")
         device_id = self.auth_oauth_init(auth_url)
+        self._human_delay("sentinel")
         sentinel = self.get_sentinel_token(device_id)
+        self._human_delay("signup")
         is_new = self.signup(email, sentinel)
 
         # outlook 接码池邮箱被 OpenAI 标"已有账号" 处理策略:
@@ -2624,9 +2683,11 @@ class AuthFlow:
 
         if is_new:
             # 新账号：注册密码 → 发 OTP → 验证 → 创建账户
+            self._human_delay("register_password")
             password_registered = self.register_password(email)
             otp_sent_at = time.time()
             if password_registered:
+                self._human_delay("send_otp")
                 try:
                     self.send_otp()
                 except RuntimeError as e:
@@ -2641,6 +2702,7 @@ class AuthFlow:
                 # 注册密码失败时优先按“已有账号 OTP”回退，避免卡死在 invalid_auth_step
                 logger.warning("注册密码失败，回退到已有账号 OTP 路径")
                 self.fetch_client_auth_session_dump("post_register_password_failed_new")
+                self._human_delay("register_fallback_otp")
                 if not self.kickoff_otp_delivery("register_password_failed_fallback"):
                     self.send_otp()
 
@@ -2654,6 +2716,7 @@ class AuthFlow:
                 issued_after=otp_sent_at,
             )
             try:
+                self._human_delay("verify_otp_new")
                 self.verify_otp(otp_code)
                 self.fetch_client_auth_session_dump("post_verify_otp_new")
             except RuntimeError as e:
@@ -2668,12 +2731,14 @@ class AuthFlow:
                         timeout=otp_timeout,
                         issued_after=otp_sent_at,
                     )
+                    self._human_delay("verify_otp_retry_new")
                     self.verify_otp(otp_code)
                     self.fetch_client_auth_session_dump("post_verify_otp_retry_new")
                 else:
                     raise
 
             try:
+                self._human_delay("create_account")
                 continue_url = self.create_account()
             except Exception as e:
                 # registration_disallowed 时尝试 reauthorize 兜底，若仍不可用再抛出
@@ -2701,6 +2766,7 @@ class AuthFlow:
                 if not login_password:
                     login_password = self._default_password_from_email(email)
                 self.result.password = login_password
+                self._human_delay("login_password_verify")
                 login_resp = self.login_password_verify(login_password)
                 continue_url = self._normalize_continue_url(
                     (login_resp or {}).get("continue_url", "") if isinstance(login_resp, dict) else ""
@@ -2710,12 +2776,14 @@ class AuthFlow:
                 if not continue_url or "/email-verification" in continue_url:
                     # password/verify 后推荐使用 resend，而不是 /email-otp/send
                     otp_sent_at = time.time()
+                    self._human_delay("existing_login_password_otp")
                     self.kickoff_otp_delivery("existing_login_password")
                     otp_code = mail_provider.wait_for_otp(
                         email,
                         timeout=otp_timeout,
                         issued_after=otp_sent_at,
                     )
+                    self._human_delay("verify_otp_existing_login_password")
                     otp_resp = self.verify_otp(otp_code)
                     continue_url = self._normalize_continue_url(
                         (otp_resp or {}).get("continue_url", "") if isinstance(otp_resp, dict) else ""
@@ -2724,11 +2792,14 @@ class AuthFlow:
                 need_send_otp = mode not in ("passwordless_signup", "passwordless_login")
                 if need_send_otp:
                     otp_sent_at = time.time()
+                    self._human_delay("existing_send_otp")
                     self.send_otp()
                 else:
                     # 某些模式在 /authorize/continue 已触发发码，不要重复 /email-otp/send 以免破坏 state
                     # 默认先尝试 /email-otp/resend 获取新码，失败再回看短窗口
                     forced_resend = self._env_flag("OTP_FORCE_RESEND", "1")
+                    if forced_resend:
+                        self._human_delay("existing_forced_resend")
                     if forced_resend and self.kickoff_otp_delivery("existing_forced_resend"):
                         otp_sent_at = time.time()
                         logger.info(f"已有账号验证码模式={mode}，已主动 resend OTP")
@@ -2787,6 +2858,7 @@ class AuthFlow:
                             timeout=otp_timeout,
                             issued_after=otp_sent_at,
                         )
+                        self._human_delay("verify_otp_retry_existing")
                         otp_resp = self.verify_otp(otp_code)
                         self.fetch_client_auth_session_dump("post_verify_otp_retry_existing")
                     else:
@@ -2801,6 +2873,7 @@ class AuthFlow:
             # 某些已有账号在 OTP 后会进入 about-you，需要补一次 create_account
             if continue_url and "/about-you" in continue_url:
                 try:
+                    self._human_delay("existing_about_you_create")
                     continue_url = self.create_account()
                 except Exception as e:
                     if self._is_registration_disallowed_error(e):
@@ -2825,13 +2898,16 @@ class AuthFlow:
             continue_url = self._normalize_continue_url(continue_url)
             # 关键尝试：在 chatgpt callback 被消费前，先走一次 Codex OAuth（有助于保留 auth.openai 登录态）
             if (not self.result.refresh_token) and self._env_flag("OAUTH_CODEX_RT_BEFORE_CALLBACK", "1"):
+                self._human_delay("codex_rt_before_callback")
                 self.oauth_codex_rt_exchange(mail_provider=mail_provider)
             # 可选：在 callback 被消费前尝试 token 交换（可能影响后续 callback，默认关闭）
             refresh_only_mode = self._env_flag("OAUTH_REFRESH_ONLY", "0")
             pre_exchange_default = "1" if refresh_only_mode else "0"
             pre_exchange = self._env_flag("OAUTH_EXCHANGE_BEFORE_CALLBACK", pre_exchange_default)
             if pre_exchange and not self._env_flag("SKIP_OAUTH_TOKEN_EXCHANGE", "0"):
+                self._human_delay("pre_exchange_token")
                 self.oauth_token_exchange(continue_url, continue_url)
+            self._human_delay("follow_redirect")
             callback_url, final_url = self.follow_redirect_chain(continue_url)
             if (not callback_url) and final_url and ("/workspace" in final_url):
                 normalized = self._normalize_continue_url(final_url)
@@ -2890,6 +2966,7 @@ class AuthFlow:
         - 适配 passwordless / login_password 两类已有账号入口
         - 可配合 OAUTH_EXCHANGE_BEFORE_CALLBACK / OAUTH_REFRESH_ONLY 尝试优先拿 refresh_token
         """
+        self._current_mail_provider = mail_provider
         if not (email or "").strip():
             raise RuntimeError("run_protocol_login 缺少邮箱")
 
@@ -2909,9 +2986,13 @@ class AuthFlow:
         login_password = (password or "").strip() or self._default_password_from_email(email)
         self.result.password = login_password
 
+        self._human_delay("csrf")
         csrf_token = self.get_csrf_token()
+        self._human_delay("auth_url")
         auth_url = self.get_auth_url(csrf_token)
+        self._human_delay("oauth_init")
         device_id = self.auth_oauth_init(auth_url)
+        self._human_delay("sentinel")
         sentinel = self.get_sentinel_token(device_id)
 
         continue_url = ""
@@ -2929,6 +3010,7 @@ class AuthFlow:
         if prefer_login_screen_first:
             try:
                 logger.info("已有账号协议登录：优先走 login screen_hint 探测 password/otp 分支")
+                self._human_delay("authorize_continue_login")
                 login_step = self.authorize_continue(
                     email=email,
                     sentinel_token=sentinel,
@@ -2951,6 +3033,7 @@ class AuthFlow:
                     # 命中已有账号 password 路径：标记之，让 kickoff_otp_delivery 走 resend
                     # 分支（避免 send_passwordless_otp 把 state 弄坏 → wrong_email_otp_code）
                     self._is_existing_account = True
+                    self._human_delay("login_password_verify")
                     login_resp = self.login_password_verify(login_password)
                     page_type = (self._extract_page_type(login_resp) or "").lower()
                     continue_url = self._normalize_continue_url(
@@ -2973,18 +3056,23 @@ class AuthFlow:
                 mode = ""
 
         if not continue_url and page_type not in ("login_password", "email_otp_verification"):
+            self._human_delay("signup_probe")
             is_new = self.signup(email, sentinel)
             if is_new:
                 logger.warning("目标邮箱未命中已有账号分支，回退到注册链路")
+                self._human_delay("register_password_fallback")
                 self.register_password(email)
                 otp_sent_at = time.time()
+                self._human_delay("send_otp_fallback")
                 self.send_otp()
                 otp_code = mail_provider.wait_for_otp(
                     email,
                     timeout=otp_timeout,
                     issued_after=otp_sent_at,
                 )
+                self._human_delay("verify_otp_fallback")
                 self.verify_otp(otp_code)
+                self._human_delay("create_account_fallback")
                 continue_url = self.create_account()
             else:
                 page_type = (self._existing_page_type or "").lower()
@@ -2996,8 +3084,10 @@ class AuthFlow:
         if not continue_url or "/email-verification" in continue_url:
             # 仍需 OTP：优先 resend 获取新码
             otp_sent_at = time.time()
+            self._human_delay("protocol_resend_otp")
             resend_ok = self.kickoff_otp_delivery("protocol_need_otp")
             if not resend_ok and mode not in ("passwordless_signup", "passwordless_login"):
+                self._human_delay("protocol_send_otp")
                 self.send_otp()
                 otp_sent_at = time.time()
 
@@ -3007,6 +3097,7 @@ class AuthFlow:
                 issued_after=otp_sent_at,
             )
             try:
+                self._human_delay("verify_otp_protocol")
                 otp_resp = self.verify_otp(otp_code)
                 self.fetch_client_auth_session_dump("post_verify_otp_protocol")
             except RuntimeError as e:
@@ -3020,6 +3111,7 @@ class AuthFlow:
                         timeout=otp_timeout,
                         issued_after=otp_sent_at,
                     )
+                    self._human_delay("verify_otp_retry_protocol")
                     otp_resp = self.verify_otp(otp_code)
                     self.fetch_client_auth_session_dump("post_verify_otp_retry_protocol")
                 else:
@@ -3041,11 +3133,14 @@ class AuthFlow:
         if continue_url:
             continue_url = self._normalize_continue_url(continue_url)
             if (not self.result.refresh_token) and self._env_flag("OAUTH_CODEX_RT_BEFORE_CALLBACK", "1"):
+                self._human_delay("codex_rt_before_callback_protocol")
                 self.oauth_codex_rt_exchange(mail_provider=mail_provider)
             pre_exchange_default = "1" if refresh_only_mode else "0"
             pre_exchange = self._env_flag("OAUTH_EXCHANGE_BEFORE_CALLBACK", pre_exchange_default)
             if pre_exchange:
+                self._human_delay("pre_exchange_token_protocol")
                 self.oauth_token_exchange(continue_url, continue_url)
+            self._human_delay("follow_redirect_protocol")
             callback_url, final_url = self.follow_redirect_chain(continue_url)
             if (not callback_url) and final_url and ("/workspace" in final_url):
                 normalized = self._normalize_continue_url(final_url)

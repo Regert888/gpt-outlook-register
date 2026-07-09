@@ -68,3 +68,4 @@ config.local.json
 .env
 .env.local
 secrets.json
+data/

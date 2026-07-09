@@ -8,15 +8,18 @@
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import json
 import logging
+import os
+import random
 import sys
 import time
 from pathlib import Path
 from typing import Optional
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -25,6 +28,9 @@ sys.path.insert(0, str(ROOT))
 
 from . import db, registrar  # noqa: E402
 from .auto_loop import CONTROLLER as AUTO_LOOP  # noqa: E402
+from auth_flow import AuthFlow  # noqa: E402
+from config import Config  # noqa: E402
+from proxy_utils import mask_proxy_url, parse_proxy_pool  # noqa: E402
 
 # 启动时自动释放卡死的 in_use 号（上次进程崩溃 / 强退留下的）
 try:
@@ -43,6 +49,44 @@ logger = logging.getLogger("webui")
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 
+
+def _log_startup_config():
+    """启动时打印关键数据库配置，方便排查。"""
+    try:
+        mail_source = db.get_setting("mail_source", "outlook")
+        proxy_cfg = db.get_proxy_config()
+        sms_cfg = db.get_sms_internal_config()
+        export_cfg = db.get_export_internal_config()
+
+        pool_lines = [
+            line.strip()
+            for line in (proxy_cfg.get("proxy_pool") or "").splitlines()
+            if line.strip() and not line.strip().startswith("#")
+        ]
+        logger.info(
+            "[startup] 配置: mail_source=%s | proxy_max_uses=%s | proxy_pool=%d条 | proxy=%s",
+            mail_source,
+            proxy_cfg.get("proxy_max_uses", "?"),
+            len(pool_lines),
+            mask_proxy_url(proxy_cfg.get("proxy", "") or "(无)"),
+        )
+        logger.info(
+            "[startup] 配置: sms_enabled=%s | sms_provider=%s | sms_country=%s",
+            sms_cfg.get("sms_enabled"),
+            sms_cfg.get("sms_provider"),
+            sms_cfg.get("sms_country"),
+        )
+        logger.info(
+            "[startup] 配置: cpa_enabled=%s | sub2api_enabled=%s",
+            export_cfg.get("cpa", {}).get("enabled"),
+            export_cfg.get("sub2api", {}).get("enabled"),
+        )
+    except Exception as _e:
+        logger.warning("[startup] 打印配置失败: %s", _e)
+
+
+_log_startup_config()
+
 app = FastAPI(title="GPT Outlook Register WebUI", docs_url=None, redoc_url=None)
 
 
@@ -59,8 +103,17 @@ class RegisterReq(BaseModel):
     want_session_token: bool = True
     want_refresh_token: bool = True
     proxy: str = ""
+    proxy_pool: str = ""
+    random_proxy_from_pool: bool = Field(
+        False,
+        description="True=若填写了代理池，单个注册从代理池随机选一条代理",
+    )
     otp_timeout: int = 180
     allow_existing_login: bool = True
+    strict_email: bool = Field(
+        True,
+        description="True=指定邮箱不可用时直接报错；False=自动 fallback 到下一个 available",
+    )
 
 
 # ──────────────────────── API ────────────────────────
@@ -73,7 +126,10 @@ def health():
 
 @app.post("/api/import")
 def api_import(req: ImportReq):
-    result = db.import_accounts(req.text)
+    rows = db.parse_lines(req.text)
+    for r in rows:
+        r["email"] = r["email"].lower()
+    result = db.import_accounts(rows)
     return {"ok": True, **result, "stats": db.stats()}
 
 
@@ -84,7 +140,7 @@ def api_accounts(status: str = "", limit: int = 500):
 
 @app.delete("/api/accounts/{email}")
 def api_delete_account(email: str):
-    ok = db.delete_account(email)
+    ok = db.delete_account(email.lower())
     if not ok:
         raise HTTPException(404, "not found")
     return {"ok": True}
@@ -102,7 +158,7 @@ def api_bulk_delete(req: BulkDeleteReq):
         n = db.delete_accounts_by_status(req.status)
         return {"ok": True, "deleted": n, "by": "status", "stats": db.stats()}
     if req.emails:
-        n = db.delete_accounts_by_emails(req.emails)
+        n = db.delete_accounts_by_emails([e.lower() for e in req.emails])
         return {"ok": True, "deleted": n, "by": "emails", "stats": db.stats()}
     raise HTTPException(400, "需要 status 或 emails")
 
@@ -116,7 +172,7 @@ def api_reset_failed():
 @app.post("/api/accounts/reset/{email}")
 def api_reset_account(email: str):
     """重置单个号：done / failed → available。"""
-    ok = db.reset_to_available(email)
+    ok = db.reset_to_available(email.lower())
     if not ok:
         raise HTTPException(404, f"邮箱 {email} 不存在")
     return {"ok": True, "email": email}
@@ -131,7 +187,7 @@ def api_bulk_reset(req: BulkResetReq):
     """批量重置：done / failed → available。"""
     if not req.emails:
         raise HTTPException(400, "emails 不能为空")
-    n = db.bulk_reset_to_available(req.emails)
+    n = db.bulk_reset_to_available([e.lower() for e in req.emails])
     return {"ok": True, "reset": n, "stats": db.stats()}
 
 
@@ -150,21 +206,42 @@ def api_stats():
 def api_register(req: RegisterReq):
     """启动注册任务，返回 run_id。前端拿 run_id 去 /api/runs/{run_id}/stream 订阅 SSE。"""
     mail_source = db.get_setting("mail_source", "outlook")
-    is_cf = (mail_source == "cf_temp")
+    is_pool_less = mail_source in ("cf_temp", "oep")
+    proxy = req.proxy
+    if req.random_proxy_from_pool:
+        proxy_pool = parse_proxy_pool(req.proxy_pool)
+        if proxy_pool:
+            proxy = random.choice(proxy_pool)
+            logger.info("[run] 单个注册从代理池随机选择代理: %s", mask_proxy_url(proxy))
 
-    if is_cf:
-        # CF 模式：不需要 outlook 号池，用虚拟占位 account
-        import time as _t
-        account = {
-            "email": f"cf_placeholder_{int(_t.time())}@cf.local",
-            "password": "",
-            "client_id": "",
-            "refresh_token": "",
-        }
+    if is_pool_less:
+        # CF / OEP 模式：不需要 outlook 号池；只有 OEP 支持指定邮箱
+        oep_specified = req.email if mail_source == "oep" else None
+        if oep_specified:
+            account = {
+                "email": oep_specified.strip(),
+                "password": "",
+                "client_id": "",
+                "refresh_token": "",
+            }
+        else:
+            import time as _t
+            account = {
+                "email": f"placeholder_{int(_t.time())}@pool.local",
+                "password": "",
+                "client_id": "",
+                "refresh_token": "",
+            }
     elif req.email:
-        account = db.claim_account(req.email)
+        account = db.claim_account(req.email.lower())
         if not account:
-            raise HTTPException(400, f"邮箱 {req.email} 不可用 (不存在 / 已 in_use / 已完成)")
+            if req.strict_email:
+                raise HTTPException(
+                    400, f"邮箱 {req.email} 不可用 (不存在 / 已 in_use / 已完成)"
+                )
+            account = db.claim_next()
+            if not account:
+                raise HTTPException(400, "号池里没有 available 账号；请先批量导入")
     else:
         account = db.claim_next()
         if not account:
@@ -174,13 +251,26 @@ def api_register(req: RegisterReq):
         "want_access_token": req.want_access_token,
         "want_session_token": req.want_session_token,
         "want_refresh_token": req.want_refresh_token,
-        "proxy": req.proxy,
+        "proxy": proxy,
         "otp_timeout": int(req.otp_timeout),
         "allow_existing_login": req.allow_existing_login,
+        "strict_email": req.strict_email,
+        # OEP 模式下指定了邮箱时透传给 registrar，让 OEP provider 跳过 claim-random；
+        # CF / outlook 模式不支持指定邮箱（CF 始终随机生成临时邮箱；outlook 走本地号池 claim）
+        "specified_email": oep_specified,
     }
-    run_id = registrar.start_registration(account, options)
+    try:
+        run_id = registrar.start_registration(account, options)
+    except RuntimeError as e:
+        msg = str(e)
+        if "余额不足" in msg:
+            raise HTTPException(status_code=400, detail=msg)
+        raise
     logger.info(f"[run] {run_id} -> {account['email']} (mail_source={mail_source})")
     return {"ok": True, "run_id": run_id, "email": account["email"]}
+
+
+
 
 
 @app.get("/api/runs/{run_id}/stream")
@@ -278,10 +368,14 @@ def api_get_mail_config():
 
 
 class SaveMailConfigReq(BaseModel):
-    mail_source: Optional[str] = None       # outlook / cf_temp
+    mail_source: Optional[str] = None       # outlook / cf_temp / oep
     cf_api_url: Optional[str] = None
     cf_admin_token: Optional[str] = None
     cf_domain: Optional[str] = None
+    oep_api_url: Optional[str] = None
+    oep_api_key: Optional[str] = None
+    oep_project_key: Optional[str] = None
+    oep_caller_id: Optional[str] = None
 
 
 @app.post("/api/settings/mail")
@@ -292,32 +386,66 @@ def api_save_mail_config(req: SaveMailConfigReq):
 
 @app.post("/api/settings/mail/test")
 def api_test_mail():
-    """测试 CF Temp Email 连通性：创建一个测试地址，确认 admin_token + domain 都对。"""
+    """测试邮箱来源连通性：CF Temp Email 或 OutlookEmailPlus 平台。"""
     mail_source = db.get_setting("mail_source", "outlook")
-    if mail_source != "cf_temp":
+    if mail_source == "cf_temp":
+        api_url = db.get_setting("cf_api_url", "")
+        domain = db.get_setting("cf_domain", "")
+        token = db.get_cf_admin_token()
+        if not api_url:
+            raise HTTPException(400, "未配置 cf_api_url")
+        if not domain:
+            raise HTTPException(400, "未配置 cf_domain")
+        if not token:
+            raise HTTPException(400, "未配置 cf_admin_token")
+
+        import sys as _sys
+        ROOT_DIR = Path(__file__).resolve().parents[1]
+        if str(ROOT_DIR) not in _sys.path:
+            _sys.path.insert(0, str(ROOT_DIR))
+        from mail_cf import CFTempEmailProvider
+        try:
+            provider = CFTempEmailProvider(api_url=api_url, admin_token=token, domain=domain)
+            test_email = provider.create_mailbox()
+            return {"ok": True, "message": f"连接成功，测试邮箱: {test_email}"}
+        except Exception as e:
+            raise HTTPException(500, f"连接失败: {e}")
+    elif mail_source == "oep":
+        api_url = db.get_setting("oep_api_url", "")
+        api_key = db.get_oep_api_key()
+        if not api_url:
+            raise HTTPException(400, "未配置 oep_api_url")
+        if not api_key:
+            raise HTTPException(400, "未配置 oep_api_key")
+
+        import sys as _sys
+        ROOT_DIR = Path(__file__).resolve().parents[1]
+        if str(ROOT_DIR) not in _sys.path:
+            _sys.path.insert(0, str(ROOT_DIR))
+        from mail_oep import OutlookEmailPlusProvider
+        try:
+            provider = OutlookEmailPlusProvider(
+                api_url=api_url, api_key=api_key,
+                caller_id=db.get_setting("oep_caller_id", "gpt-outlook-register"),
+                project_key=db.get_setting("oep_project_key", ""),
+            )
+            # 健康检查 + 池状态
+            import urllib.request as _u, json as _j
+            req = _u.Request(api_url.rstrip("/") + "/api/external/health")
+            req.add_header("X-API-Key", api_key)
+            health = _j.loads(_u.urlopen(req, timeout=15).read())
+            stats_req = _u.Request(api_url.rstrip("/") + "/api/external/pool/stats")
+            stats_req.add_header("X-API-Key", api_key)
+            stats = _j.loads(_u.urlopen(stats_req, timeout=15).read())
+            avail = (stats.get("data") or {}).get("pool_counts", {}).get("available", "?")
+            return {
+                "ok": True,
+                "message": f"连接成功 (v{health.get('data',{}).get('version','?')})，池中可用邮箱: {avail}",
+            }
+        except Exception as e:
+            raise HTTPException(500, f"连接失败: {e}")
+    else:
         raise HTTPException(400, f"当前 mail_source={mail_source}，不需要测试")
-
-    api_url = db.get_setting("cf_api_url", "")
-    domain = db.get_setting("cf_domain", "")
-    token = db.get_cf_admin_token()
-    if not api_url:
-        raise HTTPException(400, "未配置 cf_api_url")
-    if not domain:
-        raise HTTPException(400, "未配置 cf_domain")
-    if not token:
-        raise HTTPException(400, "未配置 cf_admin_token")
-
-    import sys as _sys
-    ROOT_DIR = Path(__file__).resolve().parents[1]
-    if str(ROOT_DIR) not in _sys.path:
-        _sys.path.insert(0, str(ROOT_DIR))
-    from mail_cf import CFTempEmailProvider
-    try:
-        provider = CFTempEmailProvider(api_url=api_url, admin_token=token, domain=domain)
-        test_email = provider.create_mailbox()
-        return {"ok": True, "message": f"连接成功，测试邮箱: {test_email}"}
-    except Exception as e:
-        raise HTTPException(500, f"连接失败: {e}")
 
 
 # ──────────────────────── SMS 接码配置 ────────────────────────
@@ -330,20 +458,24 @@ def api_get_sms_config():
 
 class SaveSmsConfigReq(BaseModel):
     sms_enabled: Optional[str] = None              # "0" / "1"
-    sms_provider: Optional[str] = None             # smsbower / smsbower
-    sms_api_key: Optional[str] = None              # 传 '***' 表示不修改
+    sms_provider: Optional[str] = None             # smsbower / herosms
+    smsbower_api_key: Optional[str] = None         # 传 '***' 表示不修改
+    herosms_api_key: Optional[str] = None          # 传 '***' 表示不修改
     sms_country: Optional[str] = None              # ID 或国家代码（'52' / 'th'）
     sms_service: Optional[str] = None              # OpenAI = 'dr'
     sms_max_price: Optional[str] = None
     sms_reuse_phone: Optional[str] = None
     sms_phone_success_max: Optional[str] = None
     sms_auto_country: Optional[str] = None
+    sms_keep_country: Optional[str] = None
     sms_strict_whitelist: Optional[str] = None
     sms_allowed_countries: Optional[str] = None    # 逗号分隔的 ID 列表，自动选号时只从这里挑
     sms_auto_min_stock: Optional[str] = None
     sms_auto_max_price: Optional[str] = None
     sms_max_phone_attempts: Optional[str] = None   # 空 = 用 provider 默认；>0 = 自定义
-    sms_per_phone_timeout: Optional[str] = None    # 单号等待秒数（默认 80）
+    sms_resend_interval: Optional[str] = None      # OpenAI resend 间隔秒数（默认 20）
+    sms_resend_max: Optional[str] = None           # OpenAI resend 最多次数（默认 3）
+    sms_min_balance: Optional[str] = None          # 短信供应商最低余额；低于则停止注册
 
 
 @app.post("/api/settings/sms")
@@ -352,12 +484,29 @@ def api_save_sms_config(req: SaveSmsConfigReq):
     return {"ok": True, "config": db.get_sms_config()}
 
 
+class TestSmsReq(BaseModel):
+    provider: Optional[str] = Field(None, description="smsbower / herosms；不传 = 用当前选中的 provider")
+
+
 @app.post("/api/settings/sms/test")
-def api_test_sms():
-    """测试 SMS provider 连通性：查询余额。"""
-    cfg = db.get_sms_internal_config()
-    if not cfg.get("sms_api_key"):
-        raise HTTPException(400, "未配置 sms_api_key")
+def api_test_sms(req: TestSmsReq):
+    """测试指定 SMS provider 连通性：查询余额。"""
+    target = (req.provider or db.get_setting("sms_provider", "smsbower")).strip().lower()
+    if target not in ("smsbower", "herosms"):
+        raise HTTPException(400, f"未知 provider: {target}")
+
+    api_key = db.get_setting(f"{target}_api_key", "").strip()
+    if not api_key:
+        raise HTTPException(400, f"未配置 {target}_api_key")
+
+    cfg = {
+        "sms_provider": target,
+        "sms_api_key": api_key,
+        "sms_country": db.get_setting("sms_country", "52"),
+        "sms_service": db.get_setting("sms_service", "dr"),
+        "sms_max_price": db.get_setting("sms_max_price", ""),
+        "sms_proxy": db.get_setting("proxy", ""),
+    }
 
     import sys as _sys
     ROOT_DIR = Path(__file__).resolve().parents[1]
@@ -365,11 +514,11 @@ def api_test_sms():
         _sys.path.insert(0, str(ROOT_DIR))
     from sms_provider import create_sms_provider
     try:
-        provider = create_sms_provider(cfg["sms_provider"], cfg)
+        provider = create_sms_provider(target, cfg)
         balance = provider.get_balance()
         return {
             "ok": True,
-            "provider": cfg["sms_provider"],
+            "provider": target,
             "balance": balance,
             "message": f"连接成功，余额: {balance}",
         }
@@ -379,11 +528,11 @@ def api_test_sms():
 
 @app.get("/api/settings/sms/countries")
 def api_sms_top_countries():
-    """查询 SmsBower / SmsBower 的国家排名（价格 + 库存）。"""
+    """查询 SmsBower / HeroSMS 的国家排名（价格 + 库存）。"""
     cfg = db.get_sms_internal_config()
     if not cfg.get("sms_api_key"):
         raise HTTPException(400, "未配置 sms_api_key")
-    if cfg["sms_provider"] not in ("smsbower", "smsbower"):
+    if cfg["sms_provider"] not in ("smsbower", "herosms"):
         return {"ok": True, "countries": [], "message": "当前 provider 不支持国家排名查询"}
 
     import sys as _sys
@@ -514,6 +663,83 @@ def api_manual_export_to_panel(req: ManualExportReq):
     return {"ok": True, **out}
 
 
+# ──────────────────────── 代理配置 ────────────────────────
+
+
+class ProxyConfigReq(BaseModel):
+    proxy: Optional[str] = None
+    proxy_pool: Optional[str] = None
+    auto_rotate_proxy: Optional[bool] = None
+    rotate_proxy_every: Optional[int] = None
+    proxy_max_uses: Optional[int] = None
+
+
+@app.get("/api/settings/proxy")
+def api_get_proxy_config():
+    return {"ok": True, "config": db.get_proxy_config()}
+
+
+@app.post("/api/settings/proxy")
+def api_save_proxy_config(req: ProxyConfigReq):
+    db.save_proxy_config(req.model_dump(exclude_none=True))
+    return {"ok": True, "config": db.get_proxy_config()}
+
+
+# ──────────────────────── 代理池连通性测试 ────────────────────────
+
+
+def _test_single_proxy(proxy: str) -> dict:
+    """测试单个代理：复用 AuthFlow.check_proxy()（cloudflare trace + chatgpt csrf）。"""
+    try:
+        cfg = Config(proxy=proxy or None)
+        flow = AuthFlow(cfg)
+        ok = flow.check_proxy()
+        return {
+            "proxy": proxy,
+            "ok": ok,
+            "error": "" if ok else "代理可联网，但 chatgpt.com 返回 403（IP 被 Cloudflare 拦截或 TLS 指纹被识别）",
+        }
+    except Exception as e:
+        return {"proxy": proxy, "ok": False, "error": str(e)}
+
+
+class ProxyPoolTestReq(BaseModel):
+    proxy_pool: str = ""    # 多行代理池
+    proxy: str = ""         # 单代理（无代理池时）
+
+
+@app.post("/api/settings/proxy/test")
+def api_test_proxy(req: ProxyPoolTestReq):
+    """批量测试代理池里每个代理的可用性。"""
+    proxies = [
+        line.strip()
+        for line in (req.proxy_pool or "").splitlines()
+        if line.strip() and not line.strip().startswith("#")
+    ]
+    if not proxies and req.proxy:
+        proxies = [req.proxy.strip()]
+    if not proxies:
+        raise HTTPException(400, "未提供代理，请填写「代理」或「代理池」")
+
+    results: list[dict] = []
+    max_workers = min(10, max(1, len(proxies)))
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as ex:
+        future_to_proxy = {ex.submit(_test_single_proxy, p): p for p in proxies}
+        for future in concurrent.futures.as_completed(future_to_proxy):
+            results.append(future.result())
+
+    # 按原始顺序返回
+    order = {p: i for i, p in enumerate(proxies)}
+    results.sort(key=lambda r: order.get(r["proxy"], 0))
+    available = sum(1 for r in results if r["ok"])
+    return {
+        "ok": True,
+        "available": available,
+        "total": len(results),
+        "results": results,
+    }
+
+
 # ──────────────────────── auto-loop ────────────────────────
 
 
@@ -528,6 +754,8 @@ class AutoLoopStartReq(BaseModel):
     otp_timeout: int = 180
     allow_existing_login: bool = True
     cool_down_seconds: float = 3.0  # 每个 worker 跑完后冷却（防风控）
+    auto_rotate_proxy: bool = True   # 是否按账号批量轮换代理
+    rotate_proxy_every: int = 5      # 每 N 个账号轮换一次代理
 
 
 @app.post("/api/auto/start")
@@ -608,12 +836,30 @@ async def api_auto_stream(request: Request):
 
 @app.get("/")
 def root():
-    return FileResponse(STATIC_DIR / "index.html")
+    return FileResponse(STATIC_DIR / "index.html", headers={
+        "Cache-Control": "no-cache, no-store, must-revalidate",
+    })
 
 
-app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
+# 静态文件禁止浏览器缓存，确保改 app.js/index.html 后硬刷新不需要
+app.mount(
+    "/static",
+    StaticFiles(directory=str(STATIC_DIR), html=False),
+    name="static",
+)
+
+
+@app.middleware("http")
+async def _no_cache_static(request: Request, call_next):
+    resp = await call_next(request)
+    if request.url.path.startswith("/static/"):
+        resp.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+    return resp
 
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("webui.app:app", host="127.0.0.1", port=8765, reload=False)
+
+    _port = int(os.environ.get("PORT", "8765"))
+    print(f"\n🔔 团子喵 WebUI: http://127.0.0.1:{_port}/\n")
+    uvicorn.run("webui.app:app", host="127.0.0.1", port=_port, reload=False)

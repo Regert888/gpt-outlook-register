@@ -45,6 +45,8 @@ python start_webui.py
 # 浏览器自动打开 http://127.0.0.1:8765/
 ```
 
+> 默认端口 8765，可用 `--port` 指定其他端口。
+
 **公网启动**：
 ```bash
 python start_webui.py --host 0.0.0.0 --port 8765

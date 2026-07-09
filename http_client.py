@@ -5,7 +5,10 @@ HTTP 客户端 - 使用 curl_cffi 实现 TLS 指纹模拟
 import logging
 from typing import Optional
 
+from proxy_utils import mask_proxy_url
+
 logger = logging.getLogger(__name__)
+
 
 # 尝试使用 curl_cffi（推荐，自带 TLS 指纹模拟）
 try:
@@ -38,6 +41,7 @@ def create_http_session(proxy: Optional[str] = None, impersonate: str = "chrome1
         # 使用显式配置，避免被系统 HTTP(S)_PROXY 隐式污染。
         session.trust_env = False
         if proxy:
+            logger.info(f"[http_client] 使用代理: {mask_proxy_url(proxy)}")
             # curl_cffi 在 SOCKS 代理下建议使用 socks5h，让 DNS 走代理端解析。
             # 这能减少本地 DNS/链路导致的 TLS 握手异常。
             normalized_proxy = proxy
@@ -47,9 +51,11 @@ def create_http_session(proxy: Optional[str] = None, impersonate: str = "chrome1
             session.proxies = {"https": normalized_proxy, "http": normalized_proxy}
         else:
             # 显式设置空代理，覆盖系统环境变量 (trust_env=False 对 libcurl 不够)
+            logger.info("[http_client] 未配置代理，使用直连")
             session.proxies = {"https": "", "http": ""}
         return session
     else:
+        logger.info("[http_client] curl_cffi 不可用，降级到 requests")
         session = requests.Session()
         session.trust_env = False
         retry = Retry(
@@ -62,6 +68,9 @@ def create_http_session(proxy: Optional[str] = None, impersonate: str = "chrome1
         session.mount("https://", adapter)
         session.mount("http://", adapter)
         if proxy:
+            logger.info(f"[http_client] 使用代理: {mask_proxy_url(proxy)}")
             session.proxies = {"https": proxy, "http": proxy}
+        else:
+            logger.info("[http_client] 未配置代理，使用直连")
         session.headers["User-Agent"] = USER_AGENT
         return session

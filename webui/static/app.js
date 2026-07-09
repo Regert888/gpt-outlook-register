@@ -6,13 +6,29 @@ const $$ = (s) => document.querySelectorAll(s);
 // ──────────────────────── 工具 ────────────────────────
 
 async function api(path, opts = {}) {
+  const headers = { "Content-Type": "application/json", ...(opts.headers || {}) };
   const resp = await fetch(path, {
-    headers: { "Content-Type": "application/json" },
     ...opts,
+    headers,
   });
   const data = await resp.json().catch(() => ({}));
   if (!resp.ok) throw new Error(data.detail || resp.statusText);
   return data;
+}
+
+// ──────────────────────── 页面初始化 ────────────────────────
+
+let _appIntervalStarted = false;
+
+function initApp() {
+  loadProxyConfig();
+  refreshStats();
+  refreshPool();
+  _connectAutoStream();
+  if (!_appIntervalStarted) {
+    _appIntervalStarted = true;
+    setInterval(refreshStats, 5000);
+  }
 }
 
 function fmtTime(ts) {
@@ -28,6 +44,34 @@ function logLine(text, kind = "") {
   box.appendChild(div);
   box.scrollTop = box.scrollHeight;
 }
+
+$("#btnCopyLog").addEventListener("click", async (e) => {
+  const text = $("#logBox").innerText || "";
+  if (!text.trim()) {
+    alert("当前日志为空");
+    return;
+  }
+  await _copyText(text, e.currentTarget);
+});
+
+function _setLogExpanded(active) {
+  const box = $("#logBox");
+  const backdrop = $("#logBackdrop");
+  const closeBtn = $("#btnCloseLogExpand");
+  const btn = $("#btnFullscreenLog");
+  box.classList.toggle("web-fullscreen", active);
+  backdrop.classList.toggle("hidden", !active);
+  closeBtn.classList.toggle("hidden", !active);
+  btn.textContent = active ? "⛶ 退出放大" : "⛶ 放大日志";
+  if (active) box.scrollTop = box.scrollHeight;
+}
+
+$("#btnFullscreenLog").addEventListener("click", () => {
+  _setLogExpanded(!$("#logBox").classList.contains("web-fullscreen"));
+});
+
+$("#logBackdrop").addEventListener("click", () => _setLogExpanded(false));
+$("#btnCloseLogExpand").addEventListener("click", () => _setLogExpanded(false));
 
 function classifyLog(line) {
   const l = line.toLowerCase();
@@ -99,6 +143,9 @@ $("#btnRun").addEventListener("click", async () => {
     want_access_token: true,
     want_session_token: true,
     want_refresh_token: true,
+    strict_email: $("#regStrictEmail").checked,
+    proxy_pool: $("#autoProxyPool").value,
+    random_proxy_from_pool: $("#regRandomProxyFromPool").checked,
   };
   $("#btnRun").disabled = true;
   $("#runStatus").textContent = "启动中...";
@@ -120,9 +167,13 @@ $("#btnRun").addEventListener("click", async () => {
   }
 });
 
+function makeEventSource(path) {
+  return new EventSource(path);
+}
+
 function streamRun(runId) {
   if (currentEs) { try { currentEs.close(); } catch (_) {} }
-  const es = new EventSource(`/api/runs/${runId}/stream`);
+  const es = makeEventSource(`/api/runs/${runId}/stream`);
   currentEs = es;
 
   es.addEventListener("log", (e) => {
@@ -147,7 +198,12 @@ function streamRun(runId) {
         $("#runStatus").className = "result bad";
         logLine("[client] ❌ " + d.message, "err");
       } else if (d.kind === "phase") {
-        logLine(`[client] phase=${d.phase} email=${d.email}`, "evt");
+        logLine(`[client] phase=${d.phase} email=${d.email || ""}`, "evt");
+        if (d.phase === "email_claimed" && d.email) {
+          const cur = $("#runStatus").textContent || "";
+          const runPart = cur.match(/run_id=[^\s]+/) || [""];
+          $("#runStatus").textContent = `🚀 已启动 ${runPart[0]} email=${d.email}`;
+        }
       }
     } catch (_) {}
   });
@@ -646,6 +702,8 @@ function _autoOptions() {
     want_session_token: true,
     want_refresh_token: true,
     cool_down_seconds: parseFloat($("#autoCoolDown").value || "3") || 0,
+    auto_rotate_proxy: $("#autoRotateProxy").checked,
+    rotate_proxy_every: parseInt($("#rotateProxyEvery").value || "5", 10) || 5,
   };
 }
 
@@ -654,6 +712,34 @@ async function autoStart() {
     await api("/api/auto/start", { method: "POST", body: JSON.stringify(_autoOptions()) });
   } catch (e) { alert("启动失败: " + e.message); }
 }
+
+async function testProxyPool() {
+  const resultEl = $("#proxyTestResult");
+  resultEl.textContent = "⏳ 测试中...";
+  resultEl.className = "result";
+  try {
+    const r = await api("/api/settings/proxy/test", {
+      method: "POST",
+      body: JSON.stringify({
+        proxy_pool: $("#autoProxyPool").value,
+        proxy: $("#regProxy").value.trim(),
+      }),
+    });
+    const failed = r.results.filter(x => !x.ok);
+    let html = `✅ ${r.available}/${r.total} 条代理可用`;
+    if (failed.length) {
+      html += `<br>❌ 失败 ${failed.length} 条：<br>` +
+        failed.map(x => `<code>${escapeHtml(x.proxy)}</code>: ${escapeHtml(x.error)}`).join("<br>");
+    }
+    resultEl.innerHTML = html;
+    resultEl.className = "result ok";
+  } catch (e) {
+    resultEl.textContent = "❌ " + e.message;
+    resultEl.className = "result bad";
+  }
+}
+$("#btnTestProxyPool").addEventListener("click", testProxyPool);
+
 async function autoCall(path) {
   try { await api(path, { method: "POST" }); }
   catch (e) { alert(`${path} 失败: ${e.message}`); }
@@ -678,7 +764,10 @@ function _renderAutoStatus(s) {
         return `<div class="auto-worker">worker-${w.id} ▶ <code>${escapeHtml(w.email)}</code> ${dur}${px}</div>`;
       }).join("")
     : "";
-  const meta = `并发=${s.concurrency || 1}` + (s.proxy_pool_size ? ` 代理池=${s.proxy_pool_size}` : "");
+  let meta = `并发=${s.concurrency || 1}` + (s.proxy_pool_size ? ` 代理池=${s.proxy_pool_size}` : "");
+  if (s.auto_rotate_proxy) {
+    meta += ` 轮换=${s.rotate_proxy_every}`;
+  }
   $("#autoStatus").innerHTML = `
     <b>${stateLabel}</b>
     &nbsp;|&nbsp; 已完成: <b class="ok">${s.registered_ok}</b> 成功 / <b class="bad">${s.registered_fail}</b> 失败
@@ -698,7 +787,7 @@ function _renderAutoStatus(s) {
 let _autoEs = null;
 function _connectAutoStream() {
   if (_autoEs) { try { _autoEs.close(); } catch (_) {} }
-  const es = new EventSource("/api/auto/stream");
+  const es = makeEventSource("/api/auto/stream");
   _autoEs = es;
   es.addEventListener("state", (e) => {
     try { _renderAutoStatus(JSON.parse(e.data)); } catch (_) {}
@@ -751,9 +840,13 @@ const FORM_KEY = "gpt_outlook_register_form_v1";
 const PERSIST_FIELDS = {
   regProxy:        "text",
   regOtpTimeout:   "text",
-  autoCoolDown:    "text",
-  autoConcurrency: "text",
-  autoProxyPool:   "text",
+  regStrictEmail:  "check",
+  regRandomProxyFromPool: "check",
+  autoCoolDown:      "text",
+  autoConcurrency:   "text",
+  autoProxyPool:     "text",
+  autoRotateProxy:   "check",
+  rotateProxyEvery:  "text",
 };
 
 function _saveForm() {
@@ -788,10 +881,53 @@ function _bindAutoSave() {
   }
 }
 
+// ──────────────────────── 🌐 代理配置 ────────────────────────
+
+async function loadProxyConfig() {
+  try {
+    const { config } = await api("/api/settings/proxy");
+    $("#regProxy").value = config.proxy || "";
+    $("#autoProxyPool").value = config.proxy_pool || "";
+    $("#autoRotateProxy").checked = config.auto_rotate_proxy === "1";
+    $("#rotateProxyEvery").value = config.rotate_proxy_every || "5";
+    $("#proxyMaxUses").value = config.proxy_max_uses || "10";
+    _saveForm();
+  } catch (e) {
+    console.error("loadProxyConfig:", e);
+  }
+}
+
+$("#btnSaveProxyCfg").addEventListener("click", async () => {
+  const resultEl = $("#proxyCfgResult");
+  resultEl.textContent = "保存中...";
+  resultEl.className = "result";
+  try {
+    await api("/api/settings/proxy", {
+      method: "POST",
+      body: JSON.stringify({
+        proxy: $("#regProxy").value.trim(),
+        proxy_pool: $("#autoProxyPool").value,
+        auto_rotate_proxy: $("#autoRotateProxy").checked,
+        rotate_proxy_every: parseInt($("#rotateProxyEvery").value || "5", 10) || 5,
+        proxy_max_uses: parseInt($("#proxyMaxUses").value || "10", 10) || 10,
+      }),
+    });
+    resultEl.textContent = "✅ 已保存";
+    resultEl.className = "result ok";
+    _saveForm();
+  } catch (e) {
+    resultEl.textContent = "❌ " + e.message;
+    resultEl.className = "result bad";
+  }
+  setTimeout(() => { resultEl.textContent = ""; }, 3000);
+});
+
+
 // ──────────────────────── 📧 邮箱配置 ────────────────────────
 
 function _syncCfFields(source) {
   $("#cfTempCfg").classList.toggle("hidden", source !== "cf_temp");
+  $("#oepCfg").classList.toggle("hidden", source !== "oep");
 }
 
 async function loadMailConfig() {
@@ -809,6 +945,15 @@ async function loadMailConfig() {
     } else {
       $("#cfAdminToken").placeholder = "Worker 配置的 ADMIN_PASSWORDS";
     }
+    $("#oepApiUrl").value = config.oep_api_url || "";
+    $("#oepProjectKey").value = config.oep_project_key || "";
+    $("#oepCallerId").value = config.oep_caller_id || "gpt-outlook-register";
+    $("#oepApiKey").value = "";
+    if (config.oep_api_key === "***") {
+      $("#oepApiKey").placeholder = "已设置（留空不修改）";
+    } else {
+      $("#oepApiKey").placeholder = "平台 X-API-Key";
+    }
   } catch (e) {
     console.error("loadMailConfig:", e);
   }
@@ -822,11 +967,16 @@ document.querySelectorAll("input[name='mailSource']").forEach(r => {
 $("#btnSaveMailCfg").addEventListener("click", async () => {
   const source = document.querySelector("input[name='mailSource']:checked")?.value || "outlook";
   const isCf = source === "cf_temp";
+  const isOep = source === "oep";
   const body = {
     mail_source:    source,
     cf_api_url:     isCf ? $("#cfApiUrl").value.trim() : "",
     cf_admin_token: isCf ? ($("#cfAdminToken").value.trim() || "***") : "***",
     cf_domain:      isCf ? $("#cfDomain").value.trim() : "",
+    oep_api_url:    isOep ? $("#oepApiUrl").value.trim() : "",
+    oep_api_key:    isOep ? ($("#oepApiKey").value.trim() || "***") : "***",
+    oep_project_key: isOep ? $("#oepProjectKey").value.trim() : "",
+    oep_caller_id:  isOep ? $("#oepCallerId").value.trim() : "",
   };
   try {
     await api("/api/settings/mail", { method: "POST", body: JSON.stringify(body) });
@@ -853,7 +1003,7 @@ $("#btnTestMail").addEventListener("click", async (e) => {
     $("#mailCfgResult").className = "result bad";
   } finally {
     btn.disabled = false;
-    btn.textContent = "🔌 测试 CF 连通性";
+    btn.textContent = "🔌 测试连通性";
   }
 });
 
@@ -940,6 +1090,13 @@ function _getAllowedCountriesValue() {
   return Array.from(checked).map(cb => cb.value).join(",");
 }
 
+function _updateSmsPerPhoneHint() {
+  const interval = parseInt($("#smsResendInterval").value, 10) || 20;
+  const max = parseInt($("#smsResendMax").value, 10) || 3;
+  const hint = $("#smsPerPhoneHint");
+  if (hint) hint.textContent = interval * max + 20;
+}
+
 async function loadSmsConfig() {
   await _loadSmsAllCountries();
   try {
@@ -948,25 +1105,49 @@ async function loadSmsConfig() {
     const provider = config.sms_provider || "smsbower";
     const radio = document.querySelector(`input[name="smsProvider"][value="${provider}"]`);
     if (radio) radio.checked = true;
-    $("#smsApiKey").value = "";
-    $("#smsApiKey").placeholder = (config.sms_api_key === "***")
+
+    $("#smsbowerApiKey").value = "";
+    $("#smsbowerApiKey").placeholder = (config.smsbower_api_key === "***")
       ? "已设置（留空不修改）"
-      : "粘贴接码平台 API Key";
+      : "粘贴 SmsBower API Key";
+    $("#herosmsApiKey").value = "";
+    $("#herosmsApiKey").placeholder = (config.herosms_api_key === "***")
+      ? "已设置（留空不修改）"
+      : "粘贴 HeroSMS API Key";
+
     _renderSmsCountrySelect($("#smsCountry"), config.sms_country || "150");
     $("#smsService").value = config.sms_service || "dr";
     $("#smsMaxPrice").value = config.sms_max_price || "";
     $("#smsPhoneSuccessMax").value = config.sms_phone_success_max || "3";
     $("#smsReusePhone").checked = config.sms_reuse_phone === "1";
     $("#smsAutoCountry").checked = config.sms_auto_country === "1";
+    $("#smsKeepCountry").checked = config.sms_keep_country === "1";
     $("#smsAutoMinStock").value = config.sms_auto_min_stock || "20";
     $("#smsAutoMaxPrice").value = config.sms_auto_max_price || "";
     _renderSmsAllowedCountriesBox(config.sms_allowed_countries || "");
     $("#smsMaxPhoneAttempts").value = config.sms_max_phone_attempts || "";
-    $("#smsPerPhoneTimeout").value = config.sms_per_phone_timeout || "80";
+    $("#smsResendInterval").value = config.sms_resend_interval || "20";
+    $("#smsResendMax").value = config.sms_resend_max || "3";
+    _updateSmsPerPhoneHint();
+    $("#smsMinBalance").value = config.sms_min_balance || "";
   } catch (e) {
     console.error("loadSmsConfig:", e);
   }
 }
+
+$("#btnSelectAllAllowedCountries")?.addEventListener("click", () => {
+  $("#smsAllowedCountriesBox").querySelectorAll("input[type=checkbox]").forEach(cb => {
+    cb.checked = true;
+  });
+  _updateAllowedCountryCount();
+});
+
+$("#btnInvertAllowedCountries")?.addEventListener("click", () => {
+  $("#smsAllowedCountriesBox").querySelectorAll("input[type=checkbox]").forEach(cb => {
+    cb.checked = !cb.checked;
+  });
+  _updateAllowedCountryCount();
+});
 
 $("#btnClearAllowedCountries")?.addEventListener("click", () => {
   $("#smsAllowedCountriesBox").querySelectorAll("input[type=checkbox]").forEach(cb => {
@@ -975,23 +1156,31 @@ $("#btnClearAllowedCountries")?.addEventListener("click", () => {
   _updateAllowedCountryCount();
 });
 
+["#smsResendInterval", "#smsResendMax"].forEach(sel => {
+  $(sel)?.addEventListener("input", _updateSmsPerPhoneHint);
+  $(sel)?.addEventListener("change", _updateSmsPerPhoneHint);
+});
+
 $("#btnSaveSmsCfg").addEventListener("click", async () => {
-  const apiKeyInput = $("#smsApiKey").value.trim();
   const body = {
     sms_enabled:           $("#smsEnabled").checked ? "1" : "0",
     sms_provider:          document.querySelector("input[name='smsProvider']:checked")?.value || "smsbower",
-    sms_api_key:           apiKeyInput || "***",
+    smsbower_api_key:      $("#smsbowerApiKey").value.trim() || "***",
+    herosms_api_key:       $("#herosmsApiKey").value.trim() || "***",
     sms_country:           $("#smsCountry").value.trim() || "52",
     sms_service:           $("#smsService").value.trim() || "dr",
     sms_max_price:         $("#smsMaxPrice").value.trim(),
     sms_phone_success_max: $("#smsPhoneSuccessMax").value.trim() || "3",
     sms_reuse_phone:       $("#smsReusePhone").checked ? "1" : "0",
     sms_auto_country:      $("#smsAutoCountry").checked ? "1" : "0",
+    sms_keep_country:      $("#smsKeepCountry").checked ? "1" : "0",
     sms_allowed_countries: _getAllowedCountriesValue(),
     sms_auto_min_stock:    $("#smsAutoMinStock").value.trim() || "20",
     sms_auto_max_price:    $("#smsAutoMaxPrice").value.trim(),
     sms_max_phone_attempts: $("#smsMaxPhoneAttempts").value.trim(),
-    sms_per_phone_timeout: $("#smsPerPhoneTimeout").value.trim() || "80",
+    sms_resend_interval:    $("#smsResendInterval").value.trim() || "20",
+    sms_resend_max:         $("#smsResendMax").value.trim() || "3",
+    sms_min_balance:       $("#smsMinBalance").value.trim(),
   };
   try {
     await api("/api/settings/sms", { method: "POST", body: JSON.stringify(body) });
@@ -1005,13 +1194,15 @@ $("#btnSaveSmsCfg").addEventListener("click", async () => {
   setTimeout(() => { $("#smsCfgResult").textContent = ""; }, 3500);
 });
 
-$("#btnTestSms").addEventListener("click", async (e) => {
-  const btn = e.currentTarget;
+async function _testSmsProvider(provider, btn, origText) {
   btn.disabled = true;
   btn.textContent = "⏳ 测试中...";
   $("#smsCfgResult").textContent = "";
   try {
-    const r = await api("/api/settings/sms/test", { method: "POST" });
+    const r = await api("/api/settings/sms/test", {
+      method: "POST",
+      body: JSON.stringify({ provider }),
+    });
     $("#smsCfgResult").textContent = "✅ " + r.message;
     $("#smsCfgResult").className = "result ok";
   } catch (err) {
@@ -1019,8 +1210,16 @@ $("#btnTestSms").addEventListener("click", async (e) => {
     $("#smsCfgResult").className = "result bad";
   } finally {
     btn.disabled = false;
-    btn.textContent = "🔌 测试余额";
+    btn.textContent = origText;
   }
+}
+
+$("#btnTestSmsbower").addEventListener("click", async (e) => {
+  await _testSmsProvider("smsbower", e.currentTarget, "🔌 测试 SmsBower 余额");
+});
+
+$("#btnTestHerosms").addEventListener("click", async (e) => {
+  await _testSmsProvider("herosms", e.currentTarget, "🔌 测试 HeroSMS 余额");
 });
 
 // ──────────────────────── 📤 自动导出配置 (CPA / SUB2API) ────────────────────────
@@ -1109,7 +1308,4 @@ $("#btnTestSub2api").addEventListener("click", (e) => {
 
 _loadForm();
 _bindAutoSave();
-refreshStats();
-refreshPool();
-_connectAutoStream();
-setInterval(refreshStats, 5000);
+initApp();

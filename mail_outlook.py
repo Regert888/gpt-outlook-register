@@ -33,7 +33,12 @@ IMAP_HOST = "outlook.office365.com"
 
 
 class FatalOutlookMailError(RuntimeError):
-    """Non-retryable Outlook mail error."""
+    """Non-retryable Outlook mail error.
+
+    覆盖范围：IMAP XOAUTH2 鉴权失败 / mailbox 不可用（"authenticated but not
+    connected"）/ refresh token invalid_grant / client 拒绝 等。命中即跳过
+    resend retry，由调用方 fast-fail 跳到下一个号。
+    """
 
 
 _FATAL_IMAP_ERROR_PATTERNS = (
@@ -146,9 +151,23 @@ def fetch_otp_via_imap(
 
             M = imaplib.IMAP4_SSL(IMAP_HOST, 993)
             auth_string = f"user={email_addr}\x01auth=Bearer {cached_token}\x01\x01"
-            typ, _ = M.authenticate("XOAUTH2", lambda x: auth_string.encode())
-            if typ != "OK":
-                raise RuntimeError("imap XOAUTH2 失败")
+            try:
+                typ, _ = M.authenticate("XOAUTH2", lambda x: auth_string.encode())
+                if typ != "OK":
+                    raise RuntimeError("imap XOAUTH2 失败")
+            except imaplib.IMAP4.error as e:
+                # "User is authenticated but not connected." / "mailbox unavailable"
+                # 等 fatal 模式由下方 _is_fatal_imap_error 统一识别为
+                # FatalOutlookMailError，跳过 resend retry，调用方 fast-fail。
+                if _is_fatal_imap_error(e):
+                    try:
+                        M.logout()
+                    except Exception:
+                        pass
+                    raise FatalOutlookMailError(
+                        f"outlook IMAP XOAUTH2 不可用 ({email_addr}): {e}"
+                    ) from e
+                raise
 
             # 探测真实 folder 名（不同 outlook 区域 Junk 命名不同）
             if found_folders is None:
@@ -251,6 +270,7 @@ def fetch_otp_via_imap(
             except Exception:
                 pass
         except FatalOutlookMailError:
+            # 永久错误：不重试，直接冒泡给 wait_for_otp → mark dead
             raise
         except Exception as e:
             if _is_fatal_imap_error(e):
@@ -312,10 +332,19 @@ class OutlookMailProvider:
             f"[mail] outlook IMAP OAuth2 纯协议取 OTP -> {email_addr} "
             f"(timeout={timeout}s threshold>={int(strict_threshold)})"
         )
-        return fetch_otp_via_imap(
-            self.email, self.refresh_token, self.client_id,
-            timeout=timeout, threshold_ts=strict_threshold,
-        )
+        try:
+            return fetch_otp_via_imap(
+                self.email, self.refresh_token, self.client_id,
+                timeout=timeout, threshold_ts=strict_threshold,
+            )
+        except FatalOutlookMailError as e:
+            # 邮箱后端不可用 / token 失效 → mark dead，让 auth_flow 的
+            # `except TimeoutError` + outlook_exhausted 分支跳过 resend retry，
+            # 整个流程秒级 fast-fail 而不是傻等 2×180s。
+            self.mark_outlook_dead(f"IMAP 不可用 (不可重试): {e}")
+            raise TimeoutError(
+                f"outlook mail unusable for {self.email}: {e}"
+            ) from e
 
 
 if __name__ == "__main__":

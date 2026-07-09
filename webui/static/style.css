@@ -160,6 +160,20 @@ fieldset {
   padding: 10px 14px;
 }
 fieldset legend { color: var(--pink-dark); font-size: 13px; padding: 0 6px; }
+.cfg-box {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 12px 14px;
+  background: var(--bg);
+}
+.cfg-box-head {
+  color: var(--pink-dark);
+  font-size: 14px;
+  font-weight: 600;
+  margin-bottom: 8px;
+  padding-bottom: 6px;
+  border-bottom: 1px dashed var(--border);
+}
 .check { display: flex; align-items: center; gap: 6px; padding: 4px 0; }
 .check input { width: auto; }
 .check small { color: #b89bab; }
@@ -190,6 +204,7 @@ button:disabled { opacity: 0.5; cursor: not-allowed; }
 .result.bad { color: var(--bad); }
 
 /* 日志框 */
+.log-actions { display: flex; gap: 8px; align-items: center; }
 .log {
   background: var(--code-bg);
   color: var(--code-text);
@@ -202,6 +217,56 @@ button:disabled { opacity: 0.5; cursor: not-allowed; }
   overflow-y: auto;
   white-space: pre-wrap;
   word-break: break-all;
+  user-select: text;
+  -webkit-user-select: text;
+}
+.log.web-fullscreen {
+  position: fixed;
+  top: 10vh;
+  left: 5vw;
+  z-index: 1001;
+  width: 90vw;
+  height: 80vh;
+  border-radius: 12px;
+  padding: 14px 18px;
+  font-size: 13px;
+  line-height: 1.6;
+  box-shadow: 0 20px 60px rgba(0, 0, 0, 0.5);
+}
+.log-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 1000;
+  background: rgba(0, 0, 0, 0.45);
+  backdrop-filter: blur(2px);
+}
+.log-backdrop.hidden { display: none; }
+.log-close {
+  position: fixed;
+  top: calc(10vh + 8px);
+  right: calc(5vw + 8px);
+  z-index: 1002;
+  width: 32px;
+  height: 32px;
+  border-radius: 6px;
+  padding: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(255, 255, 255, 0.12);
+  border: 1px solid rgba(255, 255, 255, 0.25);
+  color: #fff;
+  font-size: 16px;
+  cursor: pointer;
+}
+.log-close:hover {
+  background: rgba(255, 255, 255, 0.25);
+  border-color: rgba(255, 255, 255, 0.4);
+}
+.log-close.hidden { display: none; }
+.log .line {
+  user-select: text;
+  -webkit-user-select: text;
 }
 .log .line.err { color: #ff8e9c; }
 .log .line.warn { color: #ffd28e; }
@@ -602,4 +667,11 @@ button.pay-copy.copied { background: #e2f0fb; color: var(--done); border-color: 
   font-size: 11px;
   max-height: 300px;
   overflow: auto;
+}
+
+/* 响应式 */
+@media (max-width: 820px) {
+  main { grid-template-columns: 1fr; }
+  header { flex-direction: column; align-items: flex-start; }
+  .stats { width: 100%; justify-content: flex-start; }
 }
