@@ -5,45 +5,22 @@ const $$ = (s) => document.querySelectorAll(s);
 
 // ──────────────────────── 工具 ────────────────────────
 
-const TOKEN_KEY = "gpt_outlook_register_api_token";
-
-function getToken() {
-  try { return localStorage.getItem(TOKEN_KEY) || ""; } catch (_) { return ""; }
-}
-
-function setToken(token) {
-  try { localStorage.setItem(TOKEN_KEY, token || ""); } catch (_) {}
-}
-
-function clearToken() {
-  try { localStorage.removeItem(TOKEN_KEY); } catch (_) {}
-}
-
 async function api(path, opts = {}) {
   const headers = { "Content-Type": "application/json", ...(opts.headers || {}) };
-  const token = getToken();
-  if (token) headers["Authorization"] = `Bearer ${token}`;
   const resp = await fetch(path, {
     ...opts,
     headers,
   });
-  if (resp.status === 401) {
-    clearToken();
-    showAuthOverlay("访问令牌无效或已过期，请重新输入");
-    const data = await resp.json().catch(() => ({}));
-    throw new Error(data.detail || "未授权：需要访问令牌");
-  }
   const data = await resp.json().catch(() => ({}));
   if (!resp.ok) throw new Error(data.detail || resp.statusText);
   return data;
 }
 
-// ──────────────────────── Token 认证 UI ────────────────────────
+// ──────────────────────── 页面初始化 ────────────────────────
 
 let _appIntervalStarted = false;
 
 function initApp() {
-  // 认证通过后再加载需要 Token 的数据/配置
   loadProxyConfig();
   refreshStats();
   refreshPool();
@@ -51,88 +28,6 @@ function initApp() {
   if (!_appIntervalStarted) {
     _appIntervalStarted = true;
     setInterval(refreshStats, 5000);
-  }
-}
-
-function showAuthOverlay(msg = "") {
-  const overlay = $("#authOverlay");
-  const err = $("#authError");
-  $("#authTokenInput").value = getToken();
-  err.textContent = msg || "";
-  overlay.classList.remove("hidden");
-  setTimeout(() => $("#authTokenInput").focus(), 50);
-}
-
-function hideAuthOverlay() {
-  $("#authOverlay").classList.add("hidden");
-  $("#authError").textContent = "";
-}
-
-async function doLogin() {
-  const input = $("#authTokenInput");
-  const btn = $("#authLoginBtn");
-  const err = $("#authError");
-  const token = input.value.trim();
-  if (!token) {
-    err.textContent = "请输入 Token";
-    return;
-  }
-  btn.disabled = true;
-  err.textContent = "校验中...";
-  setToken(token);
-  try {
-    const status = await api("/api/auth/status");
-    if (status.required && !status.authenticated) {
-      throw new Error("Token 校验失败");
-    }
-    hideAuthOverlay();
-    // 登录成功后统一初始化页面
-    initApp();
-  } catch (e) {
-    clearToken();
-    err.textContent = "❌ " + e.message;
-  } finally {
-    btn.disabled = false;
-  }
-}
-
-$("#authLoginBtn").addEventListener("click", doLogin);
-$("#authTokenInput").addEventListener("keydown", (e) => {
-  if (e.key === "Enter") doLogin();
-});
-$("#btnChangeToken").addEventListener("click", () => {
-  showAuthOverlay();
-});
-
-async function initAuth() {
-  try {
-    const status = await fetch("/api/auth/status").then(r => r.json()).catch(() => ({ required: false }));
-    if (!status.required) {
-      // 服务端未启用认证，清空本地残留 token
-      clearToken();
-      return true;
-    }
-    const token = getToken();
-    if (token) {
-      setToken(token);
-      // 用健康接口验证 token 是否有效
-      try {
-        await api("/api/health");
-        return true; // token 有效，正常进入
-      } catch (e) {
-        if (e.message.includes("未授权") || e.message.includes("令牌")) {
-          showAuthOverlay("访问令牌已失效，请重新输入");
-          return false;
-        }
-        // 其它错误（如服务端 500）不影响认证判断，继续进入
-        return true;
-      }
-    }
-    showAuthOverlay();
-    return false;
-  } catch (e) {
-    console.error("initAuth:", e);
-    return true;
   }
 }
 
@@ -273,10 +168,7 @@ $("#btnRun").addEventListener("click", async () => {
 });
 
 function makeEventSource(path) {
-  const token = getToken();
-  const sep = path.includes("?") ? "&" : "?";
-  const url = token ? `${path}${sep}token=${encodeURIComponent(token)}` : path;
-  return new EventSource(url);
+  return new EventSource(path);
 }
 
 function streamRun(runId) {
@@ -1416,7 +1308,4 @@ $("#btnTestSub2api").addEventListener("click", (e) => {
 
 _loadForm();
 _bindAutoSave();
-initAuth().then((proceed) => {
-  if (!proceed) return;
-  initApp();
-});
+initApp();

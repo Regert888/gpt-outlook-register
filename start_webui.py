@@ -9,8 +9,6 @@
     python start_webui.py --host 0.0.0.0 --port 8765  # 内网监听
     python start_webui.py --reload  # 开发模式，auto-reload
     python start_webui.py --host 0.0.0.0 --ssl-keyfile key.pem --ssl-certfile cert.pem  # HTTPS
-    python start_webui.py --token your-secret-token   # 启用 Token 认证
-    python start_webui.py --token-file /path/to/token # 从文件读取 Token
 """
 from __future__ import annotations
 
@@ -55,28 +53,7 @@ def main():
     )
     ap.add_argument("--ssl-keyfile", default=None, help="SSL 私钥文件路径")
     ap.add_argument("--ssl-certfile", default=None, help="SSL 证书文件路径")
-    ap.add_argument(
-        "--token", default=None,
-        help="设置 WebUI API Token（启用认证）。也可通过环境变量 WEBUI_API_TOKEN 设置",
-    )
-    ap.add_argument(
-        "--token-file", default=None, dest="token_file",
-        help="从文件读取 WebUI API Token（文件内容第一行非空值）",
-    )
     args = ap.parse_args()
-
-    # 处理 Token：命令行参数 > 文件 > 环境变量
-    token = (os.getenv("WEBUI_API_TOKEN", "") or "").strip()
-    if args.token:
-        token = args.token.strip()
-    elif args.token_file:
-        p = Path(args.token_file).expanduser()
-        if not p.is_file():
-            print(f"[!] Token 文件不存在: {p}")
-            sys.exit(1)
-        token = p.read_text(encoding="utf-8").splitlines()[0].strip()
-    if token:
-        os.environ["WEBUI_API_TOKEN"] = token
 
     reload = args.reload and not args.no_reload
     port = args.port

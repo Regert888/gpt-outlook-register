@@ -13,18 +13,15 @@ import json
 import logging
 import os
 import random
-import secrets
 import sys
 import time
 from pathlib import Path
 from typing import Optional
 
-from fastapi import Depends, FastAPI, HTTPException, Request, status
-from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
-from typing import Annotated
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -51,82 +48,6 @@ logging.basicConfig(
 logger = logging.getLogger("webui")
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
-
-# ──────────────────────── Token 认证 ────────────────────────
-
-_TOKEN_ENV = "WEBUI_API_TOKEN"
-
-
-def _get_configured_token() -> str:
-    """返回系统配置的 API Token。优先级：环境变量 > 数据库设置。
-
-    若返回空字符串，表示未启用认证（本地开发兼容）。
-    """
-    env = os.getenv(_TOKEN_ENV, "").strip()
-    if env:
-        return env
-    return db.get_setting("api_token", "").strip()
-
-
-def _token_enabled() -> bool:
-    return bool(_get_configured_token())
-
-
-# FastAPI 安全方案（仅用于文档/类型，实际校验在 require_token 里）
-_bearer_scheme = HTTPBearer(auto_error=False)
-
-
-def _extract_token(request: Request) -> str:
-    """从 Authorization Bearer / X-API-Token Header 或 URL query token 取 token。"""
-    # 1) Header: Authorization: Bearer <token>
-    auth = request.headers.get("Authorization", "")
-    if auth.lower().startswith("bearer "):
-        return auth[7:].strip()
-
-    # 2) Header: X-API-Token: <token>
-    token = request.headers.get("X-API-Token", "")
-    if token:
-        return token.strip()
-
-    # 3) SSE / 简单链接：URL query ?token=...
-    return (request.query_params.get("token") or "").strip()
-
-
-def require_token(
-    request: Request,
-    credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(_bearer_scheme)] = None,
-) -> None:
-    """FastAPI dependency：校验前端携带的 token。"""
-    configured = _get_configured_token()
-    if not configured:
-        return
-
-    provided = ""
-    if credentials and credentials.scheme.lower() == "bearer":
-        provided = credentials.credentials.strip()
-    if not provided:
-        provided = _extract_token(request)
-
-    if not provided:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="缺少访问令牌 (Authorization: Bearer <token> 或 X-API-Token)",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-    if not secrets.compare_digest(provided, configured):
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="访问令牌无效",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-
-
-# 公共 API（不鉴权）：health、auth 状态
-PUBLIC_API_PATHS = {"/api/health", "/api/auth/status"}
-
-
-def _is_public_path(path: str) -> bool:
-    return path in PUBLIC_API_PATHS or path == "/" or path.startswith("/static/")
 
 
 def _log_startup_config():
@@ -160,13 +81,6 @@ def _log_startup_config():
             export_cfg.get("cpa", {}).get("enabled"),
             export_cfg.get("sub2api", {}).get("enabled"),
         )
-        auth_token = _get_configured_token()
-        if auth_token:
-            src = "env" if os.getenv(_TOKEN_ENV, "").strip() else "db"
-            masked = auth_token[:4] + "***" + auth_token[-4:] if len(auth_token) >= 12 else "***"
-            logger.info("[startup] Token 认证已启用 (source=%s, token=%s)", src, masked)
-        else:
-            logger.info("[startup] Token 认证未启用（如需启用请设置 WEBUI_API_TOKEN）")
     except Exception as _e:
         logger.warning("[startup] 打印配置失败: %s", _e)
 
@@ -208,21 +122,6 @@ class RegisterReq(BaseModel):
 @app.get("/api/health")
 def health():
     return {"ok": True, "stats": db.stats()}
-
-
-@app.get("/api/auth/status")
-def auth_status(request: Request):
-    """返回当前是否启用 token 认证，以及当前请求是否已通过认证。"""
-    configured = _get_configured_token()
-    required = bool(configured)
-    provided = _extract_token(request) if required else ""
-    authenticated = required and provided and secrets.compare_digest(provided, configured)
-    return {
-        "ok": True,
-        "required": required,
-        "authenticated": authenticated,
-        "source": "env" if os.getenv(_TOKEN_ENV, "").strip() else ("db" if required else None),
-    }
 
 
 @app.post("/api/import")
@@ -948,29 +847,6 @@ app.mount(
     StaticFiles(directory=str(STATIC_DIR), html=False),
     name="static",
 )
-
-
-@app.middleware("http")
-async def _token_auth_middleware(request: Request, call_next):
-    """全局 token 认证中间件：/api/* 需要携带 token，公共接口和静态资源除外。"""
-    path = request.url.path
-    if path.startswith("/api/") and not _is_public_path(path):
-        configured = _get_configured_token()
-        if configured:
-            provided = _extract_token(request)
-            if not provided:
-                return JSONResponse(
-                    status_code=status.HTTP_401_UNAUTHORIZED,
-                    content={"detail": "缺少访问令牌 (Authorization: Bearer <token> 或 X-API-Token 或 ?token=)"},
-                    headers={"WWW-Authenticate": "Bearer"},
-                )
-            if not secrets.compare_digest(provided, configured):
-                return JSONResponse(
-                    status_code=status.HTTP_401_UNAUTHORIZED,
-                    content={"detail": "访问令牌无效"},
-                    headers={"WWW-Authenticate": "Bearer"},
-                )
-    return await call_next(request)
 
 
 @app.middleware("http")

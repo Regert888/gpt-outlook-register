@@ -8,26 +8,11 @@
 </head>
 <body>
 
-<!-- Token 登录遮罩 -->
-<div id="authOverlay" class="auth-overlay hidden">
-  <div class="auth-box">
-    <h2>🔐 需要访问令牌</h2>
-    <p>本系统已启用 Token 认证，请输入管理员提供的 Token 后进入。</p>
-    <input id="authTokenInput" type="password" placeholder="粘贴访问令牌 (Authorization Bearer Token)" autocomplete="off">
-    <button id="authLoginBtn">进入系统</button>
-    <div id="authError" class="auth-error"></div>
-    <div class="auth-hint">Token 通常由启动时的环境变量 <code>WEBUI_API_TOKEN</code> 配置。</div>
-  </div>
-</div>
-
 <header>
   <div class="brand">
     <span class="bell">🔔</span>
     <h1>GPT Outlook Register</h1>
     <span class="sub">纯协议 · Outlook 接码 · <a href="https://www.ransuyun.com/" target="_blank" rel="noopener" class="brand-link">燃速云</a> 驱动</span>
-  </div>
-  <div class="header-actions">
-    <button id="btnChangeToken" title="更换/重新输入访问令牌">🔑 Token</button>
   </div>
   <div class="stats" id="statsBar">
     <span class="pill"><b>0</b> 总计</span>
