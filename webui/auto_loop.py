@@ -18,6 +18,7 @@ import time
 from typing import Optional
 
 from . import db, registrar
+from http_client import normalize_proxy_url
 
 logger = logging.getLogger("auto_loop")
 
@@ -34,7 +35,7 @@ def _parse_proxy_pool(text: str) -> list[str]:
     for line in (text or "").splitlines():
         s = line.strip()
         if s and not s.startswith("#"):
-            out.append(s)
+            out.append(normalize_proxy_url(s))
     return out
 
 
@@ -94,7 +95,14 @@ class AutoLoopController:
             # 解析并发参数
             self._concurrency = max(1, min(20, int(self._options.get("concurrency") or 1)))
             pool_text = self._options.get("proxy_pool") or ""
-            self._proxy_pool = _parse_proxy_pool(pool_text)
+            try:
+                self._proxy_pool = _parse_proxy_pool(pool_text)
+                if self._options.get("proxy"):
+                    self._options["proxy"] = normalize_proxy_url(self._options["proxy"])
+            except ValueError as exc:
+                self._state = AutoLoopState.STOPPED
+                self._last_message = str(exc)
+                return {"ok": False, "error": str(exc), "state": self._state}
             # 启 manage 线程
             self._manage_thread = threading.Thread(
                 target=self._manage_loop, daemon=True, name="auto-loop-manage"

@@ -24,6 +24,8 @@ from typing import Callable, Optional
 
 import requests
 
+from http_client import normalize_proxy_url
+
 logger = logging.getLogger(__name__)
 
 
@@ -242,7 +244,7 @@ class SmsBowerProvider(BaseSmsProvider):
         self.default_service = str(default_service or SMS_DEFAULT_SERVICE).strip()
         self.default_country = str(default_country or SMS_DEFAULT_COUNTRY).strip()
         self.max_price = float(max_price or -1)
-        self._proxy = (proxy or "").strip() or None
+        self._proxy = normalize_proxy_url(proxy) or None
         self._proxies = {"http": self._proxy, "https": self._proxy} if self._proxy else None
         self.reuse_phone_to_max = bool(reuse_phone_to_max)
         self.phone_success_max = max(0, int(phone_success_max or 0))

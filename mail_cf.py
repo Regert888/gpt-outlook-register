@@ -23,6 +23,7 @@ import urllib.request
 from typing import Optional
 
 logger = logging.getLogger(__name__)
+from http_client import create_http_session, normalize_proxy_url
 
 
 def _gen_local_part(rng: Optional[random.Random] = None, length: int = 10) -> str:
@@ -87,6 +88,7 @@ class CFTempEmailProvider:
         api_url: str,
         admin_token: str = "",
         domain: str = "",
+        proxy: str = "",
         session=None,
     ):
         if not api_url:
@@ -110,9 +112,10 @@ class CFTempEmailProvider:
             self._session = session
         else:
             try:
-                from curl_cffi.requests import Session as CffiSession
-                self._session = CffiSession(impersonate="chrome136")
-                self._session.trust_env = False
+                self._session = create_http_session(
+                    proxy=normalize_proxy_url(proxy) or None,
+                    impersonate="chrome136",
+                )
             except ImportError:
                 self._session = None
 
