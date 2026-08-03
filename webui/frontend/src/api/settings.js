@@ -3,7 +3,8 @@ import http from './request'
 // ──────────────── 邮箱来源配置 ────────────────
 export const getMailConfig = () => http.get('/api/settings/mail')
 export const saveMailConfig = (payload) => http.post('/api/settings/mail', payload)
-export const testMail = () => http.post('/api/settings/mail/test')
+export const testMail = (payload = {}) => http.post('/api/settings/mail/test', payload)
+
 
 // ──────────────── SMS 接码配置 ────────────────
 export const getSmsConfig = () => http.get('/api/settings/sms')

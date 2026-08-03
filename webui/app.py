@@ -55,6 +55,7 @@ class ImportReq(BaseModel):
 
 class RegisterReq(BaseModel):
     email: Optional[str] = Field(None, description="留空 = 自动 claim 下一个 available")
+    mail_source: Optional[str] = Field(None, description="outlook / cf_temp / icloud_hme；留空使用当前配置")
     want_access_token: bool = True
     want_session_token: bool = True
     want_refresh_token: bool = True
@@ -212,14 +213,21 @@ def api_proxy_test(req: ProxyTestReq):
 @app.post("/api/register")
 def api_register(req: RegisterReq):
     """启动注册任务，返回 run_id。前端拿 run_id 去 /api/runs/{run_id}/stream 订阅 SSE。"""
-    mail_source = db.get_setting("mail_source", "outlook")
-    is_cf = (mail_source == "cf_temp")
+    mail_source = (req.mail_source or db.get_setting("mail_source", "outlook")).strip().lower()
+    if mail_source not in ("outlook", "cf_temp", "icloud_hme"):
+        raise HTTPException(400, f"不支持的 mail_source={mail_source}")
+    is_virtual_mail_source = mail_source in ("cf_temp", "icloud_hme")
 
-    if is_cf:
-        # CF 模式：不需要 outlook 号池，用虚拟占位 account
+    if is_virtual_mail_source:
+        # CF / iCloud HME 模式：不需要 outlook 号池；
+        # iCloud 从邮箱列表点“使用”时保留目标邮箱，由 provider claim 对应账号。
         import time as _t
+        prefix = "cf" if mail_source == "cf_temp" else "icloud"
+        virtual_email = (req.email or "").strip().lower() if mail_source == "icloud_hme" else ""
+        if not virtual_email:
+            virtual_email = f"{prefix}_placeholder_{int(_t.time())}@{prefix}.local"
         account = {
-            "email": f"cf_placeholder_{int(_t.time())}@cf.local",
+            "email": virtual_email,
             "password": "",
             "client_id": "",
             "refresh_token": "",
@@ -234,6 +242,7 @@ def api_register(req: RegisterReq):
             raise HTTPException(400, "号池里没有 available 账号；请先批量导入")
 
     options = {
+        "mail_source": mail_source,
         "want_access_token": req.want_access_token,
         "want_session_token": req.want_session_token,
         "want_refresh_token": req.want_refresh_token,
@@ -343,10 +352,22 @@ def api_get_mail_config():
 
 
 class SaveMailConfigReq(BaseModel):
-    mail_source: Optional[str] = None       # outlook / cf_temp
+    mail_source: Optional[str] = None       # outlook / cf_temp / icloud_hme
     cf_api_url: Optional[str] = None
     cf_admin_token: Optional[str] = None
     cf_domain: Optional[str] = None
+    icloud_region: Optional[str] = None
+    icloud_cookie: Optional[str] = None
+    icloud_maildomain_host: Optional[str] = None
+    icloud_label_prefix: Optional[str] = None
+    icloud_note: Optional[str] = None
+    icloud_auto_generate: Optional[str | bool] = None
+    icloud_imap_host: Optional[str] = None
+    icloud_imap_port: Optional[str] = None
+    icloud_imap_username: Optional[str] = None
+    icloud_imap_password: Optional[str] = None
+    icloud_imap_folder: Optional[str] = None
+    icloud_imap_use_ssl: Optional[str | bool] = None
 
 
 @app.post("/api/settings/mail")
@@ -356,15 +377,52 @@ def api_save_mail_config(req: SaveMailConfigReq):
 
 
 @app.post("/api/settings/mail/test")
-def api_test_mail():
-    """测试 CF Temp Email 连通性：创建一个测试地址，确认 admin_token + domain 都对。"""
-    mail_source = db.get_setting("mail_source", "outlook")
+def api_test_mail(req: Optional[SaveMailConfigReq] = None):
+    """测试当前邮箱来源配置；请求体存在时按表单临时值测试，不落库。"""
+    incoming = req.model_dump(exclude_none=True) if req is not None else {}
+    mail_source = str(incoming.get("mail_source") or db.get_setting("mail_source", "outlook")).strip().lower()
+    if mail_source == "icloud_hme":
+        import sys as _sys
+        ROOT_DIR = Path(__file__).resolve().parents[1]
+        if str(ROOT_DIR) not in _sys.path:
+            _sys.path.insert(0, str(ROOT_DIR))
+        from mail_icloud import validate_icloud_config
+        try:
+            cfg = db.get_icloud_config()
+            for key in (
+                "icloud_region", "icloud_maildomain_host", "icloud_label_prefix",
+                "icloud_note", "icloud_auto_generate", "icloud_imap_host",
+                "icloud_imap_port", "icloud_imap_username", "icloud_imap_folder",
+                "icloud_imap_use_ssl",
+            ):
+                if key in incoming:
+                    cfg[key] = incoming[key]
+            for key in ("icloud_cookie", "icloud_imap_password"):
+                val = incoming.get(key)
+                if val and val != "***":
+                    cfg[key] = val
+            if not cfg.get("icloud_cookie"):
+                raise HTTPException(400, "未配置 icloud_cookie")
+            result = validate_icloud_config(cfg)
+            account = result.get("account") or {}
+            msg = (
+                f"iCloud 连接成功: {account.get('apple_id', 'Unknown')} / "
+                f"maildomain={account.get('maildomain_host') or 'Default'} / "
+                f"{result.get('imap_message')}"
+            )
+            return {"ok": True, "message": msg, **result}
+        except HTTPException:
+            raise
+        except Exception as e:
+            raise HTTPException(500, f"连接失败: {e}")
+
     if mail_source != "cf_temp":
         raise HTTPException(400, f"当前 mail_source={mail_source}，不需要测试")
 
-    api_url = db.get_setting("cf_api_url", "")
-    domain = db.get_setting("cf_domain", "")
-    token = db.get_cf_admin_token()
+    api_url = str(incoming.get("cf_api_url") if "cf_api_url" in incoming else db.get_setting("cf_api_url", "")).strip()
+    domain = str(incoming.get("cf_domain") if "cf_domain" in incoming else db.get_setting("cf_domain", "")).strip()
+    incoming_token = incoming.get("cf_admin_token")
+    token = str(incoming_token).strip() if incoming_token and incoming_token != "***" else db.get_cf_admin_token()
     if not api_url:
         raise HTTPException(400, "未配置 cf_api_url")
     if not domain:
@@ -383,6 +441,115 @@ def api_test_mail():
         return {"ok": True, "message": f"连接成功，测试邮箱: {test_email}"}
     except Exception as e:
         raise HTTPException(500, f"连接失败: {e}")
+
+
+class ICloudGenerateReq(BaseModel):
+    count: int = Field(1, ge=1, le=50, description="生成数量")
+    label_prefix: Optional[str] = None
+    note: Optional[str] = None
+
+
+def _icloud_client_from_config():
+    import sys as _sys
+    ROOT_DIR = Path(__file__).resolve().parents[1]
+    if str(ROOT_DIR) not in _sys.path:
+        _sys.path.insert(0, str(ROOT_DIR))
+    from mail_icloud import ICloudHMEClient
+    cfg = db.get_icloud_config()
+    if not cfg.get("icloud_cookie"):
+        raise HTTPException(400, "未配置 icloud_cookie")
+    client = ICloudHMEClient(
+        cookie=cfg.get("icloud_cookie", ""),
+        region=cfg.get("icloud_region", "global"),
+        maildomain_host=cfg.get("icloud_maildomain_host", ""),
+    )
+    if not (cfg.get("icloud_maildomain_host") or "").strip():
+        account = client.validate_account()
+        if account.get("error"):
+            err = account.get("error")
+            msg = err.get("message") if isinstance(err, dict) else str(err)
+            raise HTTPException(500, f"iCloud Cookie 校验失败: {msg}")
+        detected = account.get("detectedMaildomainHost") or client.maildomain_host
+        if detected and detected != client.maildomain_host:
+            client = ICloudHMEClient(
+                cookie=cfg.get("icloud_cookie", ""),
+                region=cfg.get("icloud_region", "global"),
+                maildomain_host=detected,
+            )
+    return client, cfg
+
+
+@app.post("/api/icloud/generate")
+def api_icloud_generate(req: ICloudGenerateReq):
+    client, cfg = _icloud_client_from_config()
+    label_prefix = (req.label_prefix or cfg.get("icloud_label_prefix") or "gpt-register").strip()
+    note = (req.note or cfg.get("icloud_note") or "Generated by gpt-outlook-register").strip()
+    rows = []
+    errors = []
+    for i in range(req.count):
+        label = f"{label_prefix}-{int(time.time())}-{i + 1}" if req.count > 1 else f"{label_prefix}-{int(time.time())}"
+        res = client.generate_reserved(label=label, note=note)
+        if not res.get("success"):
+            errors.append(res.get("error") or res.get("reason") or res)
+            continue
+        result = res.get("result") or {}
+        email = (result.get("hme") or "").lower()
+        if not email:
+            errors.append({"message": f"生成响应缺 hme: {res}"})
+            continue
+        row = {
+            "email": email,
+            "label": label,
+            "note": note,
+            "is_active": True,
+            "state": "available",
+            "source": "generated",
+        }
+        db.upsert_icloud_address(row)
+        rows.append(row)
+    return {
+        "ok": bool(rows) and not errors,
+        "generated": len(rows),
+        "items": rows,
+        "errors": errors,
+        "stats": db.icloud_stats(),
+    }
+
+
+@app.post("/api/icloud/sync")
+def api_icloud_sync():
+    client, _cfg = _icloud_client_from_config()
+    res = client.list_email()
+    if not res.get("success"):
+        err = res.get("error") or res.get("reason") or res
+        raise HTTPException(500, f"同步失败: {err}")
+    rows = (res.get("result") or {}).get("hmeEmails") or []
+    result = db.sync_icloud_addresses(rows)
+    return {"ok": True, **result, "stats": db.icloud_stats()}
+
+
+@app.get("/api/icloud/addresses")
+def api_icloud_addresses(status: str = "", state: str = "", limit: int = 50, offset: int = 0):
+    filt = status or state
+    items = db.list_icloud_addresses(state=filt, limit=limit, offset=offset)
+    total = db.count_icloud_addresses(state=filt)
+    return {"ok": True, "items": items, "total": total, "stats": db.icloud_stats()}
+
+
+@app.post("/api/icloud/addresses/reset/{email}")
+def api_icloud_reset_address(email: str):
+    ok = db.reset_icloud_address(email)
+    if not ok:
+        raise HTTPException(404, f"iCloud 地址 {email} 不存在或不可重置")
+    return {"ok": True, "email": email, "stats": db.icloud_stats()}
+
+
+@app.delete("/api/icloud/addresses/{email}")
+def api_icloud_delete_address(email: str):
+    ok = db.delete_icloud_address(email)
+    if not ok:
+        raise HTTPException(404, f"iCloud 地址 {email} 不存在")
+    return {"ok": True, "email": email, "stats": db.icloud_stats()}
 
 
 # ──────────────────────── SMS 接码配置 ────────────────────────

@@ -100,6 +100,7 @@ def classify_error(err: str) -> str:
         "outlook imap account unusable", "user is authenticated but not connected",
         "outlook refresh failed", "authentication failed", "authenticate failed",
         "outlook otp timeout", "registration_disallowed",
+        "icloud hme otp timeout", "icloud hme imap", "imap 未配置",
         "已有账号", "账号被", "refresh_token 失效",
     )):
         return "account"
@@ -133,9 +134,10 @@ def _do_register(
         root_logger.setLevel(logging.INFO)
 
     email = account["email"]
+    mail = None
     saved_env = {}
-    # 提前读取，避免在 try 块前异常时 except 引用未定义
-    mail_source = db.get_setting("mail_source", "outlook")
+    # 提前读取，避免在 try 块前异常时 except 引用未定义；单次注册可由邮箱列表指定来源。
+    mail_source = (options.get("mail_source") or db.get_setting("mail_source", "outlook")).strip().lower()
 
     try:
         # 注入环境变量（不污染全局，跑完恢复）
@@ -158,7 +160,7 @@ def _do_register(
         cfg = Config()
         cfg.proxy = (options.get("proxy") or "").strip() or None
 
-        # ─ 邮箱来源路由：outlook 池 vs CF Worker catch-all ─
+        # ─ 邮箱来源路由：outlook 池 vs CF Worker catch-all vs iCloud HME ─
         if mail_source == "cf_temp":
             sys_path_root = str(ROOT)
             if sys_path_root not in sys.path:
@@ -178,6 +180,21 @@ def _do_register(
             )
             logging.getLogger("registrar").info(
                 f"[register] 邮箱来源: cf_temp / domain={domain}"
+            )
+        elif mail_source == "icloud_hme":
+            sys_path_root = str(ROOT)
+            if sys_path_root not in sys.path:
+                sys.path.insert(0, sys_path_root)
+            from mail_icloud import ICloudHMEMailProvider
+
+            icloud_cfg = db.get_icloud_config()
+            if not icloud_cfg.get("icloud_cookie"):
+                raise RuntimeError("iCloud HME 未配置 Cookie，请去「邮箱配置」Tab 填写")
+            mail = ICloudHMEMailProvider(icloud_cfg, db_module=db)
+            if account.get("email") and not str(account["email"]).endswith("@icloud.local"):
+                mail.requested_email = str(account["email"]).lower()
+            logging.getLogger("registrar").info(
+                f"[register] 邮箱来源: icloud_hme / region={icloud_cfg.get('icloud_region')}"
             )
         else:
             mail = OutlookMailProvider(
@@ -225,8 +242,12 @@ def _do_register(
 
         # ─ 用户选项过滤：未勾选的字段从结果里抹掉，DB 只存用户想要的
         full = d
+        actual_email = (full.get("email") or getattr(mail, "current_email", "") or email).strip().lower()
+        if actual_email and actual_email != email:
+            db.update_run_email(run_id, actual_email)
+            email = actual_email
         d = {
-            "email": full.get("email", ""),
+            "email": actual_email or full.get("email", ""),
             "password": full.get("password", ""),
         }
         if options.get("want_access_token", True):
@@ -241,7 +262,9 @@ def _do_register(
         # 落库
         db.save_registered(d)
         # CF 模式下 email 是虚拟占位（cf_placeholder_XXX@cf.local），不操作号池
-        if mail_source != "cf_temp":
+        if mail_source == "icloud_hme":
+            db.mark_icloud_done(email)
+        elif mail_source != "cf_temp":
             db.mark_done(email)
 
         # ─ 可选：导出到 CPA / SUB2API 面板（仅勾选启用时才执行） ─
@@ -270,7 +293,22 @@ def _do_register(
         if category != "account":
             logging.getLogger("registrar").error(traceback.format_exc())
         # CF 模式下不操作号池
-        if mail_source != "cf_temp":
+        if mail_source == "icloud_hme":
+            actual_email = (
+                getattr(mail, "current_email", "")
+                or getattr(mail, "claimed_email", "")
+                or ("")
+            ).strip().lower()
+            if actual_email:
+                db.update_run_email(run_id, actual_email)
+                if category == "network":
+                    db.release_icloud_unused(actual_email)
+                    logging.getLogger("registrar").warning(
+                        f"[register] {actual_email} 判定为网络/环境错误，iCloud HME 已 release 回 available"
+                    )
+                else:
+                    db.mark_icloud_failed(actual_email, f"[{category}] {err}")
+        elif mail_source != "cf_temp":
             if category == "network":
                 db.release_unused(email)
                 logging.getLogger("registrar").warning(

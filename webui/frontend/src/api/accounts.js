@@ -24,3 +24,14 @@ export const bulkResetAccounts = (emails) =>
   http.post('/api/accounts/bulk_reset', { emails })
 
 export const releaseStale = () => http.post('/api/accounts/release_stale')
+
+
+// ──────────────── iCloud Hide My Email 账号池 ────────────────
+export const generateICloudAccounts = (payload) => http.post('/api/icloud/generate', payload)
+export const syncICloudAccounts = (payload = {}) => http.post('/api/icloud/sync', payload)
+export const listICloudAccounts = (params = {}) =>
+  http.get('/api/icloud/addresses', { params })
+export const resetICloudAccount = (email) =>
+  http.post(`/api/icloud/addresses/reset/${encodeURIComponent(email)}`)
+export const deleteICloudAccount = (email) =>
+  http.delete(`/api/icloud/addresses/${encodeURIComponent(email)}`)

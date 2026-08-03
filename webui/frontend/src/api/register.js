@@ -1,7 +1,7 @@
 import http from './request'
 
 // ──────────────── 单个注册 ────────────────
-export const startRegister = (payload) => http.post('/api/register', payload)
+export const startRegister = (payload) => http.post('/api/register', payload) // 可带 { mail_source }
 
 // ──────────────── 运行记录 ────────────────
 export const listRuns = (limit = 50) => http.get('/api/runs', { params: { limit } })

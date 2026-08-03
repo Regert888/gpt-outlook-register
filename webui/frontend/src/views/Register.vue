@@ -18,10 +18,12 @@ const { runningSingle, lastRunResult } = storeToRefs(runtime)
 
 const starting = ref(false)
 const regEmail = ref('')
+const regMailSource = ref('')
 
-// 从「邮箱列表 → 使用」跳转过来时，带上指定邮箱
+// 从「邮箱列表 → 使用」跳转过来时，带上指定邮箱和来源
 onActivated(() => {
   if (route.query.email) regEmail.value = String(route.query.email)
+  if (route.query.mail_source) regMailSource.value = String(route.query.mail_source)
 })
 
 async function run() {
@@ -31,6 +33,7 @@ async function run() {
   try {
     const r = await startRegister({
       email: regEmail.value.trim() || null,
+      mail_source: regMailSource.value || null,
       proxy: form.value.proxy.trim(),
       otp_timeout: parseInt(form.value.otpTimeout, 10) || 10,
       want_access_token: true,
@@ -68,6 +71,9 @@ async function copyField(email, field) {
           <el-form label-position="top">
             <el-form-item label="邮箱（留空 = 自动 claim 下一个 available）">
               <el-input v-model="regEmail" placeholder="留空 = 自动选号 / 或填指定邮箱" clearable />
+              <div v-if="regMailSource" class="hint" style="margin-top: 4px">
+                来源：{{ regMailSource === 'icloud_hme' ? 'iCloud HME' : 'Outlook' }}
+              </div>
             </el-form-item>
             <el-form-item label="本次使用的单个代理（可从代理池选，或手动输入；直连留空）">
               <el-select
