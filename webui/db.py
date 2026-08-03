@@ -43,6 +43,25 @@ def init_db():
 
         CREATE INDEX IF NOT EXISTS idx_outlook_status ON outlook_accounts(status);
 
+        CREATE TABLE IF NOT EXISTS icloud_hme_addresses (
+            email           TEXT PRIMARY KEY,
+            label           TEXT,
+            note            TEXT,
+            anonymous_id    TEXT,
+            is_active       INTEGER,
+            state           TEXT NOT NULL DEFAULT 'available',
+                            -- available / in_use / done / failed / trash
+            source          TEXT,
+            created_at      REAL,
+            updated_at      REAL,
+            synced_at       REAL,
+            claimed_at      REAL,
+            finished_at     REAL,
+            fail_reason     TEXT
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_icloud_hme_state ON icloud_hme_addresses(state);
+
         CREATE TABLE IF NOT EXISTS settings (
             key     TEXT PRIMARY KEY,
             value   TEXT
@@ -582,6 +601,241 @@ def list_runs(limit: int = 50) -> list[dict]:
     return [dict(r) for r in cur.fetchall()]
 
 
+def update_run_email(run_id: str, email: str) -> None:
+    """运行开始后才知道真实邮箱时更新 runs.email（例如 iCloud HME 自动 claim）。"""
+    if not run_id or not email:
+        return
+    with _lock:
+        con = _conn()
+        con.execute("UPDATE runs SET email=? WHERE run_id=?", (email.lower(), run_id))
+        con.commit()
+
+
+# ──────────────────────── iCloud HME 地址池 ────────────────────────
+
+
+ICLOUD_HME_STATES = {"available", "in_use", "done", "failed", "trash"}
+
+
+def _clean_icloud_state(state: str, default: str = "available") -> str:
+    s = (state or default).strip().lower()
+    return s if s in ICLOUD_HME_STATES else default
+
+
+def upsert_icloud_address(d: dict, preserve_terminal: bool = True) -> None:
+    """新增/同步 iCloud HME 地址。
+
+    preserve_terminal=True 时，同步不会覆盖 in_use/done/failed 等本地流程状态。
+    """
+    email = (d.get("email") or d.get("hme") or "").strip().lower()
+    if not email:
+        return
+    now = time.time()
+    incoming_state = _clean_icloud_state(d.get("state") or ("available" if d.get("is_active", True) else "trash"))
+    is_active = 1 if bool(d.get("is_active", True)) else 0
+    with _lock:
+        con = _conn()
+        cur = con.execute("SELECT state, created_at FROM icloud_hme_addresses WHERE email=?", (email,))
+        existing = cur.fetchone()
+        if existing:
+            state = existing["state"] or "available"
+            if not preserve_terminal or state in ("available", "trash"):
+                state = incoming_state
+            con.execute(
+                "UPDATE icloud_hme_addresses SET label=?, note=?, anonymous_id=?, "
+                "is_active=?, state=?, source=?, updated_at=?, synced_at=?, fail_reason=CASE "
+                "WHEN ? IN ('available','trash') THEN NULL ELSE fail_reason END WHERE email=?",
+                (
+                    d.get("label", ""),
+                    d.get("note", ""),
+                    d.get("anonymous_id") or d.get("anonymousId") or "",
+                    is_active,
+                    state,
+                    d.get("source") or "icloud",
+                    now,
+                    now,
+                    state,
+                    email,
+                ),
+            )
+        else:
+            con.execute(
+                "INSERT INTO icloud_hme_addresses(email, label, note, anonymous_id, is_active, "
+                "state, source, created_at, updated_at, synced_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    email,
+                    d.get("label", ""),
+                    d.get("note", ""),
+                    d.get("anonymous_id") or d.get("anonymousId") or "",
+                    is_active,
+                    incoming_state,
+                    d.get("source") or "icloud",
+                    d.get("created_at") or now,
+                    now,
+                    now,
+                ),
+            )
+        con.commit()
+
+
+def sync_icloud_addresses(rows: list[dict]) -> dict:
+    """把 iCloud list 返回的 rows 同步到本地地址池。"""
+    synced = active = inactive = 0
+    for row in rows or []:
+        email = (row.get("hme") or row.get("email") or "").strip().lower()
+        if not email:
+            continue
+        is_active = bool(row.get("isActive", row.get("is_active", True)))
+        created_at = None
+        ts = row.get("createTimestamp")
+        if isinstance(ts, (int, float)) and ts > 0:
+            created_at = ts / 1000.0
+        upsert_icloud_address({
+            "email": email,
+            "label": row.get("label") or "",
+            "note": row.get("note") or "",
+            "anonymous_id": row.get("anonymousId") or row.get("anonymous_id") or "",
+            "is_active": is_active,
+            "state": "available" if is_active else "trash",
+            "source": "icloud",
+            "created_at": created_at,
+        })
+        synced += 1
+        if is_active:
+            active += 1
+        else:
+            inactive += 1
+    return {"synced": synced, "active": active, "inactive": inactive}
+
+
+def claim_icloud_available(email: str = "") -> Optional[dict]:
+    """原子 claim iCloud HME 地址。"""
+    email = (email or "").strip().lower()
+    with _lock:
+        con = _conn()
+        if email:
+            cur = con.execute(
+                "SELECT * FROM icloud_hme_addresses WHERE email=? AND state IN ('available','failed') AND is_active != 0",
+                (email,),
+            )
+        else:
+            cur = con.execute(
+                "SELECT * FROM icloud_hme_addresses WHERE state='available' AND is_active != 0 "
+                "ORDER BY COALESCE(created_at, synced_at, updated_at, 0) ASC LIMIT 1"
+            )
+        row = cur.fetchone()
+        if not row:
+            return None
+        rc = con.execute(
+            "UPDATE icloud_hme_addresses SET state='in_use', claimed_at=?, fail_reason=NULL "
+            "WHERE email=? AND state IN ('available','failed')",
+            (time.time(), row["email"]),
+        )
+        con.commit()
+        if rc.rowcount != 1:
+            return None
+        return dict(row)
+
+
+def mark_icloud_done(email: str) -> None:
+    if not email:
+        return
+    with _lock:
+        con = _conn()
+        con.execute(
+            "UPDATE icloud_hme_addresses SET state='done', finished_at=?, fail_reason=NULL WHERE email=?",
+            (time.time(), email.lower()),
+        )
+        con.commit()
+
+
+def mark_icloud_failed(email: str, reason: str = "") -> None:
+    if not email:
+        return
+    with _lock:
+        con = _conn()
+        con.execute(
+            "UPDATE icloud_hme_addresses SET state='failed', finished_at=?, fail_reason=? WHERE email=?",
+            (time.time(), (reason or "")[:500], email.lower()),
+        )
+        con.commit()
+
+
+def release_icloud_unused(email: str) -> None:
+    if not email:
+        return
+    with _lock:
+        con = _conn()
+        con.execute(
+            "UPDATE icloud_hme_addresses SET state='available', claimed_at=NULL "
+            "WHERE email=? AND state='in_use'",
+            (email.lower(),),
+        )
+        con.commit()
+
+
+def count_icloud_addresses(state: str = "") -> int:
+    con = _conn()
+    s = _clean_icloud_state(state, "") if state else ""
+    if s:
+        cur = con.execute("SELECT COUNT(*) FROM icloud_hme_addresses WHERE state=?", (s,))
+    else:
+        cur = con.execute("SELECT COUNT(*) FROM icloud_hme_addresses")
+    return cur.fetchone()[0]
+
+
+def list_icloud_addresses(state: str = "", limit: int = 50, offset: int = 0) -> list[dict]:
+    con = _conn()
+    s = _clean_icloud_state(state, "") if state else ""
+    if s:
+        cur = con.execute(
+            "SELECT * FROM icloud_hme_addresses WHERE state=? "
+            "ORDER BY COALESCE(updated_at, synced_at, created_at, 0) DESC LIMIT ? OFFSET ?",
+            (s, limit, offset),
+        )
+    else:
+        cur = con.execute(
+            "SELECT * FROM icloud_hme_addresses "
+            "ORDER BY COALESCE(updated_at, synced_at, created_at, 0) DESC LIMIT ? OFFSET ?",
+            (limit, offset),
+        )
+    return [dict(r) for r in cur.fetchall()]
+
+
+def reset_icloud_address(email: str) -> bool:
+    if not email:
+        return False
+    with _lock:
+        con = _conn()
+        rc = con.execute(
+            "UPDATE icloud_hme_addresses SET state='available', claimed_at=NULL, finished_at=NULL, "
+            "fail_reason=NULL WHERE email=? AND is_active != 0",
+            (email.lower(),),
+        )
+        con.commit()
+        return rc.rowcount > 0
+
+
+def delete_icloud_address(email: str) -> bool:
+    if not email:
+        return False
+    with _lock:
+        con = _conn()
+        rc = con.execute("DELETE FROM icloud_hme_addresses WHERE email=?", (email.lower(),))
+        con.commit()
+        return rc.rowcount > 0
+
+
+def icloud_stats() -> dict:
+    con = _conn()
+    cur = con.execute("SELECT state, COUNT(*) AS n FROM icloud_hme_addresses GROUP BY state")
+    out = {"available": 0, "in_use": 0, "done": 0, "failed": 0, "trash": 0, "total": 0}
+    for r in cur.fetchall():
+        out[r["state"]] = r["n"]
+        out["total"] += r["n"]
+    return out
+
+
 # ──────────────────────── settings (KV) ────────────────────────
 
 
@@ -607,20 +861,32 @@ def set_setting(key: str, value) -> None:
 
 
 def get_mail_config() -> dict:
-    """返回邮箱来源配置（admin_token 隐藏明文）。"""
+    """返回邮箱来源配置（密文字段隐藏明文）。"""
     return {
-        "mail_source":   get_setting("mail_source", "outlook"),  # outlook / cf_temp
+        "mail_source":   get_setting("mail_source", "outlook"),  # outlook / cf_temp / icloud_hme
         "cf_api_url":    get_setting("cf_api_url", ""),
         "cf_admin_token": "***" if get_setting("cf_admin_token") else "",
         "cf_domain":     get_setting("cf_domain", ""),
+        "icloud_region":          get_setting("icloud_region", "global"),
+        "icloud_cookie":          "***" if get_setting("icloud_cookie") else "",
+        "icloud_maildomain_host": get_setting("icloud_maildomain_host", ""),
+        "icloud_label_prefix":    get_setting("icloud_label_prefix", "gpt-register"),
+        "icloud_note":            get_setting("icloud_note", "Generated by gpt-outlook-register"),
+        "icloud_auto_generate":   get_setting("icloud_auto_generate", "1"),
+        "icloud_imap_host":       get_setting("icloud_imap_host", ""),
+        "icloud_imap_port":       get_setting("icloud_imap_port", "993"),
+        "icloud_imap_username":   get_setting("icloud_imap_username", ""),
+        "icloud_imap_password":   "***" if get_setting("icloud_imap_password") else "",
+        "icloud_imap_folder":     get_setting("icloud_imap_folder", "INBOX"),
+        "icloud_imap_use_ssl":    get_setting("icloud_imap_use_ssl", "1"),
     }
 
 
 def save_mail_config(data: dict) -> None:
-    """保存邮箱配置。admin_token 传 '***' 表示不修改。"""
+    """保存邮箱配置。密文字段传 '***' 表示不修改。"""
     if "mail_source" in data:
         src = str(data["mail_source"]).strip().lower()
-        if src not in ("outlook", "cf_temp"):
+        if src not in ("outlook", "cf_temp", "icloud_hme"):
             src = "outlook"
         set_setting("mail_source", src)
     if "cf_api_url" in data:
@@ -629,11 +895,53 @@ def save_mail_config(data: dict) -> None:
         set_setting("cf_domain", str(data["cf_domain"]).strip())
     if data.get("cf_admin_token") and data["cf_admin_token"] != "***":
         set_setting("cf_admin_token", str(data["cf_admin_token"]).strip())
+    if "icloud_region" in data:
+        region = str(data["icloud_region"]).strip().lower()
+        if region not in ("global", "china"):
+            region = "global"
+        set_setting("icloud_region", region)
+    for key in (
+        "icloud_maildomain_host", "icloud_label_prefix", "icloud_note",
+        "icloud_imap_host", "icloud_imap_port", "icloud_imap_username",
+        "icloud_imap_folder",
+    ):
+        if key in data:
+            set_setting(key, str(data[key] or "").strip())
+    for key in ("icloud_auto_generate", "icloud_imap_use_ssl"):
+        if key in data:
+            v = data[key]
+            if isinstance(v, bool):
+                set_setting(key, "1" if v else "0")
+            else:
+                s = str(v).strip().lower()
+                set_setting(key, "1" if s in ("1", "true", "yes", "on") else "0")
+    if data.get("icloud_cookie") and data["icloud_cookie"] != "***":
+        set_setting("icloud_cookie", str(data["icloud_cookie"]).strip())
+    if data.get("icloud_imap_password") and data["icloud_imap_password"] != "***":
+        set_setting("icloud_imap_password", str(data["icloud_imap_password"]).strip())
 
 
 def get_cf_admin_token() -> str:
     """内部用：拿明文 admin_token。"""
     return get_setting("cf_admin_token", "")
+
+
+def get_icloud_config() -> dict:
+    """内部用：拿 iCloud HME 明文配置。"""
+    return {
+        "icloud_region":          get_setting("icloud_region", "global"),
+        "icloud_cookie":          get_setting("icloud_cookie", ""),
+        "icloud_maildomain_host": get_setting("icloud_maildomain_host", ""),
+        "icloud_label_prefix":    get_setting("icloud_label_prefix", "gpt-register"),
+        "icloud_note":            get_setting("icloud_note", "Generated by gpt-outlook-register"),
+        "icloud_auto_generate":   get_setting("icloud_auto_generate", "1") in ("1", "true"),
+        "icloud_imap_host":       get_setting("icloud_imap_host", ""),
+        "icloud_imap_port":       get_setting("icloud_imap_port", "993"),
+        "icloud_imap_username":   get_setting("icloud_imap_username", ""),
+        "icloud_imap_password":   get_setting("icloud_imap_password", ""),
+        "icloud_imap_folder":     get_setting("icloud_imap_folder", "INBOX"),
+        "icloud_imap_use_ssl":    get_setting("icloud_imap_use_ssl", "1") in ("1", "true"),
+    }
 
 
 # ──────────────────────── SMS 接码配置 ────────────────────────
