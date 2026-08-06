@@ -1887,6 +1887,13 @@ class AuthFlow:
             logger.warning(f"访问 create-account/password 页面失败: {e}")
 
         # 注册前需要刷新 sentinel token，且 flow 必须为 username_password_create
+        #
+        # ⚠️ SO token 只在**本次请求**范围内决定带不带，绝不回写实例上的
+        #    _last_sentinel_so_token。原因：send_otp / verify_otp 这些后续步骤
+        #    自己不刷 sentinel，直接复用实例字段。本 flow 服务端不要求 SO token
+        #    （so_token 为空），要是把空值写回实例，等于顺手把后续所有请求的
+        #    SO 头也一起摘掉了 —— 那几步的 flow 服务端是要 SO 的。
+        so_token_for_request = getattr(self, "_last_sentinel_so_token", "")
         if self.result.device_id:
             try:
                 from sentinel import get_sentinel_token as _get_st
@@ -1894,19 +1901,29 @@ class AuthFlow:
                                 flow="username_password_create",
                                 **self._sentinel_fp_kwargs())
                 self._last_sentinel_token = token or ""
-                self._last_sentinel_so_token = so_token or ""
+                so_token_for_request = so_token or ""
+                if so_token:
+                    self._last_sentinel_so_token = so_token
                 logger.debug("Sentinel Token 获取成功")
-            except RuntimeError:
-                raise
             except Exception as e:
-                logger.warning(f"注册前刷新 sentinel 失败: {e}")
+                # 注：username_password_create 这个 flow 服务端**不下发 so 块**
+                #    （实测 2026-08-06，见 sentinel_quickjs.py 里的说明），
+                #    所以 so_token 为空是正常的，已在 sentinel_quickjs 按服务端要求判定，
+                #    不再走到这个 except。这里只兜网络/子进程一类的真异常。
+                #    走到这里说明用的是上一步的 token，flow 对不上是风控特征，
+                #    但比当场崩掉（POST 根本发不出去）强，故降级继续。
+                logger.warning(
+                    f"注册前刷新 sentinel 失败，将改用 flow 不匹配的现有 sentinel token 提交: {e}"
+                )
 
         headers = self._common_headers("https://auth.openai.com/create-account/password")
         headers["Content-Type"] = "application/json"
         if self._last_sentinel_token:
             headers["openai-sentinel-token"] = self._last_sentinel_token
-        if getattr(self, "_last_sentinel_so_token", ""):
-            headers["openai-sentinel-so-token"] = self._last_sentinel_so_token
+        # 服务端对该 flow 没下发 so 块时 so_token_for_request 为空 → 不带这个头，
+        # 与真实浏览器一致；不要退回实例字段拿别的 flow 的 SO token 来凑。
+        if so_token_for_request:
+            headers["openai-sentinel-so-token"] = so_token_for_request
         resp = self.session.post(
             "https://auth.openai.com/api/accounts/user/register",
             headers=headers,
@@ -2799,13 +2816,29 @@ class AuthFlow:
                     f"OpenAI 静默拒绝发 OTP (识别 {email} 为已有账号, {pool_tag} 池 fast-fail)"
                 )
 
-        if is_new:
-            # 新账号：注册密码 → 等服务端自动发码 → 验证 OTP → 创建账户
-            # signin 时已带 login_hint，服务端会自动发码，无需主动 send_otp
+        # ⚠️ passwordless_signup **也是新账号**，只是服务端选择了"不设密码直接发码"的注册流程。
+        #    signup() 用一个 bool 表达三种服务端状态，把它和"已有账号"压成了同一个 False，
+        #    结果新号全部走进下面的 else 分支 —— register_password 从没被调用过，
+        #    注册出来的号全是无密码号（只能靠临时邮箱收码登录，域名一失效就永久丢失）。
+        #    实测 2026-08-06: 这类号照样能走 POST user/register 设密码并成功。
+        if is_new or self._existing_email_verification_mode == "passwordless_signup":
+            # 新账号：注册密码 → 主动重新发码 → 验证 OTP → 创建账户
             password_registered = self.register_password(email)
-            # 向前偏移 8 秒，覆盖 signin 阶段服务端自动发码的时间窗口
-            otp_sent_at = time.time() - 8
-            if not password_registered:
+            if password_registered:
+                # ⚠️ POST user/register 成功后服务端**切换流程**到 email_otp_send 页
+                #    （实测响应 continue_url=/api/accounts/email-otp/send, page.type=email_otp_send），
+                #    signup 阶段自动发的那封 OTP 立即失效，拿它 verify 会 409 invalid_state。
+                #    所以必须主动重新发码，且以本次发码时间为准，不能再用 -8 偏移。
+                #    时间戳在发码**之前**取：邮件是服务端在这次请求里发出的，
+                #    先发再取时间会让 otp_sent_at 晚于邮件时间戳，被 issued_after 过滤掉。
+                otp_sent_at = time.time()
+                try:
+                    self.send_otp()
+                except Exception as e:
+                    # 429 等发码失败时别让整个注册崩掉，退回 resend 兜底
+                    logger.warning(f"密码注册后主动发码失败，回退 resend: {e}")
+                    self.kickoff_otp_delivery("post_register_password_send_failed")
+            else:
                 logger.warning("注册密码失败，回退到已有账号 OTP 路径")
                 self.fetch_client_auth_session_dump("post_register_password_failed_new")
                 # 密码注册失败时 fallback 主动发码

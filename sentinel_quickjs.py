@@ -290,15 +290,31 @@ def get_sentinel_token_via_quickjs(
 
         so_token_raw = str(solved.get("so_token") or "").strip()
 
+        # SO token 要不要，是**服务端在 challenge 里说了算**的，不是每个 flow 都有。
+        # sdk.js 里 SO 采集器的启动条件（去混淆）：
+        #     challenge.so.required === true && typeof challenge.so.collector_dx === 'string'
+        # 实测 2026-08-06 三个 flow 的 /sentinel/req 响应：
+        #     authorize_continue    → 有 so 块, required=true
+        #     oauth_create_account  → 有 so 块, required=true
+        #     username_password_create → **顶层根本没有 so 键**
+        # 也就是说真实浏览器跑 username_password_create 同样不会有 SO token。
+        # 以前这里无条件要求 so_token 非空，把「服务端没要」误判成「我们没算出来」，
+        # 打出「中止以避免封号」——是误报。更糟的是调用方降级时会沿用上一个 flow 的
+        # SO token 继续发，等于给一个明说不需要 SO 的请求塞了个别的 flow 的凭证，
+        # 比不发更像异常特征。现在按服务端的要求判定。
+        so_required = bool((challenge.get("so") or {}).get("required") is True)
+
         sdk_token = str(solved.get("token") or "").strip()
-        if sdk_token and so_token_raw:
-            log(f"Sentinel QuickJS OK (len={len(sdk_token)}, so=Y)")
-            return (sdk_token, so_token_raw)
-        if sdk_token:
-            log("Sentinel QuickJS 失败: 主 token 有但 SO token 为空，中止以避免封号")
-        else:
+        if not sdk_token:
             log("Sentinel QuickJS 失败: SDK token 为空，中止以避免封号")
-        return None
+            return None
+        if so_required and not so_token_raw:
+            # 服务端确实要了 SO token 但我们没算出来 —— 这才是真异常，保持中止
+            log("Sentinel QuickJS 失败: 服务端要求 SO token 但求解为空，中止以避免封号")
+            return None
+        log(f"Sentinel QuickJS OK (len={len(sdk_token)}, "
+            f"so={'Y' if so_token_raw else 'N/A(服务端未要求)'})")
+        return (sdk_token, so_token_raw)
     except Exception as e:
         log(f"Sentinel QuickJS 异常: {e}")
         return None

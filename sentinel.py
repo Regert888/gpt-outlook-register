@@ -75,7 +75,10 @@ def get_sentinel_token(
         )
         if qresult:
             return qresult
-        raise RuntimeError("Sentinel QuickJS 失败（无 SO token），中止注册以避免封号")
+        # 注意：SO token 为空**不一定**是失败 —— 服务端在 challenge 里没下发 so 块的
+        # flow（如 username_password_create）本来就没有 SO token，那种情况
+        # sentinel_quickjs 会正常返回 (token, "")，不会走到这里。
+        raise RuntimeError("Sentinel QuickJS 失败（主 token 缺失或服务端要求的 SO token 未算出），中止注册以避免封号")
     except ImportError as e:
         raise RuntimeError(f"Sentinel QuickJS 模块缺失: {e}")
     except RuntimeError:

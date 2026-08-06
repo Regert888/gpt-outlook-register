@@ -20,7 +20,7 @@ export const useRuntimeStore = defineStore('runtime', () => {
   const logs = ref([])            // { id, text, kind }
   const autoStatus = ref({ state: 'stopped', registered_ok: 0, registered_fail: 0 })
   const banner = ref('')          // 熔断/严重错误横幅
-  const lastRunResult = ref(null) // { email, access_token_len, partial } 或 { error }
+  const lastRunResult = ref(null) // { email, password, access_token_len, partial } 或 { error }
   const dataVersion = ref(0)      // 递增：通知号池/结果/记录表刷新
   const runningSingle = ref(false)
 
@@ -52,10 +52,15 @@ export const useRuntimeStore = defineStore('runtime', () => {
           if (d.kind === 'done') {
             lastRunResult.value = {
               email: d.email,
+              password: d.password || '',
               access_token_len: d.access_token_len,
               partial: d.partial,
             }
-            addLog(`注册完成: access_token=${d.access_token_len}${d.partial ? ' (部分凭证)' : ''}`, 'ok')
+            addLog(
+              `注册完成: ${d.email}${d.password ? ' / ' + d.password : ''}`
+              + ` (access_token=${d.access_token_len}${d.partial ? ', 部分凭证' : ''})`,
+              'ok',
+            )
           } else if (d.kind === 'error') {
             lastRunResult.value = { email: d.email, error: d.message }
             addLog('错误: ' + d.message, 'err')

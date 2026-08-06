@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import logging
 import sys
@@ -23,7 +24,7 @@ from pydantic import BaseModel, Field
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from . import db, registrar  # noqa: E402
+from . import db, export_formats, registrar  # noqa: E402
 from .auto_loop import CONTROLLER as AUTO_LOOP  # noqa: E402
 from mail_providers import (  # noqa: E402
     ImportValidationError,
@@ -383,6 +384,57 @@ def api_bulk_delete_registered(req: BulkDeleteRegisteredReq):
         n = db.delete_registered_by_emails(req.emails)
         return {"ok": True, "deleted": n, "by": "emails"}
     raise HTTPException(400, "需要 emails 或 all=true")
+
+
+# ──────────────────────── 批量导出（文本） ────────────────────────
+# ⚠️ 路由顺序：
+#   - formats 是 4 段路径，不会被 3 段的 GET /api/registered/{email} 吃掉；
+#   - export 是 POST，而 {email} 那两条是 GET / DELETE，也不冲突。
+# 要加新格式只改 webui/export_formats.py，这里和前端都不用动。
+
+
+@app.get("/api/registered/export/formats")
+def api_export_formats():
+    """导出格式清单，前端下拉菜单据此渲染。"""
+    return {"ok": True, "formats": export_formats.list_formats()}
+
+
+class ExportRegisteredReq(BaseModel):
+    format: str = Field(..., description="格式 id，见 GET /api/registered/export/formats")
+    emails: Optional[list[str]] = Field(None, description="要导出的 email 列表")
+    all: bool = Field(False, description="true = 导出全部（跨页），忽略 emails")
+
+
+@app.post("/api/registered/export")
+def api_export_registered(req: ExportRegisteredReq):
+    fmt = export_formats.get_format(req.format)
+    if fmt is None:
+        raise HTTPException(400, f"未知导出格式: {req.format}")
+
+    if req.all:
+        rows = db.list_registered_full(limit=100000)
+    elif req.emails:
+        rows = db.list_registered_by_emails(req.emails)
+    else:
+        raise HTTPException(400, "需要 emails 或 all=true")
+
+    # 不跳行：勾了几个号就几行 / 几个文件，字段为空也照样出。
+    # 手动导出**不做 refresh_token 刷新、不因为缺 rt 拦截**，这是和自动推送的区别。
+    base = {
+        "ok": True,
+        "count": len(rows),
+        "filename": fmt.filename,
+        "label": fmt.label,
+        "mode": fmt.mode,
+        "mime": fmt.mime,
+    }
+
+    if fmt.mode == "download":
+        # 二进制（zip / json 文件）走 base64，前端解出来直接存盘，不弹预览
+        blob = export_formats.render_bytes(rows, fmt)
+        return {**base, "b64": base64.b64encode(blob).decode("ascii"), "size": len(blob)}
+
+    return {**base, "text": export_formats.render_text(rows, fmt)}
 
 
 # ──────────────────────── 邮箱来源配置 ────────────────────────

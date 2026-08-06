@@ -601,6 +601,41 @@ def list_registered_full(limit: int = 5000) -> list[dict]:
     return out
 
 
+def list_registered_by_emails(emails: list[str]) -> list[dict]:
+    """按 email 列表返回完整凭证（批量导出勾选的号用）。
+
+    - 行序 = created_at 倒序，和「注册结果」表格里看到的一致，方便核对。
+    - 查不到的 email 直接不出现（号已被删掉的情况），不报错。
+    - SQLite 单条语句变量数有上限（默认 999），所以分批查。
+    """
+    cleaned = [e.strip().lower() for e in (emails or []) if e and e.strip()]
+    if not cleaned:
+        return []
+
+    con = _conn()
+    out = []
+    CHUNK = 500
+    for i in range(0, len(cleaned), CHUNK):
+        part = cleaned[i:i + CHUNK]
+        placeholders = ",".join("?" * len(part))
+        cur = con.execute(
+            f"SELECT * FROM registered WHERE email IN ({placeholders})",
+            part,
+        )
+        for row in cur.fetchall():
+            d = dict(row)
+            if d.get("extra_json"):
+                try:
+                    d["extra"] = json.loads(d["extra_json"])
+                except Exception:
+                    d["extra"] = {}
+            d.pop("extra_json", None)
+            out.append(d)
+
+    out.sort(key=lambda d: d.get("created_at") or 0, reverse=True)
+    return out
+
+
 def get_registered(email: str) -> Optional[dict]:
     con = _conn()
     cur = con.execute("SELECT * FROM registered WHERE email=?", (email.lower(),))

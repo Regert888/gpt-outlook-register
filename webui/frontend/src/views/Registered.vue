@@ -5,6 +5,7 @@ import { ElMessage, ElMessageBox } from 'element-plus'
 import {
   listRegistered, getRegistered, deleteRegistered,
   bulkDeleteRegistered, checkPlus,
+  listExportFormats, exportRegistered,
 } from '@/api/register'
 import { copyText, fmtTime } from '@/api/request'
 import { useFormStore } from '@/stores/form'
@@ -94,6 +95,74 @@ async function deleteAll() {
   catch (e) { ElMessage.error(e.message) }
 }
 
+// ──────────── 批量导出 ────────────
+// 格式清单来自后端 export_formats.py，下拉菜单是 v-for 出来的：
+// 以后加格式只改后端那一个文件，这里一行都不用动。
+const exportFormats = ref([])
+const exporting = ref(false)
+const exportVisible = ref(false)
+const exportText = ref('')
+const exportCount = ref(0)
+const exportFilename = ref('')
+const exportLabel = ref('')
+
+const exportBtnText = computed(() =>
+  selected.value.length ? `导出选中 (${selected.value.length})` : '导出全部',
+)
+
+async function loadExportFormats() {
+  if (exportFormats.value.length) return
+  try {
+    const { formats } = await listExportFormats()
+    exportFormats.value = formats || []
+  } catch (e) { ElMessage.error('加载导出格式失败: ' + e.message) }
+}
+
+async function doExport(fmt) {
+  const emails = selected.value.map((r) => r.email)
+  // 没勾选 = 导出全部（跨页，不只当前页）
+  const payload = emails.length ? { format: fmt.id, emails } : { format: fmt.id, all: true }
+  exporting.value = true
+  try {
+    const r = await exportRegistered(payload)
+    // download 模式（CPA zip / SUB2API json）：不弹预览，直接落盘
+    if (r.mode === 'download') {
+      saveBlob(b64ToBytes(r.b64), r.filename, r.mime)
+      ElMessage.success(`已下载 ${r.filename}（${r.count} 个号）`)
+      return
+    }
+    exportText.value = r.text || ''
+    exportCount.value = r.count || 0
+    exportFilename.value = r.filename || 'export.txt'
+    exportLabel.value = r.label || fmt.label
+    exportVisible.value = true
+  } catch (e) { ElMessage.error('导出失败: ' + e.message) }
+  finally { exporting.value = false }
+}
+
+function b64ToBytes(b64) {
+  const bin = atob(b64 || '')
+  const bytes = new Uint8Array(bin.length)
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i)
+  return bytes
+}
+
+function saveBlob(data, filename, mime) {
+  const blob = data instanceof Blob ? data : new Blob([data], { type: mime || 'application/octet-stream' })
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement('a')
+  a.href = url
+  a.download = filename
+  document.body.appendChild(a)
+  a.click()
+  document.body.removeChild(a)
+  URL.revokeObjectURL(url)
+}
+
+function downloadExport() {
+  saveBlob(exportText.value, exportFilename.value, 'text/plain;charset=utf-8')
+}
+
 // 凭证弹窗
 const credVisible = ref(false)
 const credEmail = ref('')
@@ -148,6 +217,23 @@ onActivated(() => load())
         <el-button :loading="checking" :disabled="!selected.length" @click="doCheck('selected')">
           检测选中 ({{ selected.length }})
         </el-button>
+        <el-divider direction="vertical" />
+        <el-dropdown trigger="click" @command="doExport" @visible-change="(v) => v && loadExportFormats()">
+          <el-button :loading="exporting">
+            <el-icon><Download /></el-icon>{{ exportBtnText }}
+            <el-icon class="el-icon--right"><ArrowDown /></el-icon>
+          </el-button>
+          <template #dropdown>
+            <el-dropdown-menu>
+              <el-dropdown-item v-for="f in exportFormats" :key="f.id" :command="f" :divided="f.mode === 'download' && f.id === 'cpa'">
+                {{ f.label }}
+                <span v-if="f.note" class="hint" style="margin-left: 6px">{{ f.note }}</span>
+              </el-dropdown-item>
+              <el-dropdown-item v-if="!exportFormats.length" disabled>加载中...</el-dropdown-item>
+            </el-dropdown-menu>
+          </template>
+        </el-dropdown>
+        <el-divider direction="vertical" />
         <el-button type="danger" plain :disabled="!selected.length" @click="deleteSelected">
           删除选中 ({{ selected.length }})
         </el-button>
@@ -163,6 +249,19 @@ onActivated(() => load())
       >
         <el-table-column type="selection" width="44" />
         <el-table-column prop="email" label="邮箱" min-width="200" show-overflow-tooltip />
+        <!-- 密码直接明文列出：随机 16 位，是登录账号的必需品，
+             藏进「查看凭证」弹窗每次都要多点两下。列表接口本来就在返回它。 -->
+        <el-table-column label="密码" min-width="170">
+          <template #default="{ row }">
+            <el-button
+              v-if="row.password" size="small" text type="primary"
+              class="mono" style="font-size: 12px" @click="copyText(row.password)"
+            >
+              <el-icon><CopyDocument /></el-icon>{{ row.password }}
+            </el-button>
+            <span v-else class="hint">—</span>
+          </template>
+        </el-table-column>
         <el-table-column label="Plus状态" width="120">
           <template #default="{ row }">
             <StatusDot v-if="plusOf(row)" :type="PLUS_TYPE[plusOf(row).status] || 'info'" :text="plusOf(row).label" />
@@ -212,6 +311,27 @@ onActivated(() => load())
           layout="prev, pager, next, total" background
         />
       </div>
+
+      <el-dialog v-model="exportVisible" width="720px" top="8vh">
+        <template #header>
+          <div style="display: flex; align-items: center; gap: 12px">
+            <span style="font-weight: 600">导出 · {{ exportLabel }}</span>
+            <el-tag size="small" type="info">共 {{ exportCount }} 行</el-tag>
+          </div>
+        </template>
+        <el-input
+          :model-value="exportText" type="textarea" :rows="14" readonly
+          class="mono export-area"
+        />
+        <template #footer>
+          <el-button @click="copyText(exportText)">
+            <el-icon><CopyDocument /></el-icon>复制全部
+          </el-button>
+          <el-button type="primary" @click="downloadExport">
+            <el-icon><Download /></el-icon>下载 {{ exportFilename }}
+          </el-button>
+        </template>
+      </el-dialog>
 
       <el-dialog v-model="credVisible" :title="credEmail" width="760px" top="6vh">
         <template #header>

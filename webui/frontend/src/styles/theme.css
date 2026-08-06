@@ -83,6 +83,29 @@ body {
 .hint { color: var(--el-text-color-secondary); font-size: 12px; line-height: 1.6; }
 .mono { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; }
 
+/* 明文凭证展示（注册完成提示里的密码）：等宽 + 可选中，方便直接框选复制 */
+.cred-line { margin-top: 8px; display: flex; align-items: center; gap: 8px; }
+.cred-label { font-size: 12px; color: var(--el-text-color-secondary); }
+.cred-val {
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  font-size: 13px;
+  padding: 2px 8px;
+  border-radius: 4px;
+  background: var(--el-fill-color-light);
+  user-select: all;
+  word-break: break-all;
+}
+
+/* 批量导出弹窗的文本框：不换行 + 横向滚动，
+   长 access_token 一行就是一行，肉眼数行数 = 账号数，不会被折行骗到 */
+.export-area .el-textarea__inner {
+  white-space: pre;
+  overflow-x: auto;
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  font-size: 12px;
+  line-height: 1.65;
+}
+
 /* 路由进度条配色（品牌蓝） */
 #nprogress .bar { background: var(--brand); height: 2px; }
 #nprogress .peg { box-shadow: 0 0 10px var(--brand), 0 0 5px var(--brand); }

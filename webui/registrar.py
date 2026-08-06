@@ -287,6 +287,11 @@ def _do_register(
 
         result_summary = {
             "email": d.get("email"),
+            # 密码走明文推给前端：token 只给长度是因为太长且必须点按钮复制，
+            # 但密码是随机 16 位、用户注册完第一件事就是拿去登录，
+            # 藏在「查看凭证」弹窗里等于每次都要多点两下。
+            # 这是本机自用工具，SSE 只发给本地浏览器，不外传。
+            "password": d.get("password") or "",
             "access_token_len": len(d.get("access_token") or ""),
             "session_token_len": len(d.get("session_token") or ""),
             "refresh_token_len": len(d.get("refresh_token") or ""),
@@ -295,6 +300,7 @@ def _do_register(
         _emit_status(run_id, "done", result_summary)
         logging.getLogger("registrar").info(
             f"[register] 完成 email={d.get('email')} "
+            f"pw={d.get('password') or '(无)'} "
             f"at={result_summary['access_token_len']} "
             f"st={result_summary['session_token_len']} "
             f"rt={result_summary['refresh_token_len']}"
@@ -305,6 +311,19 @@ def _do_register(
         err = str(e)
         category = classify_error(err, mail_source)
         logging.getLogger("registrar").error(f"[register] 失败 (category={category}): {err}")
+        # ⚠️ 密码是在 register_password 里现生成的，只活在内存里。
+        #    走到这里说明 save_registered 没执行过 —— 但 POST user/register 可能**已经成功**，
+        #    OpenAI 那边账号连同这个密码已经建好了，只是后续步骤（发码/验证/建账户）挂了。
+        #    不打出来的话这个号就成了谁也登不进去的孤儿。这里只写日志不落库，
+        #    避免把没有任何 token 的半成品塞进「注册结果」表里。
+        try:
+            _pw = (flow.result.password or "").strip()
+            if _pw:
+                logging.getLogger("registrar").error(
+                    f"[register] 该号已生成密码，请自行留存: {flow.result.email or email} / {_pw}"
+                )
+        except Exception:
+            pass  # flow 还没建出来（异常发生在 AuthFlow 之前），没密码可救
         if category != "account":
             logging.getLogger("registrar").error(traceback.format_exc())
         # 非池化 provider 没有号池记录，不操作

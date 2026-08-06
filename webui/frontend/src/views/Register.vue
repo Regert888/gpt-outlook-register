@@ -95,8 +95,20 @@ async function copyField(email, field) {
           >
             注册完成 {{ lastRunResult.email }}
             (access_token len={{ lastRunResult.access_token_len }}{{ lastRunResult.partial ? ', 部分凭证' : '' }})
-            <div style="margin-top: 8px" v-if="lastRunResult.access_token_len > 0">
-              <el-button size="small" @click="copyField(lastRunResult.email, 'access_token')">复制 access_token</el-button>
+            <div v-if="lastRunResult.password" class="cred-line">
+              <span class="cred-label">密码</span><code class="cred-val">{{ lastRunResult.password }}</code>
+            </div>
+            <div v-else class="cred-line hint">该号未设置密码（服务端未走密码注册流程）</div>
+            <div style="margin-top: 8px">
+              <el-button size="small" @click="copyText(lastRunResult.email)">复制邮箱</el-button>
+              <template v-if="lastRunResult.password">
+                <el-button size="small" type="primary" @click="copyText(lastRunResult.password)">复制密码</el-button>
+                <el-button size="small" @click="copyText(lastRunResult.email + '----' + lastRunResult.password)">
+                  复制 邮箱----密码
+                </el-button>
+              </template>
+              <el-button v-if="lastRunResult.access_token_len > 0" size="small"
+                         @click="copyField(lastRunResult.email, 'access_token')">复制 access_token</el-button>
             </div>
           </el-alert>
           <el-alert
