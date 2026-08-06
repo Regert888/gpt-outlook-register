@@ -61,8 +61,14 @@ onActivated(() => load())
 <template>
   <div class="page">
     <el-card shadow="never" style="max-width: 760px">
-      <template #header><span class="section-title" style="margin: 0">注册完成后自动导出</span></template>
+      <template #header>
+        <span class="section-title" style="margin: 0">注册完成后自动导出</span>
+        <el-tag type="danger" size="small" effect="dark" style="margin-left: 8px">仅带 RT 的账号可用</el-tag>
+      </template>
       <p class="hint">勾选启用后，每次注册成功落库会导出到对应面板。没勾选完全不执行，导出失败只记日志、不影响注册。</p>
+      <p class="hint" style="color: var(--el-color-danger); font-weight: 600">
+        注意：只有带 <b>RT（refresh_token）</b>的账号，导出后才能正常使用。没有 RT 的号推过去面板也用不了 —— 想拿到 RT 需要<b>配置接码</b>。
+      </p>
 
       <el-form label-position="top">
         <el-divider content-position="left">CPA 面板</el-divider>

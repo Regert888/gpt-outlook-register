@@ -8,20 +8,19 @@
   - `download` 整份文档，前端拿到直接下载、不弹预览（`render_all` 返回 bytes）
 
 约定（主人定的）：
-- **不跳行**。勾了几个号就出几行 / 几个文件，字段为空就留空，
+- **不跳行**。勾了几个号就出几行，字段为空就留空，
   分隔符照样保留（`邮箱----`），方便主人自己在文本里对齐、补齐。
-- **手动导出不管有没有 refresh_token，一律照出**（这是和自动推送的区别所在）。
-  自动推送 `exporter.run_exports` 会先用 rt 换 Codex 风格 token，换不到就整个放弃；
-  手动导出**不刷新、不拦截**，DB 里是什么就导什么，能不能用主人自己判断。
 - 行序 = 「注册结果」表格里的顺序（created_at 倒序），好核对。
+
+注：CPA / SUB2API 的**手动导出已移除**（2026-08-06）。这两个面板都是
+「一次只吃一个号」的接口形态，而且必须先用 refresh_token 把 access_token
+换成 Codex 风格才认，手动导出满足不了，实测导出来用不了。
+要往这两个面板送号请用**自动推送**（注册完成后由 `exporter.run_exports` 直接 POST），
+在「导出配置」里开就行。
 """
 from __future__ import annotations
 
-import io
-import json
 import logging
-import re
-import zipfile
 from dataclasses import dataclass
 from typing import Callable, Optional
 
@@ -48,117 +47,6 @@ def _s(row: dict, key: str) -> str:
     return str(v).strip()
 
 
-# ──────────────────────── CPA / SUB2API ────────────────────────
-# 直接复用 exporter.py 里自动推送用的那两个 build 函数，不重写一遍字段拼装 ——
-# 将来推送逻辑改了字段，手动导出自动跟着改，不会两边漂移。
-
-
-def _safe_filename(name: str) -> str:
-    """邮箱 -> 安全文件名。Windows 非法字符全换成 _。"""
-    cleaned = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", (name or "").strip())
-    cleaned = cleaned.strip(". ") or "unknown"
-    return cleaned[:120]
-
-
-def _cpa_fallback(row: dict) -> dict:
-    """build_cpa_token_json 抛错时的兜底（比如 access_token 是空的）。
-
-    照样出文件、字段结构不变，**不静默丢号**。
-    """
-    return {
-        "type": "codex",
-        "email": _s(row, "email"),
-        "expired": "",
-        "id_token": _s(row, "id_token"),
-        "account_id": "",
-        "access_token": _s(row, "access_token"),
-        "last_refresh": "",
-        "refresh_token": _s(row, "refresh_token"),
-    }
-
-
-def _render_cpa_zip(rows: list) -> bytes:
-    """CPA：每个号一个 `{email}.json`，打成 zip。
-
-    CPA 的 auth-files 就是按「一号一文件」吃的（见 exporter.export_to_cpa:335），
-    所以这里不做成 JSON 数组，直接给能丢进目录的形态。
-    """
-    from . import exporter
-
-    buf = io.BytesIO()
-    used: dict[str, int] = {}
-    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
-        for row in rows or []:
-            try:
-                data = exporter.build_cpa_token_json(row)
-            except Exception as e:
-                logger.warning(f"[export] CPA 构建失败，用兜底结构: {_s(row, 'email')}: {e}")
-                data = _cpa_fallback(row)
-
-            base = _safe_filename(_s(row, "email") or "unknown")
-            n = used.get(base, 0)
-            used[base] = n + 1
-            name = f"{base}.json" if n == 0 else f"{base}_{n}.json"
-
-            z.writestr(name, json.dumps(data, ensure_ascii=False, indent=2))
-    return buf.getvalue()
-
-
-def _sub2api_group_ids() -> list:
-    """从「导出配置」里读 group_ids，读不到就用 exporter 的默认值。"""
-    from . import db, exporter
-
-    raw = None
-    try:
-        raw = (db.get_export_config() or {}).get("sub2api_group_ids")
-    except Exception as e:
-        logger.warning(f"[export] 读取 sub2api_group_ids 失败，用默认值: {e}")
-    return exporter._parse_group_ids(raw)
-
-
-def _sub2api_fallback(row: dict, group_ids: list) -> dict:
-    from . import exporter
-
-    email = _s(row, "email")
-    return {
-        "name": email,
-        "notes": "",
-        "platform": "openai",
-        "type": "oauth",
-        "credentials": {
-            "access_token": _s(row, "access_token"),
-            "refresh_token": _s(row, "refresh_token"),
-            "expires_in": exporter.SUB2API_DEFAULT_EXPIRES_IN,
-            "expires_at": 0,
-            "chatgpt_account_id": "",
-            "chatgpt_user_id": "",
-            "organization_id": "",
-            "client_id": exporter.CODEX_CLIENT_ID,
-            "id_token": _s(row, "id_token"),
-        },
-        "extra": {"email": email},
-        "group_ids": list(group_ids),
-        "concurrency": 10,
-        "priority": 1,
-        "auto_pause_on_expired": True,
-    }
-
-
-def _render_sub2api_json(rows: list) -> bytes:
-    """SUB2API：一整个 JSON 数组，每个元素就是 POST /api/v1/admin/accounts 的 body。"""
-    from . import exporter
-
-    group_ids = _sub2api_group_ids()
-    out = []
-    for row in rows or []:
-        try:
-            out.append(exporter.build_sub2api_payload(row, group_ids))
-        except Exception as e:
-            logger.warning(f"[export] SUB2API 构建失败，用兜底结构: {_s(row, 'email')}: {e}")
-            out.append(_sub2api_fallback(row, group_ids))
-    return json.dumps(out, ensure_ascii=False, indent=2).encode("utf-8")
-
-
 # ──────────────────────── 注册表 ────────────────────────
 
 
@@ -174,22 +62,6 @@ FORMATS: list[ExportFormat] = [
         label="邮箱----密码",
         filename="账号密码.txt",
         render=lambda r: f'{_s(r, "email")}----{_s(r, "password")}',
-    ),
-    ExportFormat(
-        id="cpa",
-        label="CPA (zip)",
-        filename="cpa_tokens.zip",
-        mode="download",
-        mime="application/zip",
-        render_all=_render_cpa_zip,
-    ),
-    ExportFormat(
-        id="sub2api",
-        label="SUB2API (json)",
-        filename="sub2api_accounts.json",
-        mode="download",
-        mime="application/json; charset=utf-8",
-        render_all=_render_sub2api_json,
     ),
 ]
 
