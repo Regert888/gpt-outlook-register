@@ -67,6 +67,7 @@ class AuthFlow:
         config: Config,
         sms_callback: Optional[Any] = None,
         env_overrides: Optional[dict] = None,
+        on_password: Optional[Any] = None,
     ):
         # 本次流程专属的配置覆盖（WEBUI_ALLOW_LOGIN / OTP_TIMEOUT / OAuth 开关等）。
         # ⚠️ 以前 registrar 是直接写 os.environ 再在 finally 里还原的，
@@ -92,6 +93,11 @@ class AuthFlow:
         # 可选 SMS 接码控制器（sms_provider.PhoneCallbackController 实例）
         # 命中 add-phone 时自动租手机号 + 接 SMS 验证码，否则回退到环境变量路径
         self._sms_callback = sms_callback
+        # 密码一在 OpenAI 侧生效就回调出去，调用方负责立刻落盘。
+        # 签名 (email: str, password: str) -> None，异常由 register_password 吞掉。
+        # ⚠️ 协议层不认识 webui.db，所以只给回调，"存哪"留给调用方决定，
+        #    auth_flow 单独当 CLI 用时不传就是了，行为和以前一模一样。
+        self._on_password = on_password
         self._http_trace_enabled = str(os.getenv("AUTH_HTTP_TRACE", "0")).lower() in ("1", "true", "yes", "on")
         # signup() 会在分支里 set；run_protocol_login 命中已有账号路径会跳过 signup，
         # 导致 kickoff_otp_delivery 读未初始化属性 AttributeError。这里给个默认值。
@@ -1935,6 +1941,18 @@ class AuthFlow:
             logger.warning(f"密码注册返回 {resp.status_code}: {resp.text[:200]}")
             return False
         logger.info("密码注册成功")
+        # ⚠️ 走到这里 = OpenAI 侧账号连同这个密码**已经建好了**，但注册流程后面还有
+        #    发码 → 验证 OTP → create_account 三步，任何一步挂掉都到不了 save_registered。
+        #    密码是这个方法现生成的、只活在内存里，进程一退就永久没了 ——
+        #    号还在 OpenAI 那边好好的，却谁也登不进去（实测 2026-08-07 被 OTP 超时坑过一次）。
+        #    所以在这里立刻回调落盘。
+        #    位置刻意选在 POST 200 **之后**而不是生成密码时：POST 失败的密码
+        #    OpenAI 侧根本没生效，写进库里反而误导人以为能用。
+        if self._on_password is not None:
+            try:
+                self._on_password(email, password)
+            except Exception as e:
+                logger.warning(f"密码落盘回调失败（不影响注册，日志里还有兜底）: {e}")
         return True
 
     # ── Step 7: 发送 OTP ──

@@ -482,12 +482,27 @@ def save_registered(d: dict) -> None:
     email = (d.get("email") or "").lower()
     if not email:
         return
+    password = d.get("password", "") or ""
     extra = {k: v for k, v in d.items() if k not in {
         "email", "password", "access_token", "session_token", "refresh_token",
         "id_token", "device_id", "csrf_token", "cookie_header",
     }}
     with _lock:
         con = _conn()
+        # ⚠️ INSERT OR REPLACE 是**整行替换**，不是按字段合并 —— 没写的列会被清空。
+        #    重跑同一个邮箱时这会咬人：第一轮 register_password 设了密码但 OTP 超时，
+        #    save_password_early 把密码存下了；第二轮 OpenAI 已经认识这个邮箱了，
+        #    走 passwordless_login 分支根本不调 register_password，
+        #    这一轮的 d["password"] 是空的 —— 直接 REPLACE 就把上一轮的密码冲没了。
+        #    密码是 OpenAI 侧的**持久状态**，"这一轮没设" ≠ "这个号没有密码"，
+        #    所以空值不覆盖非空旧值。
+        #    token 三件套正相反：每轮跑都是全新的，旧的可能已失效，照常整列覆盖。
+        if not password:
+            row = con.execute(
+                "SELECT password FROM registered WHERE email=?", (email,)
+            ).fetchone()
+            if row and (row["password"] or "").strip():
+                password = row["password"]
         con.execute(
             "INSERT OR REPLACE INTO registered "
             "(email, password, access_token, session_token, refresh_token, "
@@ -495,7 +510,7 @@ def save_registered(d: dict) -> None:
             "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 email,
-                d.get("password", ""),
+                password,
                 d.get("access_token", ""),
                 d.get("session_token", ""),
                 d.get("refresh_token", ""),
@@ -504,6 +519,43 @@ def save_registered(d: dict) -> None:
                 d.get("csrf_token", ""),
                 d.get("cookie_header", ""),
                 json.dumps(extra, ensure_ascii=False) if extra else None,
+                time.time(),
+            ),
+        )
+        con.commit()
+
+
+def save_password_early(email: str, password: str) -> None:
+    """密码一在 OpenAI 侧生效就落盘，不等整个注册流程跑完。
+
+    由 AuthFlow 的 on_password 回调触发（register_password 里 POST 200 之后）。
+    此刻账号+密码在 OpenAI 那边已经建好，但本地还要过发码/验证/建账户三关，
+    挂在任何一关都走不到 save_registered ——
+    密码只活在内存里，进程一退号就成了谁也登不进去的孤儿。
+
+    只写 email + password；token 三件套留空，等流程跑通后 save_registered
+    用同一个 email 主键覆盖同一行补上。extra_json 打 pending 标记，
+    方便一眼认出"有密码没凭证"的半成品行（跑通后会被 save_registered 清掉）。
+
+    ⚠️ 行已存在时**只 UPDATE password**，绝不动已有的 token：
+       重跑一个之前跑通过的邮箱时，不能把人家的凭证清空。
+    """
+    email = (email or "").strip().lower()
+    password = (password or "").strip()
+    if not email or not password:
+        return
+    with _lock:
+        con = _conn()
+        con.execute(
+            "INSERT INTO registered "
+            "(email, password, access_token, session_token, refresh_token, "
+            "id_token, device_id, csrf_token, cookie_header, extra_json, created_at) "
+            "VALUES (?, ?, '', '', '', '', '', '', '', ?, ?) "
+            "ON CONFLICT(email) DO UPDATE SET password=excluded.password",
+            (
+                email,
+                password,
+                json.dumps({"pending": True}, ensure_ascii=False),
                 time.time(),
             ),
         )

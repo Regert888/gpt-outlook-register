@@ -7,9 +7,12 @@
 中转站是第三方部署的 HTML 页面，**没有 JSON 接口**（试过 ?format=json，
 还是吐 HTML），所以取码只能从 HTML 里抠。
 
-⚠️ 中转站不止一家，页面模板各写各的（实测 2026-08-04 已遇到 2 种）。
-   主人买号是一批一批买的，不同批次可能来自不同中转商，所以这里
-   **两种版式都要认**，靠特征标签自动判别，不能写死一种：
+⚠️ 中转站不止一家，取件方式各写各的（实测已遇到 3 家）。主人买号是一批一批买的，
+   不同批次可能来自不同中转商，所以这里**几种形态都要认**，自动判别，不能写死一种。
+
+   先分两大类：**JSON 接口式**（形态 C）和 **HTML 页面式**（版式 A/B）。
+   判据是链接里有没有 `#email=...&key=...`，见 `_parse_pickup_credentials`。
+   下面三种，靠特征标签 / 链接形状自动判别：
 
    版式 A（mail.ai1998.xyz）—— 纯文本正文，本地时区时间
        <article class="mail-card">
@@ -27,9 +30,40 @@
          <div class="bd"><html>…整封邮件…</html></div>
        </div>
 
-默认都只给最新一封，要全部得带参数：A 用 ?all=1，B 用 ?n=10。
-实测两家都容忍对方的参数（多余的会被忽略），所以两个一起带，
-不用先探测是哪家。
+   A / B 默认都只给最新一封，要全部得带参数：A 用 ?all=1，B 用 ?n=10。
+   实测两家都容忍对方的参数（多余的会被忽略），所以两个一起带，
+   不用先探测是哪家。
+
+   形态 C（flysms.xyz）—— **纯 JSON 接口，没有 HTML 可抠**（2026-08-07 新增）
+       链接长这样，注意参数在 `#` 后面：
+           https://flysms.xyz/icloud/pickup#email=xxx%40icloud.com&key=tok_xxx
+
+       `#` 后面的内容**浏览器不会发给服务器**，所以直接 GET 这个地址只拿得到
+       一个 339 字节的 React 空壳，一封信都没有 —— A / B / 兜底三个解析器
+       全都扫不到东西（主人 2026-08-07 遇到的就是这个）。真正取信的是页面里
+       JS 自己发的那个请求，协议是从它的 bundle 里挖出来的：
+
+           GET  <base>/api/pickup/messages?limit=20
+           Accept:          application/json
+           Authorization:   Bearer <key>
+           X-Mailbox-Email: <email>
+
+       返回 {"email","scope","revision","messages":[…],"nextCursor"}，
+       每封信有 uid / from / to / date / subject / preview / hasAttachments。
+
+       ✅ 这条路比抠 HTML 稳得多：
+          · `uid` 是**真正的邮件 ID**。A / B 只能拿「时间+主题」凑指纹，
+            而 OpenAI 连发几封验证码时这两项几乎一模一样，最容易撞车。
+          · `date` 是带 Z 的 ISO8601 **绝对时间**，防旧码的时间窗从此可靠
+            （版式 A 那个「本机时区墙上时间」的坑在这里不存在）。
+          · `from` 是**真实发件人** noreply@tm.openai.com，
+            不是中转站改写过的 noreply_at_tm_openai_com_xxx@icloud.com。
+
+       ⚠️ **uid 顺序和时间顺序对不上**（实测 uid …116 比 …118 还新）。
+          所以 uid 只能当指纹，排序和时间窗一律认 `date`。
+       ⚠️ 正文只有 `preview`（截断的纯文本），没有取全文的接口。OpenAI 的
+          验证码都在正文开头，实测日/英两种模板都取得到；哪天模板把码挪到
+          很靠后，这里要另想办法。
 
 能力：pooled=True     一批号导进号池，一个一个 claim（每个号自带取件链接）
       ephemeral=False 地址固定不变 ⚠️
@@ -49,6 +83,7 @@ from __future__ import annotations
 
 import hashlib
 import html as _html
+import json
 import logging
 import re
 import time
@@ -178,6 +213,78 @@ def _parse_date(s: str) -> Optional[float]:
         except ValueError:
             continue
     return None
+
+
+# ──────────────────── 形态 C：JSON 接口 ────────────────────
+
+
+def _parse_iso8601(s: str) -> Optional[float]:
+    """'2026-08-07T01:38:25.000Z' -> epoch 秒。
+
+    带 Z 的绝对时间，不用猜时区 —— 这是 JSON 接口相对 HTML 版式最大的好处。
+    解析不出来退回通用的 _parse_date，别为一个格式微调就把时间窗整个丢掉。
+    """
+    s = (s or "").strip()
+    if not s:
+        return None
+    try:
+        dt = datetime.fromisoformat(s.replace("Z", "+00:00").replace("z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.timestamp()
+    except ValueError:
+        return _parse_date(s)
+
+
+def _parse_pickup_credentials(url: str) -> Optional[dict]:
+    """认不认得出这是「JSON 接口式」链接？认得就返回调接口要的三件套。
+
+    判据：`#` 后面同时有 email 和 key（实测就放这儿）。顺带也看 query，
+    是给以后别家留的后路。**认不出来返回 None**，调用方继续走 HTML 版式，
+    所以这个改动对 A / B 两家零影响。
+
+    接口地址从页面路径推出来，对应 bundle 里那句
+    `${'/icloud/'.replace(/\\/$/,'')}/api/pickup/messages`：
+        https://flysms.xyz/icloud/pickup -> https://flysms.xyz/icloud/api/pickup/messages
+    不写死域名，换个中转商只要形状一样就还能用。
+    """
+    parts = urllib.parse.urlsplit(url or "")
+    for blob in (parts.fragment, parts.query):
+        q = dict(urllib.parse.parse_qsl(blob or ""))
+        email = (q.get("email") or "").strip()
+        token = (q.get("key") or q.get("token") or "").strip()
+        if email and token:
+            path = parts.path.rstrip("/")
+            if path.endswith("/pickup"):
+                path = path[: -len("/pickup")]
+            api = urllib.parse.urlunsplit(
+                (parts.scheme, parts.netloc, f"{path}/api/pickup/messages", "", "")
+            )
+            return {"api_url": api, "email": email.lower(), "token": token}
+    return None
+
+
+def _parse_pickup_json(payload: dict) -> list[dict]:
+    """把接口返回的 messages 映射成和 HTML 版式**完全一样**的字典结构。
+
+    统一形状是故意的：wait_for_otp 里那套时间窗 / 发件人校验 / _seen 去重
+    一行都不用改，两条取件路径直接共用。多出来的 uid 只有 _fp 会用。
+    """
+    out: list[dict] = []
+    for m in (payload or {}).get("messages") or []:
+        if not isinstance(m, dict):
+            continue
+        date_str = str(m.get("date") or "")
+        out.append({
+            "subject": str(m.get("subject") or ""),
+            "sender": str(m.get("from") or ""),
+            "body": str(m.get("preview") or ""),
+            "date_str": date_str,
+            "ts": _parse_iso8601(date_str),
+            "layout": "json",
+            "uid": m.get("uid"),
+        })
+    return out
 
 
 def _parse_layout_a(text: str) -> list[dict]:
@@ -362,6 +469,21 @@ class ICloudRelayProvider(MailProvider):
         self._dead = False
         self.last_persona = None
 
+        # 取件方式自动分流：链接里带 #email=&key= 就是 JSON 接口式（形态 C），
+        # 否则按老路子拉 HTML 页面（版式 A/B/兜底）。在这里判一次就够，
+        # 省得每轮轮询（3 秒一次）都重新解析一遍 URL。
+        self._pickup = _parse_pickup_credentials(relay_url)
+        if self._pickup:
+            if self._pickup["email"] != email:
+                # 号池那一行的邮箱和链接里的对不上 —— 多半是导入时粘串行了。
+                # 以链接里的为准（key 是按它签的，用错必然 401），但要吼一声。
+                logger.warning(
+                    "[icloud_relay] 号池邮箱 %s 与链接里的 %s 不一致，"
+                    "按链接里的取件（key 是跟着链接走的）",
+                    email, self._pickup["email"],
+                )
+            logger.debug("[icloud_relay] %s 走 JSON 接口取件", email)
+
         # 已消费过的邮件指纹（主题+时间），避免同一封被读两遍
         self._seen: set[str] = set()
         # 起始快照只做一次 —— 见 wait_for_otp 里的说明
@@ -438,19 +560,74 @@ class ICloudRelayProvider(MailProvider):
         """地址是配置里填死的，直接返回，不造新地址。"""
         return self.email
 
-    def _messages(self) -> list[dict]:
-        """拉一次并解析，异常吞掉返回空列表（轮询里不该因一次网络抖动就崩）。"""
+    def _fetch_json(self, limit: int = 20) -> list[dict]:
+        """形态 C：直接调 JSON 接口取信。
+
+        认证是 `Authorization: Bearer` + `X-Mailbox-Email` 两件套，少一个都是 401。
+        """
+        p = self._pickup
+        url = f"{p['api_url']}?{urllib.parse.urlencode({'limit': limit})}"
+        req = urllib.request.Request(url, headers={
+            "Accept": "application/json",
+            "Authorization": f"Bearer {p['token']}",
+            "X-Mailbox-Email": p["email"],
+            "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                           "AppleWebKit/537.36 (KHTML, like Gecko) "
+                           "Chrome/136.0.0.0 Safari/537.36"),
+            "Cache-Control": "no-cache",
+        })
         try:
-            return parse_relay_html(self._fetch())
+            with urllib.request.urlopen(req, timeout=self.http_timeout) as r:
+                payload = json.loads(r.read().decode("utf-8", errors="replace"))
+        except urllib.error.HTTPError as e:
+            if e.code in (401, 403, 404, 410):
+                raise MailProviderError(
+                    f"取件接口拒绝（HTTP {e.code}）—— key 可能过期，或邮箱和链接对不上",
+                    fatal=True, kind=self.kind,
+                ) from e
+            if e.code == 429:
+                # 限流是暂时的，不该当致命错误。轮询本来就 3 秒一轮，
+                # 这里退回空列表继续等，比直接把整个号判死友好。
+                logger.warning(
+                    "[icloud_relay] 取件接口限流 429（Retry-After=%s），本轮跳过",
+                    (e.headers.get("Retry-After") if e.headers else None) or "?",
+                )
+                return []
+            raise
+
+        if not isinstance(payload, dict) or payload.get("messages") is None:
+            logger.warning("[icloud_relay] 接口返回里没有 messages 字段，结构可能有变动")
+            return []
+        return _parse_pickup_json(payload)
+
+    def _load(self) -> list[dict]:
+        """拉一次并解析（异常原样往上抛）。两种取件方式在这里分流。"""
+        if self._pickup:
+            return self._fetch_json()
+        return parse_relay_html(self._fetch())
+
+    def _messages(self) -> list[dict]:
+        """给轮询用的包装：异常吞掉返回空列表（不该因一次网络抖动就崩）。"""
+        try:
+            return self._load()
         except MailProviderError:
             raise                      # 致命错误要往上抛，不能被当成"暂时没邮件"
         except Exception as e:
-            logger.warning(f"[icloud_relay] 拉取中转页异常（吞掉重试）: {e}")
+            logger.warning(f"[icloud_relay] 拉取邮件异常（吞掉重试）: {e}")
             return []
 
     @staticmethod
     def _fp(m: dict) -> str:
-        """邮件指纹。中转页没给 message id，用 时间+主题 凑合。"""
+        """邮件指纹，防同一封被读两遍。
+
+        JSON 接口给了真的 uid，直接用。HTML 版式没有 message id，只能拿
+        时间+主题 凑 —— 而 OpenAI 连发几封验证码时这两项几乎一模一样
+        （实测 3 封里 2 封同主题、时间差 20 秒），撞车了就会漏读新码。
+        又一个该优先走接口的理由。
+        """
+        uid = m.get("uid")
+        if uid not in (None, ""):
+            return f"uid:{uid}"
         return f"{m.get('date_str','')}|{m.get('subject','')[:80]}"
 
     def _looks_like_openai(self, m: dict) -> bool:
@@ -569,27 +746,33 @@ class ICloudRelayProvider(MailProvider):
     # ──────────────────────── 自检 ────────────────────────
 
     def self_test(self) -> dict:
-        """WebUI「测试连通性」：拉一次中转页，报告能看到几封信。"""
+        """WebUI「测试连通性」：拉一次，报告用的哪种取件方式、看到几封信。
+
+        把方式也报出来，是为了让主人一眼看出这个链接被判成了哪一类 ——
+        万一新链接没被认成 JSON 接口式，这里会直接显示「HTML 中转页」，
+        比等注册跑挂了再翻日志快得多。
+        """
+        way = "JSON 接口" if self._pickup else "HTML 中转页"
         try:
-            msgs = parse_relay_html(self._fetch())
+            msgs = self._load()
         except MailProviderError as e:
-            return {"ok": False, "message": str(e)}
+            return {"ok": False, "message": f"[{way}] {e}"}
         except Exception as e:
-            return {"ok": False, "message": f"中转页拉取失败: {e}"}
+            return {"ok": False, "message": f"[{way}] 拉取失败: {e}"}
 
         if not msgs:
             return {
                 "ok": True,
                 "message": (
-                    f"中转链接可访问，但当前收件箱是空的（{self.email}）。"
-                    "页面结构若有变动，取码会失败 —— 建议先发一封测试邮件确认。"
+                    f"[{way}] 链接可访问，但当前收件箱是空的（{self.email}）。"
+                    "建议先发一封测试邮件确认能收到。"
                 ),
             }
         newest = msgs[0]
         return {
             "ok": True,
             "message": (
-                f"连接成功，{self.email} 当前有 {len(msgs)} 封邮件，"
+                f"[{way}] 连接成功，{self.email} 当前有 {len(msgs)} 封邮件，"
                 f"最新一封：{newest.get('subject','(无主题)')[:40]}"
                 f"（{newest.get('date_str','时间未知')}）"
             ),

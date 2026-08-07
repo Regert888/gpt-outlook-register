@@ -224,6 +224,7 @@ def _do_register(
             cfg,
             sms_callback=_build_sms_callback(run_id),
             env_overrides=env_overrides,
+            on_password=_save_password_early,
         )
         _emit_status(run_id, "phase", {"phase": "starting", "email": email})
         logging.getLogger("registrar").info(f"[register] 开始: {email}")
@@ -277,6 +278,26 @@ def _do_register(
 
         # 落库
         db.save_registered(d)
+        # ⚠️ d 是**本轮内存里**的结果，它不一定知道这个号有密码：
+        #    重跑一个之前设过密码的邮箱时，OpenAI 会认成已有账号 → passwordless_login
+        #    → register_password 根本不执行 → d["password"] 是空的。
+        #    但上一轮 save_password_early 存的密码还在库里，save_registered 刚刚
+        #    已经把它保留下来了（空值不覆盖非空旧值）——「注册结果」页读 DB 显示正确，
+        #    唯独跑完这一刻的 done 事件拿的是 d，前端 `v-if="lastRunResult.password"`
+        #    判空 → 密码行连同「复制密码」「复制 email----password」两个按钮一起消失，
+        #    主人会以为密码又丢了。所以这里从库里回读补回来。
+        #    只在 d 里密码为空时查一次，正常路径零额外开销。
+        if not (d.get("password") or "").strip():
+            try:
+                _saved = db.get_registered(d.get("email") or "")
+                _pw = ((_saved or {}).get("password") or "").strip()
+                if _pw:
+                    d["password"] = _pw
+                    logging.getLogger("registrar").info(
+                        "[register] 本轮未设密码，沿用库中已存密码（上一轮 register_password 留下的）"
+                    )
+            except Exception as e:
+                logging.getLogger("registrar").warning(f"[register] 回读已存密码失败: {e}")
         # 非池化 provider 的 email 是虚拟占位（xxx_placeholder_N@placeholder.local），
         # 号池里根本没这行，不能去 mark。判据用 provider 的 pooled，不写死 kind。
         if is_pooled:
@@ -411,6 +432,25 @@ def _try_export_to_panels(run_id: str, cred: dict) -> None:
         _emit_status(run_id, "phase", {"phase": "export_done", "summary": summary})
     except Exception:
         pass
+
+
+def _save_password_early(email: str, password: str) -> None:
+    """AuthFlow 的 on_password 回调：密码在 OpenAI 侧一生效就落盘。
+
+    以前密码只在流程**全部**跑通后才随 save_registered 一起入库，
+    中间任何一步失败（实测最常见的是 OTP 超时）密码就只剩一行 ERROR 日志兜底 ——
+    换台机器、日志轮转、或者干脆没人去翻，号就废了。
+
+    这里存的是"有密码、无凭证"的半成品行，跑通后 save_registered 会用
+    同一个 email 主键覆盖补全，不会多出一行对不上的记录。
+    """
+    log = logging.getLogger("registrar")
+    try:
+        db.save_password_early(email, password)
+        log.info(f"[register] 密码已落盘: {email}（凭证待补）")
+    except Exception as e:
+        # 落盘失败不能影响注册；下面 except 里那行 ERROR 日志仍然是兜底
+        log.warning(f"[register] 密码落盘失败，仅剩日志兜底: {e}")
 
 
 def _build_sms_callback(run_id: str) -> Optional[PhoneCallbackController]:
