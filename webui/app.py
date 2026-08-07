@@ -765,8 +765,19 @@ def api_check_plus(req: CheckPlusReq):
         try:
             proxies = None
             proxy = req.proxy.strip()
-            if proxy:
+            # 检测 chatgpt.com 必须用 HTTP 代理（SOCKS5 对 chatgpt.com 有 TLS 问题）。
+            # 表单 proxy 是注册/跑号共用的 SOCKS5，会连不上 —— 检测这里强制走 DB 配置的
+            # check_plus_proxy（默认 sing-box HTTP 7890），不信任前端传来的 SOCKS5。
+            from . import db as _db
+            proxy = req.proxy.strip()
+            if proxy and not proxy.startswith("socks"):
                 proxies = {"https": proxy, "http": proxy}
+            else:
+                _proxy = _db.get_setting("check_plus_proxy", "")
+                if _proxy and not _proxy.startswith("socks"):
+                    proxies = {"https": _proxy, "http": _proxy}
+                else:
+                    proxies = {"https": "http://127.0.0.1:7890", "http": "http://127.0.0.1:7890"}
             resp = cffi_requests.get(
                 "https://chatgpt.com/backend-api/accounts/check/v4-2023-04-27",
                 headers={
