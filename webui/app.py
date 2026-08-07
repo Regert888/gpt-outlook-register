@@ -26,6 +26,7 @@ sys.path.insert(0, str(ROOT))
 
 from . import db, export_formats, registrar  # noqa: E402
 from .auto_loop import CONTROLLER as AUTO_LOOP  # noqa: E402
+from .proxy_health import get_checker as get_proxy_health_checker  # noqa: E402
 from mail_providers import (  # noqa: E402
     ImportValidationError,
     MailProviderError,
@@ -42,6 +43,12 @@ try:
         logging.getLogger("webui").info(f"[startup] 释放 {_released} 个卡死的 in_use 号")
 except Exception as _e:
     logging.getLogger("webui").warning(f"[startup] release_stale 失败: {_e}")
+
+# 启动代理池健康检查后台线程（每 5 分钟自动检测一次）
+try:
+    get_proxy_health_checker().start()
+except Exception as _e:
+    logging.getLogger("webui").warning(f"[startup] 代理健康检查启动失败: {_e}")
 
 logging.basicConfig(
     level=logging.INFO,
@@ -181,6 +188,11 @@ def api_stats():
     return {"ok": True, "stats": db.stats()}
 
 
+@app.get("/api/stats/detailed")
+def api_stats_detailed():
+    return {"ok": True, "stats": db.get_detailed_stats()}
+
+
 # ──────────────────────── 代理连通性测试 ────────────────────────
 
 
@@ -240,6 +252,57 @@ def api_proxy_test(req: ProxyTestReq):
         for proxy, res in zip(proxies, ex.map(_test_one, proxies)):
             results[proxy] = res
     return {"ok": True, "results": results}
+
+
+# ──────────────────────── 代理池同步 + 健康状态 ────────────────────────
+
+
+class ProxyPoolSyncReq(BaseModel):
+    proxies: list[str] = Field(default_factory=list, description="代理池列表")
+
+
+@app.post("/api/proxy/pool")
+def api_proxy_pool_sync(req: ProxyPoolSyncReq):
+    """前端同步代理池到后端，供定时健康检查使用。
+
+    前端每次修改代理池后调用，保证后端定时任务测试的是「当前生效」的池。
+    """
+    db.set_proxy_pool(req.proxies)
+    return {"ok": True, "count": len(req.proxies)}
+
+
+@app.get("/api/proxy/health")
+def api_proxy_health():
+    """返回各代理的健康状态（含绿色/红色指示，前端仪表盘用）。
+
+    返回结构：
+        {
+            "ok": True,
+            "proxies": { "proxy_string": { "ok": bool, "latency_ms": int, ... } },
+            "last_check_at": float,
+            "healthy": int,
+            "unhealthy": int,
+            "removed": list[str],
+            "removed_count": int,
+            "total": int,
+            "checker_status": { "running": bool, "in_progress": bool, ... },
+        }
+    """
+    health = db.get_proxy_health()
+    checker = get_proxy_health_checker()
+    return {
+        "ok": True,
+        **health,
+        "checker_status": checker.get_status(),
+    }
+
+
+@app.post("/api/proxy/health/check")
+def api_proxy_health_check():
+    """手动触发一次代理健康检查。"""
+    checker = get_proxy_health_checker()
+    result = checker.check_now()
+    return {"ok": True, **result}
 
 
 @app.post("/api/register")
@@ -352,6 +415,17 @@ def api_registered(limit: int = 20, offset: int = 0, filter: str = "all"):
     items = db.list_registered(limit=limit, offset=offset, filter_rt=filter)
     total = db.count_registered(filter_rt=filter)
     return {"ok": True, "items": items, "total": total}
+
+
+@app.get("/api/registered/without_refresh")
+def api_registered_without_refresh():
+    """返回 registered 表中无 refresh_token 的号（email 列表）。
+
+    ⚠️ 必须定义在 /api/registered/{email} 之前，
+      否则 FastAPI 会把 without_refresh 当 email 参数匹配，永远 404。
+    """
+    emails = db.get_accounts_without_refresh()
+    return {"ok": True, "emails": emails, "count": len(emails)}
 
 
 @app.get("/api/registered/{email}")
@@ -832,6 +906,96 @@ def api_check_plus(req: CheckPlusReq):
             db.update_plus_check(email, {**info, "checked_at": checked_at})
 
     return {"ok": True, "results": results}
+
+
+# ──────────────────────── 补 refresh（无 refresh_token 的号重跑注册） ────────────────────────
+
+
+    return {"ok": True, "emails": emails, "count": len(emails)}
+
+
+class RefreshRefreshReq(BaseModel):
+    emails: list[str] = Field(..., description="要补 refresh 的邮箱列表")
+    proxy: str = Field("", description="注册用代理，留空直连")
+    otp_timeout: int = Field(10, description="接码超时秒数")
+
+
+@app.post("/api/registered/refresh_refresh")
+def api_refresh_refresh(req: RefreshRefreshReq):
+    """对一批无 refresh_token 的号逐个重跑注册以补 refresh。
+
+    流程（每个号）：
+      a. 查 outlook_creds 表取原始凭证（password / client_id / refresh_token）
+      b. 以 outlook 格式导入号池 outlook_accounts（import_accounts）
+      c. 重置号为 available
+      d. 调用 registrar.start_registration 跑注册（后台线程）
+      e. 记录成功（已启动）或失败（无凭证 / 导入失败 / 启动异常）
+
+    返回 {"started": [...], "failed": {email: 原因}}。实际是否拿到 refresh
+    由后台注册线程负责（成功会 save_registered 并 _try_export_to_panels）。
+    """
+    cleaned = [e.strip().lower() for e in (req.emails or []) if e and e.strip()]
+    if not cleaned:
+        raise HTTPException(400, "emails 不能为空")
+
+    results = {}
+    for email in cleaned:
+        try:
+            cred = db.get_outlook_cred(email)
+            if not cred:
+                results[email] = {"ok": False, "error": "outlook_creds 中无此凭证"}
+                continue
+            # b. 导入号池（outlook 格式：email----password----client_id----refresh_token）
+            line = (
+                f"{cred['email']}----{cred['password'] or ''}----"
+                f"{cred['client_id'] or ''}----{cred['refresh_token'] or ''}"
+            )
+            db.import_accounts(line, kind="outlook")
+            # c. 重置为 available
+            db.reset_to_available(email)
+            # 从池里取回该号（含 kind 等字段）
+            account = db.get_account(email)
+            if not account:
+                results[email] = {"ok": False, "error": "导入号池后找不到该号"}
+                continue
+            # d. 启动注册（后台线程），want_refresh_token 必须为 True
+            options = {
+                "want_access_token": True,
+                "want_session_token": True,
+                "want_refresh_token": True,
+                "proxy": req.proxy or "",
+                "otp_timeout": int(req.otp_timeout or 10),
+                "allow_existing_login": True,
+            }
+            run_id = registrar.start_registration(account, options)
+            results[email] = {"ok": True, "run_id": run_id}
+        except Exception as e:  # noqa: BLE001
+            results[email] = {"ok": False, "error": str(e)[:200]}
+
+    started = [e for e, r in results.items() if r.get("ok")]
+    failed = {e: r["error"] for e, r in results.items() if not r.get("ok")}
+    return {"ok": True, "started": started, "failed": failed, "results": results}
+
+
+# ──────────────────────── Webhook 通知配置 ────────────────────────
+
+
+class SaveWebhookReq(BaseModel):
+    webhook_url: str = Field("", description="Webhook 回调 URL，留空清除")
+
+
+@app.get("/api/settings/webhook")
+def api_get_webhook_config():
+    return {"ok": True, "config": db.get_webhook_config()}
+
+
+@app.post("/api/settings/webhook")
+def api_save_webhook_config(req: SaveWebhookReq):
+    try:
+        db.save_webhook_config(req.model_dump())
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    return {"ok": True, "config": db.get_webhook_config()}
 
 
 # ──────────────────────── auto-loop ────────────────────────
