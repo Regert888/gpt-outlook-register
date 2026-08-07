@@ -6,6 +6,7 @@ import {
   listRegistered, getRegistered, deleteRegistered,
   bulkDeleteRegistered, checkPlus,
   listExportFormats, exportRegistered,
+  listWithoutRefresh, refreshRefresh,
 } from '@/api/register'
 import { copyText, fmtTime } from '@/api/request'
 import { useFormStore } from '@/stores/form'
@@ -24,6 +25,13 @@ const selected = ref([])
 const loading = ref(false)
 const checking = ref(false)
 const checkResult = ref('')
+
+// ──────────── 补 refresh ────────────
+const refreshing = ref(false)
+const refreshResult = ref('')
+const refreshProgress = ref({ total: 0, started: 0, failed: 0, done: 0 })
+const refreshEmails = ref([])      // 待处理的邮箱列表
+const refreshDialogVisible = ref(false)
 
 const PLUS_TYPE = {
   plus_eligible: 'success', plus_active: 'primary', free: 'warning',
@@ -70,6 +78,69 @@ async function doCheck(mode) {
     checkResult.value = ''
     ElMessage.error('检查失败: ' + e.message)
   } finally { checking.value = false }
+}
+
+// ──────────── 补 refresh ────────────
+async function doRefresh(mode) {
+  refreshing.value = true
+  refreshResult.value = '查询中...'
+  try {
+    let emails = []
+    if (mode === 'selected') {
+      // 只处理选中的、且无 refresh 的号
+      emails = selected.value
+        .filter((r) => !r.refresh_token)
+        .map((r) => r.email)
+      if (!emails.length) {
+        refreshResult.value = ''
+        ElMessage.info('选中的号都有 refresh_token')
+        return
+      }
+    } else {
+      const { emails: all } = await listWithoutRefresh()
+      emails = all || []
+      if (!emails.length) {
+        refreshResult.value = ''
+        ElMessage.info('没有需要补 refresh 的号')
+        return
+      }
+    }
+    const ok = await confirm(
+      `已发现 ${emails.length} 个无 refresh_token 的账号，确认逐个重跑注册补 refresh？\n\n`
+      + `（注册会在后台线程执行，刷新页面可查看进度）`,
+    )
+    if (!ok) return
+
+    refreshEmails.value = emails
+    refreshProgress.value = { total: emails.length, started: 0, failed: 0, done: 0 }
+    refreshResult.value = `补 refresh 中... 0/${emails.length}`
+
+    const { started, failed } = await refreshRefresh(
+      emails,
+      form.value.proxy.trim(),
+      form.value.otp_timeout || 10,
+    )
+    refreshProgress.value = {
+      total: emails.length,
+      started: started.length,
+      failed: Object.keys(failed || {}).length,
+      done: emails.length,
+    }
+    const parts = [`已完成: ${started.length} 个启动成功`]
+    if (Object.keys(failed || {}).length) {
+      parts.push(`${Object.keys(failed).length} 个失败`)
+    }
+    refreshResult.value = parts.join(', ')
+    if (Object.keys(failed || {}).length) {
+      ElMessage.warning(`${Object.keys(failed).length} 个号启动失败，请查看详情`)
+    } else {
+      ElMessage.success(`${started.length} 个号已启动补 refresh`)
+    }
+    load(false)
+  } catch (e) {
+    refreshResult.value = ''
+    ElMessage.error('补 refresh 失败: ' + e.message)
+  } finally { refreshing.value = false }
 }
 
 async function confirm(msg) {
@@ -217,6 +288,9 @@ onActivated(() => load())
         <el-button :loading="checking" :disabled="!selected.length" @click="doCheck('selected')">
           检测选中 ({{ selected.length }})
         </el-button>
+        <el-button :loading="refreshing" type="warning" plain @click="doRefresh(selected.length ? 'selected' : '')">
+          <el-icon><Refresh /></el-icon>补 refresh{{ selected.length ? ` (${selected.length})` : '' }}
+        </el-button>
         <el-divider direction="vertical" />
         <el-dropdown trigger="click" @command="doExport" @visible-change="(v) => v && loadExportFormats()">
           <el-button :loading="exporting">
@@ -239,6 +313,7 @@ onActivated(() => load())
         </el-button>
         <el-button type="danger" plain @click="deleteAll">清空全部</el-button>
         <span class="hint">{{ checkResult }}</span>
+        <span v-if="refreshResult" class="hint" style="margin-left: 8px; color: var(--el-color-warning)">{{ refreshResult }}</span>
       </el-space>
 
       <el-skeleton v-if="loading && !rows.length" :rows="6" animated style="padding: 8px 0" />

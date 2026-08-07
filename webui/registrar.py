@@ -101,6 +101,43 @@ def _emit_status(run_id: str, kind: str, payload: dict | str = ""):
     q.put("__EVENT__:" + _json.dumps(body, ensure_ascii=False))
 
 
+def _send_webhook(event: str, email: str, error: str = "") -> None:
+    """异步发送 Webhook 通知。不阻塞注册流程，异常静默吞掉。"""
+    try:
+        url = db.get_setting("webhook_url", "").strip()
+        if not url:
+            return
+        import json as _json
+        import threading as _threading
+        import urllib.request as _request
+
+        payload = _json.dumps(
+            {
+                "event": event,
+                "email": email,
+                "time": time.time(),
+                "error": error,
+            },
+            ensure_ascii=False,
+        ).encode("utf-8")
+
+        def _do():
+            try:
+                req = _request.Request(
+                    url,
+                    data=payload,
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                _request.urlopen(req, timeout=10)
+            except Exception:
+                pass  # webhook 失败不报错
+
+        _threading.Thread(target=_do, daemon=True).start()
+    except Exception:
+        pass  # 构造失败也不报错
+
+
 # 网络/环境层错误特征：命中任一就把号放回 available（号本身没问题，是环境炸了）
 _NETWORK_ERROR_PATTERNS = [
     "tls", "ssl", "sslerror", "connection", "connect error", "timeout", "timed out",
@@ -326,6 +363,7 @@ def _do_register(
             f"st={result_summary['session_token_len']} "
             f"rt={result_summary['refresh_token_len']}"
         )
+        _send_webhook("register_done", d.get("email") or email)
         db.finish_run(run_id, "done")
 
     except Exception as e:
@@ -358,6 +396,7 @@ def _do_register(
                 db.mark_failed(email, f"[{category}] {err}")
         db.finish_run(run_id, "failed", err, category=category)
         _emit_status(run_id, "error", {"message": err, "category": category})
+        _send_webhook("register_failed", email, err)
 
     finally:
         # env 覆盖现在只挂在 AuthFlow 实例上，随实例一起回收，无需还原。
@@ -495,7 +534,7 @@ def start_registration(account: dict, options: dict) -> str:
     """启动一次注册任务，返回 run_id。"""
     run_id = uuid.uuid4().hex[:12]
     log_file = LOG_DIR / f"{run_id}.log"
-    db.create_run(run_id, account["email"], str(log_file))
+    db.create_run(run_id, account["email"], str(log_file), options.get("proxy", ""))
 
     q: queue.Queue = queue.Queue()
     with _lock:

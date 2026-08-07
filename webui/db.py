@@ -93,6 +93,14 @@ def init_db():
             error           TEXT,
             error_category  TEXT         -- network / account / unknown
         );
+
+        CREATE TABLE IF NOT EXISTS outlook_creds (
+            email           TEXT PRIMARY KEY,
+            password        TEXT,
+            client_id       TEXT,
+            refresh_token   TEXT,
+            imported_at     REAL
+        );
     """)
     con.commit()
     # 老 DB migrate：error_category 在后期才加，对已建表补列
@@ -100,6 +108,10 @@ def init_db():
     cols = {r[1] for r in cur.fetchall()}
     if "error_category" not in cols:
         con.execute("ALTER TABLE runs ADD COLUMN error_category TEXT")
+        con.commit()
+    # proxy 列用于「代理成功率排名」统计（仪表盘详细统计用）
+    if "proxy" not in cols:
+        con.execute("ALTER TABLE runs ADD COLUMN proxy TEXT")
         con.commit()
 
     # 老 DB migrate：号池多邮箱混放（kind / relay_url 在后期才加）
@@ -470,6 +482,140 @@ def stats() -> dict:
     return out
 
 
+def get_detailed_stats() -> dict:
+    """仪表盘详细统计：今天注册/趋势/小时成功率/代理排名/失败原因。
+
+    从 runs 表和 registered 表计算。
+    """
+    import time
+    con = _conn()
+    now = time.time()
+    today_start = int(now // 86400) * 86400  # 今天的 00:00 UTC
+    today_end = today_start + 86400
+    week_ago = now - 7 * 86400
+
+    out = {}
+
+    # ── 1) 今天注册成功数/失败数 ──
+    cur = con.execute(
+        "SELECT status, COUNT(*) AS n FROM runs "
+        "WHERE started_at >= ? AND started_at < ? "
+        "AND status IN ('done','failed') GROUP BY status",
+        (today_start, today_end),
+    )
+    today_success = 0
+    today_fail = 0
+    for r in cur.fetchall():
+        if r["status"] == "done":
+            today_success = r["n"]
+        elif r["status"] == "failed":
+            today_fail = r["n"]
+    out["today"] = {"success": today_success, "fail": today_fail}
+
+    # ── 2) 近7天趋势（每天的成功/失败数） ──
+    # 精确到天
+    cur = con.execute(
+        "SELECT CAST(started_at AS INTEGER) / 86400 AS day, "
+        "status, COUNT(*) AS n FROM runs "
+        "WHERE started_at >= ? AND status IN ('done','failed') "
+        "GROUP BY day, status ORDER BY day",
+        (week_ago,),
+    )
+    day_data = {}
+    for r in cur.fetchall():
+        day = r["day"]
+        if day not in day_data:
+            day_data[day] = {"date": "", "success": 0, "fail": 0}
+        if r["status"] == "done":
+            day_data[day]["success"] = r["n"]
+        elif r["status"] == "failed":
+            day_data[day]["fail"] = r["n"]
+    # 填充 7 天，补全缺失天
+    import datetime
+    trend = []
+    for i in range(7):
+        ts = today_start - (6 - i) * 86400
+        day = ts // 86400
+        date_str = datetime.datetime.utcfromtimestamp(ts).strftime("%m-%d")
+        entry = day_data.get(day, {"date": date_str, "success": 0, "fail": 0})
+        entry["date"] = date_str
+        trend.append(entry)
+    out["trend_7d"] = trend
+
+    # ── 3) 按小时成功率统计（今天） ──
+    cur = con.execute(
+        "SELECT CAST((started_at - ?) / 3600 AS INTEGER) AS hour, "
+        "status, COUNT(*) AS n FROM runs "
+        "WHERE started_at >= ? AND started_at < ? "
+        "AND status IN ('done','failed') "
+        "GROUP BY hour, status ORDER BY hour",
+        (today_start, today_start, today_end),
+    )
+    hour_data = {}
+    for r in cur.fetchall():
+        h = r["hour"]
+        if h not in hour_data:
+            hour_data[h] = {"hour": h, "success": 0, "fail": 0}
+        if r["status"] == "done":
+            hour_data[h]["success"] = r["n"]
+        elif r["status"] == "failed":
+            hour_data[h]["fail"] = r["n"]
+    # 补全 0-23 小时
+    hourly = []
+    for h in range(24):
+        entry = hour_data.get(h, {"hour": h, "success": 0, "fail": 0})
+        total = entry["success"] + entry["fail"]
+        entry["rate"] = round(entry["success"] / total * 100, 1) if total > 0 else 0
+        hourly.append(entry)
+    out["hourly"] = hourly
+
+    # ── 4) 代理成功率排名 ──
+    cur = con.execute(
+        "SELECT proxy, COUNT(*) AS total, "
+        "SUM(CASE WHEN status='done' THEN 1 ELSE 0 END) AS success, "
+        "SUM(CASE WHEN status='failed' THEN 1 ELSE 0 END) AS fail "
+        "FROM runs WHERE proxy IS NOT NULL AND proxy != '' "
+        "AND status IN ('done','failed') "
+        "GROUP BY proxy ORDER BY success DESC"
+    )
+    proxies = []
+    for r in cur.fetchall():
+        t = r["total"]
+        proxies.append({
+            "proxy": r["proxy"],
+            "total": t,
+            "success": r["success"],
+            "fail": r["fail"],
+            "rate": round(r["success"] / t * 100, 1) if t > 0 else 0,
+        })
+    out["proxy_ranking"] = proxies
+
+    # ── 5) 失败原因分布 ──
+    cur = con.execute(
+        "SELECT error_category, COUNT(*) AS n FROM runs "
+        "WHERE status='failed' AND error_category IS NOT NULL AND error_category != '' "
+        "GROUP BY error_category ORDER BY n DESC"
+    )
+    reasons = {"network": 0, "account": 0, "unknown": 0, "other": 0}
+    for r in cur.fetchall():
+        cat = r["error_category"]
+        if cat in reasons:
+            reasons[cat] = r["n"]
+        else:
+            reasons["other"] += r["n"]
+    # 也统计 uncategorized failed runs
+    cur = con.execute(
+        "SELECT COUNT(*) AS n FROM runs "
+        "WHERE status='failed' AND (error_category IS NULL OR error_category = '')"
+    )
+    row = cur.fetchone()
+    if row and row["n"] > 0:
+        reasons["uncategorized"] = row["n"]
+    out["failure_reasons"] = reasons
+
+    return out
+
+
 # ──────────────────────── 注册结果存储 ────────────────────────
 
 
@@ -735,16 +881,92 @@ def delete_all_registered() -> int:
         return rc.rowcount
 
 
+# ──────────────────────── Outlook 原始凭证 (outlook_creds) ────────────────────────
+
+
+def import_outlook_creds(text: str) -> dict:
+    """批量导入 Outlook 原始凭证到 outlook_creds 表。
+
+    text 每行一个号，格式：email----password----client_id----refresh_token
+    （与 outlook_accounts 号池导入格式一致）。已存在的 email 覆盖更新。
+    返回 {"imported": 新增, "updated": 更新, "skipped": 跳过, "bad": 非法行数}。
+    """
+    now = time.time()
+    imported = updated = skipped = bad = 0
+    with _lock:
+        con = _conn()
+        for n, raw in enumerate((text or "").splitlines(), 1):
+            line = raw.strip()
+            if not line:
+                continue
+            parts = [p.strip() for p in line.split("----")]
+            if len(parts) != 4:
+                bad += 1
+                continue
+            email, password, client_id, refresh = parts
+            email = email.lower()
+            if not email or "@" not in email:
+                bad += 1
+                continue
+            cur = con.execute(
+                "SELECT refresh_token FROM outlook_creds WHERE email=?",
+                (email,),
+            )
+            existing = cur.fetchone()
+            if existing is None:
+                con.execute(
+                    "INSERT INTO outlook_creds(email, password, client_id, refresh_token, "
+                    "imported_at) VALUES (?, ?, ?, ?, ?)",
+                    (email, password, client_id, refresh, now),
+                )
+                imported += 1
+            elif (existing["refresh_token"] or "") != refresh:
+                con.execute(
+                    "UPDATE outlook_creds SET password=?, client_id=?, refresh_token=?, "
+                    "imported_at=? WHERE email=?",
+                    (password, client_id, refresh, now, email),
+                )
+                updated += 1
+            else:
+                skipped += 1
+        con.commit()
+    return {"imported": imported, "updated": updated, "skipped": skipped, "bad": bad}
+
+
+def get_outlook_cred(email: str) -> Optional[dict]:
+    """查询单个 Outlook 原始凭证。"""
+    con = _conn()
+    cur = con.execute(
+        "SELECT * FROM outlook_creds WHERE lower(email)=lower(?)",
+        ((email or "").strip(),),
+    )
+    row = cur.fetchone()
+    return dict(row) if row else None
+
+
+def get_accounts_without_refresh() -> list[str]:
+    """查询 registered 表中无 refresh_token 的号（email 列表）。
+
+    这些号注册成功但没拿到 refresh_token，需要"补 refresh"重跑一遍。
+    """
+    con = _conn()
+    cur = con.execute(
+        "SELECT email FROM registered "
+        "WHERE coalesce(length(refresh_token),0) = 0 ORDER BY created_at DESC"
+    )
+    return [r["email"] for r in cur.fetchall()]
+
+
 # ──────────────────────── 运行记录 ────────────────────────
 
 
-def create_run(run_id: str, email: str, log_path: str) -> None:
+def create_run(run_id: str, email: str, log_path: str, proxy: str = "") -> None:
     with _lock:
         con = _conn()
         con.execute(
-            "INSERT INTO runs(run_id, email, status, started_at, log_path) "
-            "VALUES (?, ?, 'running', ?, ?)",
-            (run_id, email.lower(), time.time(), log_path),
+            "INSERT INTO runs(run_id, email, status, started_at, log_path, proxy) "
+            "VALUES (?, ?, 'running', ?, ?, ?)",
+            (run_id, email.lower(), time.time(), log_path, (proxy or "").strip() or None),
         )
         con.commit()
 
@@ -786,6 +1008,74 @@ def set_setting(key: str, value) -> None:
             (key, str(value)),
         )
         con.commit()
+
+
+# ──────────────────────── Webhook 通知配置 ────────────────────────
+
+
+def get_webhook_config() -> dict:
+    """返回 Webhook 配置（URL 明文）。"""
+    return {"webhook_url": get_setting("webhook_url", "")}
+
+
+def save_webhook_config(data: dict) -> None:
+    """保存 Webhook 配置。"""
+    url = (data.get("webhook_url") or "").strip()
+    if url:
+        # 简单校验 URL 格式
+        if not url.startswith(("http://", "https://")):
+            raise ValueError("Webhook URL 必须以 http:// 或 https:// 开头")
+        set_setting("webhook_url", url)
+    else:
+        # 传空字符串 = 清空
+        con = _conn()
+        con.execute("DELETE FROM settings WHERE key='webhook_url'")
+        con.commit()
+
+
+# ──────────────────────── 代理池 / 代理健康 ────────────────────────
+
+
+def get_proxy_pool() -> list[str]:
+    """读回后端同步的代理池（JSON 数组字符串）。"""
+    raw = get_setting("proxy_pool", "")
+    if not raw:
+        return []
+    try:
+        data = json.loads(raw)
+        return [p for p in data if isinstance(p, str) and p.strip()]
+    except Exception:
+        return []
+
+
+def set_proxy_pool(proxies: list[str]) -> None:
+    """把代理池同步到后端 settings，供定时健康检查使用。
+
+    前端代理修改后调用，保证后端定时任务测试的是「当前生效」的池。
+    """
+    cleaned = [p.strip() for p in (proxies or []) if p and p.strip()]
+    set_setting("proxy_pool", json.dumps(cleaned, ensure_ascii=False))
+
+
+def get_proxy_health() -> dict:
+    """读回代理健康状态（settings 里的 JSON）。"""
+    raw = get_setting("proxy_health", "")
+    if not raw:
+        return {"proxies": {}, "last_check_at": 0, "healthy": 0, "unhealthy": 0}
+    try:
+        data = json.loads(raw)
+        data.setdefault("proxies", {})
+        data.setdefault("last_check_at", 0)
+        data.setdefault("healthy", 0)
+        data.setdefault("unhealthy", 0)
+        return data
+    except Exception:
+        return {"proxies": {}, "last_check_at": 0, "healthy": 0, "unhealthy": 0}
+
+
+def set_proxy_health(health: dict) -> None:
+    """持久化代理健康状态。"""
+    set_setting("proxy_health", json.dumps(health, ensure_ascii=False))
 
 
 # ──────────────────────── 邮箱来源配置 ────────────────────────

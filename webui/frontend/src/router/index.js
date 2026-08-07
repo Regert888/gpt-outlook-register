@@ -71,6 +71,12 @@ const routes = [
     component: () => import('@/views/ExportConfig.vue'),
     meta: { title: '自动导出', icon: 'Share', group: '配置' },
   },
+  {
+    path: '/settings/webhook',
+    name: 'webhook',
+    component: () => import('@/views/WebhookConfig.vue'),
+    meta: { title: 'Webhook', icon: 'Bell', group: '配置' },
+  },
 ]
 
 const router = createRouter({

@@ -26,6 +26,11 @@ export const exportRegistered = (payload) => http.post('/api/registered/export',
 export const checkPlus = (emails, proxy = '') =>
   http.post('/api/registered/check_plus', { emails, proxy })
 
+// 补 refresh：无 refresh_token 的号重跑注册
+export const listWithoutRefresh = () => http.get('/api/registered/without_refresh')
+export const refreshRefresh = (emails, proxy = '', otpTimeout = 10) =>
+  http.post('/api/registered/refresh_refresh', { emails, proxy, otp_timeout: otpTimeout })
+
 export const exportToPanel = (email, targets) =>
   http.post('/api/registered/export_to_panel', { email, targets })
 
