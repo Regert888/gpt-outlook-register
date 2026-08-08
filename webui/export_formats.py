@@ -63,6 +63,17 @@ FORMATS: list[ExportFormat] = [
         filename="账号密码.txt",
         render=lambda r: f'{_s(r, "email")}----{_s(r, "password")}',
     ),
+    # 2FA secret 只在绑定那一刻下发一次、服务端取不回，丢了这个号就永久锁死，
+    # 所以必须有能把它带出去的导出格式。没绑 2FA 的号照约定留空、分隔符保留。
+    ExportFormat(
+        id="email_pw_2fa",
+        label="邮箱----密码----2FA",
+        filename="账号密码2FA.txt",
+        render=lambda r: (
+            f'{_s(r, "email")}----{_s(r, "password")}----{_s(r, "totp_secret")}'
+        ),
+        note="secret 仅下发一次，取不回，务必留存",
+    ),
 ]
 
 _BY_ID = {f.id: f for f in FORMATS}

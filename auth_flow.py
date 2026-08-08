@@ -8,11 +8,13 @@
 import json
 import base64
 import hashlib
+import hmac
 import logging
 import os
 import random
 import re
 import secrets
+import struct
 import subprocess
 import time
 import uuid
@@ -28,6 +30,22 @@ from http_client import create_http_session, USER_AGENT
 logger = logging.getLogger(__name__)
 
 
+# ── RFC 6238 TOTP 实现（用于 mfa-challenge 计算动态码）────────────
+def _hotp(secret_b32: str, counter: int, digits: int = 6) -> str:
+    """HOTP 算法（RFC 4226）"""
+    key = base64.b32decode(secret_b32 + "=" * (-len(secret_b32) % 8))
+    msg = struct.pack(">Q", counter)
+    h = hmac.new(key, msg, hashlib.sha1).digest()
+    o = h[-1] & 0x0F
+    code = (struct.unpack(">I", h[o:o + 4])[0] & 0x7FFFFFFF) % (10 ** digits)
+    return str(code).zfill(digits)
+
+
+def _totp_now(secret_b32: str) -> str:
+    """当前 30 秒窗口的 6 位 TOTP 码"""
+    return _hotp(secret_b32, int(time.time()) // 30)
+
+
 class AuthResult:
     """认证结果"""
 
@@ -41,6 +59,7 @@ class AuthResult:
         self.id_token: str = ""
         self.refresh_token: str = ""
         self.cookie_header: str = ""
+        self.totp_secret: str = ""
 
     def is_valid(self) -> bool:
         return bool(self.session_token and self.access_token)
@@ -56,6 +75,7 @@ class AuthResult:
             "id_token": self.id_token,
             "refresh_token": self.refresh_token,
             "cookie_header": self.cookie_header,
+            "totp_secret": self.totp_secret,
         }
 
 
@@ -68,6 +88,8 @@ class AuthFlow:
         sms_callback: Optional[Any] = None,
         env_overrides: Optional[dict] = None,
         on_password: Optional[Any] = None,
+        on_session_ready: Optional[Any] = None,
+        account_callback: Optional[Any] = None,
     ):
         # 本次流程专属的配置覆盖（WEBUI_ALLOW_LOGIN / OTP_TIMEOUT / OAuth 开关等）。
         # ⚠️ 以前 registrar 是直接写 os.environ 再在 finally 里还原的，
@@ -98,6 +120,18 @@ class AuthFlow:
         # ⚠️ 协议层不认识 webui.db，所以只给回调，"存哪"留给调用方决定，
         #    auth_flow 单独当 CLI 用时不传就是了，行为和以前一模一样。
         self._on_password = on_password
+        # 拿到 session（access_token）之后、Codex 授权之前的钩子。
+        # 签名 (flow: AuthFlow, access_token: str) -> None，异常由调用点吞掉。
+        # 为的是把 2FA 绑定插进主人指定的顺序：
+        #     创建账户 → 重定向链 → 拿 session → ★绑 2FA★ → Codex 授权 → 接码
+        # ⚠️ 传了这个钩子会**顺带关掉** run_register 里 callback 前那次 Codex 抢跑
+        #    （:3051 OAUTH_CODEX_RT_BEFORE_CALLBACK），否则 Codex 会跑在钩子前面，
+        #    顺序就白调了。不传则一个字节都不变，老行为。
+        self._on_session_ready = on_session_ready
+        # 账号凭证回调：已有账号登录时从数据库加载密码和 totp_secret。
+        # 签名 (email: str) -> dict，返回 {"password": "...", "totp_secret": "..."}。
+        # 用于 mfa-challenge 路径：密码验证后需要 TOTP 码，从库里读 secret。
+        self._account_callback = account_callback
         self._http_trace_enabled = str(os.getenv("AUTH_HTTP_TRACE", "0")).lower() in ("1", "true", "yes", "on")
         # signup() 会在分支里 set；run_protocol_login 命中已有账号路径会跳过 signup，
         # 导致 kickoff_otp_delivery 读未初始化属性 AttributeError。这里给个默认值。
@@ -828,6 +862,33 @@ class AuthFlow:
             page_type = self._extract_page_type(step)
             continue_url = self._normalize_continue_url(self._extract_continue_url_from_step(step))
 
+        # mfa-challenge 分支（密码验证后需要 TOTP 2FA）
+        if self._is_mfa_challenge_state(page_type, continue_url):
+            totp_secret = (self.result.totp_secret or "").strip()
+            if not totp_secret and self._account_callback:
+                # 从数据库加载凭证
+                try:
+                    cred = self._account_callback(email)
+                    if cred and cred.get("totp_secret"):
+                        totp_secret = cred["totp_secret"]
+                        self.result.totp_secret = totp_secret
+                        logger.info("已从数据库加载 totp_secret")
+                except Exception as e:
+                    logger.warning(f"account_callback 异常: {e}")
+            if not totp_secret:
+                logger.warning("进入 mfa-challenge 但没有 totp_secret，无法继续")
+                return continue_url or ""
+            # 从 continue_url 提取 challenge_id
+            challenge_id = continue_url.split("/")[-1] if "/mfa-challenge/" in continue_url else ""
+            if not challenge_id:
+                logger.warning("无法从 continue_url 提取 challenge_id")
+                return continue_url or ""
+            # 计算当前 TOTP 码并提交
+            totp_code = _totp_now(totp_secret)
+            logger.info(f"提交 TOTP 码进行 2FA 验证（challenge_id={challenge_id[:16]}...）")
+            mfa_resp = self.submit_mfa_totp(totp_code, challenge_id)
+            continue_url = self._normalize_continue_url(self._extract_continue_url_from_step(mfa_resp))
+
         need_otp = (page_type == "email_otp_verification") or ("/email-verification" in (continue_url or ""))
         if need_otp:
             if mail_provider is None:
@@ -862,6 +923,13 @@ class AuthFlow:
         pt = (page_type or "").strip().lower()
         cu = (continue_url or "").strip().lower()
         return (pt == "add_phone") or ("add-phone" in cu)
+
+    @staticmethod
+    def _is_mfa_challenge_state(page_type: str = "", continue_url: str = "") -> bool:
+        """判断是否进入 mfa-challenge 状态（已有账号启用 2FA，密码验证后需要 TOTP 码）。"""
+        pt = (page_type or "").strip().lower()
+        cu = (continue_url or "").strip().lower()
+        return (pt == "mfa_challenge") or ("/mfa-challenge/" in cu)
 
     def _phone_headers(self, referer: str) -> dict:
         headers = self._common_headers(referer)
@@ -2113,6 +2181,39 @@ class AuthFlow:
         except Exception:
             return {}
 
+    # ── Step 7.5: 提交 TOTP 2FA 验证码 ──
+    def submit_mfa_totp(self, totp_code: str, challenge_id: str) -> dict:
+        """提交 TOTP 2FA 验证码（已有账号登录时，密码验证后进入 mfa-challenge 状态）。
+
+        Args:
+            totp_code: 6 位 TOTP 动态码
+            challenge_id: 从 continue_url 提取的 challenge ID（如 /mfa-challenge/6a76f2e8...）
+
+        Returns:
+            服务端响应 dict，包含 continue_url 指向 callback
+        """
+        headers = self._common_headers("https://auth.openai.com/mfa-challenge")
+        headers["Content-Type"] = "application/json"
+        if self._last_sentinel_token:
+            headers["openai-sentinel-token"] = self._last_sentinel_token
+        if getattr(self, "_last_sentinel_so_token", ""):
+            headers["openai-sentinel-so-token"] = self._last_sentinel_so_token
+
+        resp = self.session.post(
+            "https://auth.openai.com/api/accounts/mfa/verify",
+            headers=headers,
+            json={"code": totp_code, "type": "totp", "id": challenge_id},
+            timeout=30,
+        )
+        self._trace_http("submit_mfa_totp", resp)
+        if resp.status_code != 200:
+            body = (resp.text or "")[:260]
+            raise RuntimeError(f"TOTP 验证失败: {resp.status_code} - {body}")
+        try:
+            return resp.json()
+        except Exception:
+            return {}
+
     # ── Step 8: 验证 OTP ──
     def verify_otp(self, otp_code: str) -> dict:
         logger.info("[7/10] 验证 OTP...")
@@ -2918,16 +3019,53 @@ class AuthFlow:
             if page_type == "login_password":
                 logger.info("已有账号进入 login_password 分支，先走密码校验再 OTP")
                 login_password = (os.getenv("LOGIN_PASSWORD", "") or "").strip()
+                if not login_password and self._account_callback:
+                    # 从数据库加载真实密码
+                    try:
+                        cred = self._account_callback(email)
+                        if cred and cred.get("password"):
+                            login_password = cred["password"]
+                            logger.info("已从数据库加载密码")
+                    except Exception as e:
+                        logger.warning(f"account_callback 加载密码异常: {e}")
                 if not login_password:
                     login_password = self._default_password_from_email(email)
                 self.result.password = login_password
                 login_resp = self.login_password_verify(login_password)
+                login_page_type = self._extract_page_type(login_resp)
                 continue_url = self._normalize_continue_url(
                     (login_resp or {}).get("continue_url", "") if isinstance(login_resp, dict) else ""
                 )
 
+                # mfa-challenge 分支（密码验证后需要 TOTP 2FA）
+                if self._is_mfa_challenge_state(login_page_type, continue_url):
+                    totp_secret = (self.result.totp_secret or "").strip()
+                    if not totp_secret and self._account_callback:
+                        # 从数据库加载凭证
+                        try:
+                            cred = self._account_callback(email)
+                            if cred and cred.get("totp_secret"):
+                                totp_secret = cred["totp_secret"]
+                                self.result.totp_secret = totp_secret
+                                logger.info("已从数据库加载 totp_secret")
+                        except Exception as e:
+                            logger.warning(f"account_callback 异常: {e}")
+                    if not totp_secret:
+                        logger.warning("进入 mfa-challenge 但没有 totp_secret，无法继续")
+                    else:
+                        challenge_id = continue_url.split("/")[-1] if "/mfa-challenge/" in continue_url else ""
+                        if challenge_id:
+                            totp_code = _totp_now(totp_secret)
+                            logger.info(f"提交 TOTP 码进行 2FA 验证（challenge_id={challenge_id[:16]}...）")
+                            mfa_resp = self.submit_mfa_totp(totp_code, challenge_id)
+                            continue_url = self._normalize_continue_url(
+                                (mfa_resp or {}).get("continue_url", "") if isinstance(mfa_resp, dict) else ""
+                            )
+                        else:
+                            logger.warning("无法从 continue_url 提取 challenge_id")
+
                 # 部分账号密码校验后仍需 email otp（二次校验）
-                if not continue_url or "/email-verification" in continue_url:
+                elif not continue_url or "/email-verification" in continue_url:
                     # password/verify 后推荐使用 resend，而不是 /email-otp/send
                     otp_sent_at = time.time()
                     self.kickoff_otp_delivery("existing_login_password")
@@ -3048,7 +3186,16 @@ class AuthFlow:
         if continue_url:
             continue_url = self._normalize_continue_url(continue_url)
             # 关键尝试：在 chatgpt callback 被消费前，先走一次 Codex OAuth（有助于保留 auth.openai 登录态）
-            if (not self.result.refresh_token) and self._env_flag("OAUTH_CODEX_RT_BEFORE_CALLBACK", "1"):
+            # ⚠️ 挂了 on_session_ready 钩子时**跳过这次抢跑**：钩子（绑 2FA）要等
+            #    get_auth_session 拿到 access_token 才能跑，而那步在下面 :callback 之后；
+            #    这次抢跑成功的话 Codex 就跑到钩子前面去了，指定的顺序等于没改。
+            #    跳过后 Codex 落到后面那个调用点（get_auth_session 之后），顺序才是
+            #    创建账户 → 重定向链 → 拿 session → 绑 2FA → Codex 授权 → 接码。
+            if (
+                (not self.result.refresh_token)
+                and self._on_session_ready is None
+                and self._env_flag("OAUTH_CODEX_RT_BEFORE_CALLBACK", "1")
+            ):
                 self.oauth_codex_rt_exchange(mail_provider=mail_provider)
             # 可选：在 callback 被消费前尝试 token 交换（可能影响后续 callback，默认关闭）
             refresh_only_mode = self._env_flag("OAUTH_REFRESH_ONLY", "0")
@@ -3080,6 +3227,16 @@ class AuthFlow:
 
         if not refresh_only_mode:
             self.get_auth_session()
+
+        # ── 钩子：session 到手、Codex 授权之前 ──
+        # 主人指定的顺序是「注册完 → 绑 2FA → Codex 授权 → 接码」。这里是唯一同时满足
+        # 「已经有 access_token」和「Codex 还没跑」的位置，所以插在这。
+        # 失败绝不能拖垮已注册成功的号 —— 异常吞掉，继续往下走 Codex。
+        if self._on_session_ready is not None and self.result.access_token:
+            try:
+                self._on_session_ready(self, self.result.access_token)
+            except Exception as e:
+                logger.warning(f"session_ready 回调失败（不影响注册）: {e}")
 
         # Codex OAuth refresh_token 交换（独立 authorize 链路，不依赖上面 callback 的 code）
         if callback_url or continue_url:
@@ -3181,6 +3338,35 @@ class AuthFlow:
                     continue_url = self._normalize_continue_url(
                         self._extract_continue_url_from_step(login_resp)
                     )
+
+                    # mfa-challenge 分支（密码验证后需要 TOTP 2FA）
+                    if self._is_mfa_challenge_state(page_type, continue_url):
+                        totp_secret = (self.result.totp_secret or "").strip()
+                        if not totp_secret and self._account_callback:
+                            # 从数据库加载凭证
+                            try:
+                                cred = self._account_callback(email)
+                                if cred and cred.get("totp_secret"):
+                                    totp_secret = cred["totp_secret"]
+                                    self.result.totp_secret = totp_secret
+                                    logger.info("已从数据库加载 totp_secret")
+                            except Exception as e:
+                                logger.warning(f"account_callback 异常: {e}")
+                        if not totp_secret:
+                            logger.warning("进入 mfa-challenge 但没有 totp_secret，无法继续")
+                        else:
+                            challenge_id = continue_url.split("/")[-1] if "/mfa-challenge/" in continue_url else ""
+                            if challenge_id:
+                                totp_code = _totp_now(totp_secret)
+                                logger.info(f"提交 TOTP 码进行 2FA 验证（challenge_id={challenge_id[:16]}...）")
+                                mfa_resp = self.submit_mfa_totp(totp_code, challenge_id)
+                                page_type = (self._extract_page_type(mfa_resp) or "").lower()
+                                continue_url = self._normalize_continue_url(
+                                    self._extract_continue_url_from_step(mfa_resp)
+                                )
+                            else:
+                                logger.warning("无法从 continue_url 提取 challenge_id")
+
                 elif page_type == "email_otp_verification" or "/email-verification" in (continue_url or ""):
                     logger.info("登录分支: email_otp_verification")
                     # 同上：authorize/continue 已 trigger 发码，kickoff_otp_delivery 必须只 resend。

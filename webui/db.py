@@ -17,6 +17,7 @@
 """
 from __future__ import annotations
 
+import base64
 import json
 import sqlite3
 import sys
@@ -79,6 +80,8 @@ def init_db():
             device_id       TEXT,
             csrf_token      TEXT,
             cookie_header   TEXT,
+            totp_secret     TEXT,
+            totp_factor_id  TEXT,
             extra_json      TEXT,
             created_at      REAL
         );
@@ -120,6 +123,17 @@ def init_db():
         "CREATE INDEX IF NOT EXISTS idx_outlook_kind ON outlook_accounts(kind, status)"
     )
     con.commit()
+
+    # 老 DB migrate：registered 的 2FA 两列（totp_secret / totp_factor_id）后期才加。
+    # secret 一次性下发、服务端取不回，务必单独补列持久化。重复执行无副作用。
+    cur = con.execute("PRAGMA table_info(registered)")
+    reg_cols = {r[1] for r in cur.fetchall()}
+    if "totp_secret" not in reg_cols:
+        con.execute("ALTER TABLE registered ADD COLUMN totp_secret TEXT")
+        con.commit()
+    if "totp_factor_id" not in reg_cols:
+        con.execute("ALTER TABLE registered ADD COLUMN totp_factor_id TEXT")
+        con.commit()
 
 
 # ──────────────────────── outlook 号池 ────────────────────────
@@ -486,6 +500,7 @@ def save_registered(d: dict) -> None:
     extra = {k: v for k, v in d.items() if k not in {
         "email", "password", "access_token", "session_token", "refresh_token",
         "id_token", "device_id", "csrf_token", "cookie_header",
+        "totp_secret", "totp_factor_id",
     }}
     with _lock:
         con = _conn()
@@ -497,17 +512,30 @@ def save_registered(d: dict) -> None:
         #    密码是 OpenAI 侧的**持久状态**，"这一轮没设" ≠ "这个号没有密码"，
         #    所以空值不覆盖非空旧值。
         #    token 三件套正相反：每轮跑都是全新的，旧的可能已失效，照常整列覆盖。
-        if not password:
+        # totp_secret 和密码同理，甚至更严：secret【一次性下发、服务端取不回】，
+        #    丢了 = 该号 2FA 永久锁死。重跑同邮箱（已绑过 2FA）时这一轮不会再绑，
+        #    d 里没有 secret —— 绝不能拿空值把库里已存的 secret 冲没。
+        #    与密码合成一次 SELECT，顺带把两列旧值一起兜住。
+        totp_secret = (d.get("totp_secret") or "").strip()
+        totp_factor_id = (d.get("totp_factor_id") or "").strip()
+        if not password or not totp_secret:
             row = con.execute(
-                "SELECT password FROM registered WHERE email=?", (email,)
+                "SELECT password, totp_secret, totp_factor_id FROM registered WHERE email=?",
+                (email,),
             ).fetchone()
-            if row and (row["password"] or "").strip():
-                password = row["password"]
+            if row:
+                if not password and (row["password"] or "").strip():
+                    password = row["password"]
+                if not totp_secret and (row["totp_secret"] or "").strip():
+                    totp_secret = row["totp_secret"]
+                    # factor_id 跟着 secret 走：本轮没绑就沿用旧的
+                    totp_factor_id = totp_factor_id or (row["totp_factor_id"] or "")
         con.execute(
             "INSERT OR REPLACE INTO registered "
             "(email, password, access_token, session_token, refresh_token, "
-            "id_token, device_id, csrf_token, cookie_header, extra_json, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "id_token, device_id, csrf_token, cookie_header, "
+            "totp_secret, totp_factor_id, extra_json, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 email,
                 password,
@@ -518,6 +546,8 @@ def save_registered(d: dict) -> None:
                 d.get("device_id", ""),
                 d.get("csrf_token", ""),
                 d.get("cookie_header", ""),
+                totp_secret,
+                totp_factor_id,
                 json.dumps(extra, ensure_ascii=False) if extra else None,
                 time.time(),
             ),
@@ -560,6 +590,86 @@ def save_password_early(email: str, password: str) -> None:
             ),
         )
         con.commit()
+
+
+def normalize_totp_secret(raw: str) -> str:
+    """把用户手填的 TOTP secret 规范化成可用的 base32，非法值抛 ValueError。
+
+    登录侧（auth_flow._totp_now）拿到 secret 直接 b32decode，**不做任何校验** ——
+    脏值存进去要等到真登录时才炸，那时只看到一句 base32 解码异常，
+    根本看不出是手填填错了。所以校验必须挡在写库这一关。
+
+    接受的输入：
+      - 裸 base32:  JBSWY3DPEHPK3PXP / jbswy3dp ehpk 3pxp / JBSW-Y3DP-EHPK
+      - otpauth URI: otpauth://totp/ChatGPT:a@b.com?secret=JBSWY3DP&issuer=...
+        （从手机 App 导出/二维码解码出来的就是这个格式，直接粘进来很常见）
+    """
+    s = (raw or "").strip()
+    if not s:
+        return ""
+    # otpauth:// URI 抽 secret 参数
+    if s.lower().startswith("otpauth://"):
+        try:
+            from urllib.parse import urlparse, parse_qs
+            qs = parse_qs(urlparse(s).query)
+            s = (qs.get("secret") or [""])[0]
+        except Exception:
+            raise ValueError("otpauth 链接解析失败，请直接填 secret")
+        if not s:
+            raise ValueError("otpauth 链接里没有 secret 参数")
+    # 去掉分隔符（手机 App 展示时常带空格/连字符）并统一大写
+    s = s.replace(" ", "").replace("-", "").replace("_", "").upper()
+    # base32 只有 A-Z 和 2-7，先挡掉明显非法字符再解码，报错更好懂
+    if not s or any(c not in "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567=" for c in s):
+        raise ValueError("TOTP secret 含非法字符（base32 只允许 A-Z 和 2-7）")
+    try:
+        # 补 padding 后试解，解得开才算合法。auth_flow 那边也是这么补的。
+        decoded = base64.b32decode(s + "=" * (-len(s) % 8))
+    except Exception:
+        raise ValueError("TOTP secret 不是合法的 base32")
+    if len(decoded) < 10:
+        raise ValueError(f"TOTP secret 太短（解出 {len(decoded)} 字节，通常应为 20 字节）")
+    return s
+
+
+def update_registered_manual(email: str, password: Optional[str] = None,
+                             totp_secret: Optional[str] = None) -> bool:
+    """手动修正某个已注册账号的密码 / TOTP secret。
+
+    ⚠️ 只改**本地库**，不会同步到 OpenAI —— 这里改密码不等于改了账号密码。
+       用途是把外部已知的凭证补进来，或修正记录错误。
+
+    传 None = 该字段不动（不是清空）。用 None 而不是空串做"不修改"的标记，
+    是为了留出"主人真想清空某字段"的余地（传空串即清空）。
+
+    totp_secret 会先过 normalize_totp_secret 校验，非法直接抛 ValueError；
+    宁可这里报错，也不能让脏值躺进库里等登录时才炸。
+
+    返回 False 表示该邮箱不存在（不会凭空插入新行 —— 手填是"修正已有记录"，
+    真要新增外部账号是另一件事，走单独的导入功能）。
+    """
+    email = (email or "").strip().lower()
+    if not email:
+        return False
+    sets, vals = [], []
+    if password is not None:
+        sets.append("password=?")
+        vals.append(password)
+    if totp_secret is not None:
+        # 空串 = 主人主动清空；非空则必须过校验
+        sets.append("totp_secret=?")
+        vals.append(normalize_totp_secret(totp_secret) if totp_secret.strip() else "")
+    if not sets:
+        return False
+    with _lock:
+        con = _conn()
+        row = con.execute("SELECT email FROM registered WHERE email=?", (email,)).fetchone()
+        if not row:
+            return False
+        vals.append(email)
+        con.execute(f"UPDATE registered SET {', '.join(sets)} WHERE email=?", vals)
+        con.commit()
+        return True
 
 
 def update_plus_check(email: str, plus_info: dict) -> None:
@@ -611,7 +721,7 @@ def list_registered(limit: int = 20, offset: int = 0, filter_rt: str = "all") ->
     con = _conn()
     where = _registered_where(filter_rt)
     cur = con.execute(
-        f"SELECT email, password, "
+        f"SELECT email, password, totp_secret, "
         f"length(access_token) AS at_len, length(session_token) AS st_len, "
         f"length(refresh_token) AS rt_len, extra_json, created_at FROM registered "
         f"{where} ORDER BY created_at DESC LIMIT ? OFFSET ?",

@@ -118,7 +118,7 @@ onActivated(() => load())
 
         <el-form-item label="接码平台">
           <el-radio-group v-model="provider" @change="onProviderChange">
-            <el-radio value="smsbower">SmsBower（支持号码复用 + 立即取消退款）</el-radio>
+            <el-radio value="smsbower">SmsBower（立即取消就退款）</el-radio>
             <el-radio value="herosms">HeroSMS（取消后 20 分钟自动退款）</el-radio>
           </el-radio-group>
         </el-form-item>
@@ -156,7 +156,7 @@ onActivated(() => load())
         </el-row>
 
         <el-form-item>
-          <el-checkbox v-model="reusePhone"><b>启用号码复用</b>（SmsBower：同号复用多次，省钱）</el-checkbox>
+          <el-checkbox v-model="reusePhone"><b>启用号码复用</b>（gpt风控，号码短时间无法复用）</el-checkbox>
         </el-form-item>
         <el-divider content-position="left">自动选择最优国家（按价格 + 库存）</el-divider>
         <el-form-item>

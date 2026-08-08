@@ -18,6 +18,9 @@ const { runningSingle, lastRunResult } = storeToRefs(runtime)
 
 const starting = ref(false)
 const regEmail = ref('')
+// 2FA 默认开（主人要求每个号都绑）。绑定不可逆，所以留开关。
+// 放在 form store（localStorage 持久化）而不是组件局部 ref —— 组件是
+// keep-alive 的，切页不丢，但刷新页面会重建，关了就白关。
 
 // 从「邮箱列表 → 使用」跳转过来时，带上指定邮箱
 onActivated(() => {
@@ -36,6 +39,7 @@ async function run() {
       want_access_token: true,
       want_session_token: true,
       want_refresh_token: true,
+      want_2fa: form.value.want2fa,
     })
     runtime.addLog(`[client] 启动注册 run_id=${r.run_id} email=${r.email}`, 'evt')
     runtime.streamRun(r.run_id)
@@ -84,6 +88,18 @@ async function copyField(email, field) {
             <el-form-item label="OTP 等待秒数">
               <el-input-number v-model="form.otpTimeout" :min="10" :max="600" />
             </el-form-item>
+            <el-form-item>
+              <div style="display: flex; align-items: center; gap: 10px">
+                <el-switch v-model="form.want2fa" />
+                <span>注册成功后自动绑定 2FA（TOTP）</span>
+              </div>
+              <div class="hint" style="margin-top: 6px; line-height: 1.5">
+                默认开。绑定不可逆、即刻生效：<b>之后该号所有登录都需 6 位动态码</b>；
+                secret 仅在绑定时下发<b>一次</b>、服务端取不回，
+                请在下方结果或「注册结果」页<b>立刻复制导出</b>并录入验证器，丢失 = 该号 2FA 永久锁死。
+                仅对<b>有密码</b>的号生效，无密码号会自动跳过。
+              </div>
+            </el-form-item>
             <el-button type="primary" :loading="starting || runningSingle" @click="run">
               开始注册
             </el-button>
@@ -99,6 +115,10 @@ async function copyField(email, field) {
               <span class="cred-label">密码</span><code class="cred-val">{{ lastRunResult.password }}</code>
             </div>
             <div v-else class="cred-line hint">该号未设置密码（服务端未走密码注册流程）</div>
+            <div v-if="lastRunResult.totp_secret" class="cred-line">
+              <span class="cred-label">2FA</span><code class="cred-val">{{ lastRunResult.totp_secret }}</code>
+              <span class="hint" style="margin-left: 6px">仅此一次！务必复制录入验证器</span>
+            </div>
             <div style="margin-top: 8px">
               <el-button size="small" @click="copyText(lastRunResult.email)">复制邮箱</el-button>
               <template v-if="lastRunResult.password">
@@ -109,6 +129,8 @@ async function copyField(email, field) {
               </template>
               <el-button v-if="lastRunResult.access_token_len > 0" size="small"
                          @click="copyField(lastRunResult.email, 'access_token')">复制 access_token</el-button>
+              <el-button v-if="lastRunResult.totp_secret" size="small" type="warning"
+                         @click="copyText(lastRunResult.totp_secret)">复制 2FA secret</el-button>
             </div>
           </el-alert>
           <el-alert

@@ -25,6 +25,7 @@ import string
 import time
 import urllib.error
 import urllib.request
+from datetime import datetime, timezone
 from typing import Optional
 
 from .base import ConfigField, MailProvider, extract_otp, register
@@ -184,6 +185,24 @@ class CFTempEmailProvider(MailProvider):
             return e
 
     @staticmethod
+    def _mail_epoch(mail: dict) -> Optional[float]:
+        """把邮件的 created_at 解析成 epoch 秒；解析不出来返回 None。
+
+        CF Worker 给的是【UTC】裸时间串（'2026-08-08 05:51:41'，不带时区），
+        主人本地是 UTC+8 —— 当成本地时间解析会整整差 8 小时，那 issued_after
+        就永远比不过了。所以必须显式按 UTC 解释。
+        """
+        raw = (mail.get("created_at") or "").strip()
+        if not raw:
+            return None
+        raw = raw.replace("T", " ").replace("Z", "").split(".")[0]
+        try:
+            dt = datetime.strptime(raw, "%Y-%m-%d %H:%M:%S")
+        except Exception:
+            return None
+        return dt.replace(tzinfo=timezone.utc).timestamp()
+
+    @staticmethod
     def _parse_json(resp) -> dict:
         try:
             return resp.json() if callable(getattr(resp, "json", None)) else _json.loads(resp.text)
@@ -251,6 +270,48 @@ class CFTempEmailProvider(MailProvider):
             return data
         return []
 
+    def peek_otp(
+        self,
+        email_addr: str,
+        issued_after: Optional[float] = None,
+        wait: float = 0.0,
+    ) -> Optional[str]:
+        """非破坏性预读：收件箱里已经躺着本轮的码就直接返回，没有返回 None。
+
+        语义见 base.MailProvider.peek_otp。这里三条铁律：
+          - **不碰 self._seen_mail_ids**。探完没探到，后面 wait_for_otp 还要
+            靠这几封信；标记成已读它就永远看不见了。
+          - issued_after 之前的信一律不认（旧 challenge 的废码）；时间戳读不
+            出来的也不认 —— 宁可让调用方多发一封，也不能把上一轮的码当成本轮的。
+          - 拿不到不抛异常，让调用方安静地回退到原来的发码流程。
+        """
+        deadline = time.time() + max(0.0, float(wait))
+        while True:
+            try:
+                for mail in sorted(
+                    self._get_mails(email_addr),
+                    key=lambda x: x.get("id", 0),
+                    reverse=True,
+                ):
+                    mid = str(mail.get("id", ""))
+                    if not mid or mid in self._seen_mail_ids:
+                        continue
+                    if issued_after is not None:
+                        ts = self._mail_epoch(mail)
+                        if ts is None or ts < issued_after - 2:
+                            continue
+                    otp = extract_otp(str(mail.get("raw") or ""))
+                    if otp:
+                        logger.info(
+                            f"[cf_temp] 👀 预读命中 OTP={otp} (mail id={mid})，省掉一次发码"
+                        )
+                        return otp
+            except Exception as e:
+                logger.debug(f"[cf_temp] peek 异常（当作没探到）: {e}")
+            if time.time() >= deadline:
+                return None
+            time.sleep(1)
+
     def wait_for_otp(
         self,
         email_addr: str,
@@ -268,14 +329,33 @@ class CFTempEmailProvider(MailProvider):
         logger.info(f"[cf_temp] 等待 OTP -> {email_addr} (timeout={timeout}s)")
 
         # 起始 seen_ids：当前邮箱里已有的邮件 id（避免被旧邮件污染）
-        # issued_after=None 表示从现在开始等
+        #
+        # ★ issued_after 必须当真（2026-08-08 修）：以前这个参数收下就扔了，只靠
+        #   「进来时拍张快照、之后的才算新信」。碰上【邮件比我们开始等更早落地】的
+        #   场景就必死 —— 绑 2FA 时 OpenAI 在 authorize/continue 那一刻当场就把码发了
+        #   （实测 run 4067171c0a62：信 05:51:40 到，我们 05:51:40 才开始等），
+        #   于是这封正主被快照当成旧信吞掉，干等到超时。
+        #   现在：只有【早于 issued_after】的信才算旧信；issued_after 之后到的信
+        #   哪怕已经躺在收件箱里，也照样认。时间戳读不出来的按旧信处理（保守，
+        #   宁可多等一封重发，也不要把上一轮的废码当成新码用）。
         try:
             initial_mails = self._get_mails(email_addr)
+            kept = 0
             for m in initial_mails:
                 mid = str(m.get("id", ""))
-                if mid:
-                    self._seen_mail_ids.add(mid)
-            logger.debug(f"[cf_temp] 初始已有邮件 {len(self._seen_mail_ids)} 封，跳过")
+                if not mid:
+                    continue
+                if issued_after is not None:
+                    ts = self._mail_epoch(m)
+                    if ts is not None and ts >= issued_after - 2:
+                        # 这封是我们要等的信，别标记成旧信
+                        kept += 1
+                        continue
+                self._seen_mail_ids.add(mid)
+            logger.debug(
+                f"[cf_temp] 初始已有邮件 {len(initial_mails)} 封，"
+                f"跳过 {len(initial_mails) - kept} 封旧信，保留 {kept} 封候选"
+            )
         except Exception as e:
             logger.warning(f"[cf_temp] 初始邮件列表拉取异常: {e}")
 

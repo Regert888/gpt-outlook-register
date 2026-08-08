@@ -44,6 +44,9 @@ async function start() {
       want_refresh_token: true,
       cool_down_seconds: parseFloat(form.value.autoCoolDown) || 0,
       target_count: parseInt(form.value.autoTargetCount, 10) || 0,
+      // 批量默认绑 2FA（后端默认是 false，这个字段以前压根没传，
+      // 所以批量跑出来的号一个都没 2FA）。留开关是因为绑定不可逆。
+      want_2fa: form.value.autoWant2fa,
     })
     ElMessage.success('自动跑号已启动')
   } catch (e) { ElMessage.error('启动失败: ' + e.message) }
@@ -73,6 +76,19 @@ async function call(fn, name) {
           <el-input-number v-model="form.otpTimeout" :min="10" :max="600" />
         </el-form-item>
       </el-space>
+
+      <el-form-item label="2FA">
+        <div style="display: flex; align-items: center; gap: 10px; flex-wrap: wrap">
+          <el-switch v-model="form.autoWant2fa" />
+          <span>每个号注册成功后自动绑定 2FA（TOTP）</span>
+        </div>
+        <div class="hint" style="margin-top: 6px; line-height: 1.5">
+          默认开。绑定不可逆：之后该号所有登录都需 6 位动态码；
+          secret 仅下发<b>一次</b>、服务端取不回，跑完请到「注册结果」页<b>导出备份</b>。
+          绑定失败<b>不会废号</b>（仅日志告警、账号照常入库）；
+          <b>无密码的号会自动跳过</b>，所以「每个号」实际是「每个有密码的号」。
+        </div>
+      </el-form-item>
 
       <el-form-item label="代理池">
         <div style="display: flex; align-items: center; gap: 12px; flex-wrap: wrap">

@@ -220,11 +220,48 @@ def _do_register(
             f"[register] 邮箱来源: {mail_source} ({mail.display_name})"
         )
 
+        # ─ 2FA 绑定钩子：插在「拿到 session」和「Codex 授权」之间 ─
+        #   主人指定的顺序：注册完 → 绑 2FA → Codex 授权 → 接码。
+        #   2FA 必须有 access_token 才能打 mfa/enroll，而 at 只能从 get_auth_session 拿，
+        #   所以这是唯一「已有 at 且 Codex 还没跑」的位置（见 auth_flow.py 那处注释）。
+        #   钩子里绑成了就把结果存进 _tfa_box，run_register 返回后直接取，不再重绑。
+        _tfa_box: dict = {}
+
+        def _bind_2fa_hook(_flow, at: str) -> None:
+            if not (getattr(_flow.result, "password", "") or "").strip():
+                logging.getLogger("registrar").warning(
+                    "[register] 勾了 2FA 但该号无密码，跳过绑定"
+                )
+                return
+            from .two_factor import bind_totp_2fa_inline
+            info = bind_totp_2fa_inline(_flow, at)
+            if info and info.get("secret"):
+                _tfa_box.update(info)
+
+        def _account_callback_for_flow(email: str) -> dict:
+            """从数据库加载账号凭证（密码和 totp_secret）供 AuthFlow 登录时使用。
+
+            用于既有账号登录场景：当服务端返回 mfa-challenge 时，AuthFlow 需要
+            totp_secret 来计算 6 位动态码完成 2FA 验证。
+            """
+            try:
+                data = db.get_registered(email)
+                if data:
+                    return {
+                        "password": data.get("password", ""),
+                        "totp_secret": data.get("totp_secret", ""),
+                    }
+            except Exception as e:
+                logging.getLogger("registrar").warning(f"[register] account_callback 异常: {e}")
+            return {}
+
         flow = AuthFlow(
             cfg,
             sms_callback=_build_sms_callback(run_id),
             env_overrides=env_overrides,
             on_password=_save_password_early,
+            on_session_ready=_bind_2fa_hook if options.get("want_2fa") else None,
+            account_callback=_account_callback_for_flow,
         )
         _emit_status(run_id, "phase", {"phase": "starting", "email": email})
         logging.getLogger("registrar").info(f"[register] 开始: {email}")
@@ -276,6 +313,53 @@ def _do_register(
             d["refresh_token"] = full.get("refresh_token", "")
             d["id_token"] = full.get("id_token", "")
 
+        # ─ 可选：绑定 TOTP 2FA（仅用户勾选 want_2fa 时才跑） ─
+        #   正常情况上面的 on_session_ready 钩子已经在【Codex 授权之前】绑完了，
+        #   这里只是兜底：钩子没跑到（run_register 中途抛异常走 partial 分支、
+        #   或那时 access_token 还是空）时再补一次。
+        #   兜底本身也是先快后慢两条路（见 two_factor.py 模块头）：
+        #     快 bind_totp_2fa_inline —— 直接复用刚跑完注册的 flow + access_token，
+        #        6.2s 搞定，零 PoW 零邮件（实测 2026-08-08 <测试号>@<自建域>
+        #        四个请求全 200，mfa_enabled=true）。
+        #     慢 bind_totp_2fa —— 新起 AuthFlow 重走 login 正式链，约 40s + 一次 PoW
+        #        + 一封验证码邮件。只在快路径没成时兜底。
+        #   失败仅告警、绝不废掉已注册成功的号；secret 一次性下发，成功即随 d 落库+推前端。
+        if options.get("want_2fa") and (d.get("password") or "").strip():
+            _emit_status(run_id, "phase", {"phase": "binding_2fa", "email": d.get("email")})
+            try:
+                from .two_factor import bind_totp_2fa, bind_totp_2fa_inline
+                # 钩子（Codex 授权之前那次）已经绑好就直接用，别再打一遍 enroll
+                tinfo = dict(_tfa_box) if _tfa_box.get("secret") else None
+                if not tinfo:
+                    tinfo = bind_totp_2fa_inline(flow, full.get("access_token", ""))
+                if not (tinfo and tinfo.get("secret")):
+                    logging.getLogger("registrar").info(
+                        "[register] 2FA 快路径未成，回落重走登录链..."
+                    )
+                    tinfo = bind_totp_2fa(
+                        cfg, d.get("email", ""), d.get("password", ""),
+                        mail_provider=mail, env_overrides=env_overrides,
+                    )
+                if tinfo and tinfo.get("secret"):
+                    d["totp_secret"] = tinfo["secret"]
+                    d["totp_factor_id"] = tinfo.get("factor_id", "")
+                    logging.getLogger("registrar").info(
+                        f"[register] 2FA 绑定成功 email={d.get('email')}"
+                    )
+                    _emit_status(run_id, "phase", {"phase": "2fa_bound", "email": d.get("email")})
+                else:
+                    logging.getLogger("registrar").warning(
+                        "[register] 2FA 绑定未成功（账号仍有效，仅未绑 2FA）"
+                    )
+            except Exception as e:
+                logging.getLogger("registrar").warning(
+                    f"[register] 2FA 绑定异常（账号仍有效）: {e}"
+                )
+        elif options.get("want_2fa"):
+            logging.getLogger("registrar").warning(
+                "[register] 勾选了 2FA 但该号无密码，跳过绑定"
+            )
+
         # 落库
         db.save_registered(d)
         # ⚠️ d 是**本轮内存里**的结果，它不一定知道这个号有密码：
@@ -316,6 +400,9 @@ def _do_register(
             "access_token_len": len(d.get("access_token") or ""),
             "session_token_len": len(d.get("session_token") or ""),
             "refresh_token_len": len(d.get("refresh_token") or ""),
+            # 2FA secret 一次性下发、服务端取不回，明文推前端让用户当场导入验证器
+            # （理由同密码；本机自用工具，SSE 只发本地浏览器）。未绑则为空串。
+            "totp_secret": d.get("totp_secret") or "",
             "partial": partial,
         }
         _emit_status(run_id, "done", result_summary)

@@ -16,6 +16,10 @@ export const getRegistered = (email) =>
 export const deleteRegistered = (email) =>
   http.delete(`/api/registered/${encodeURIComponent(email)}`)
 
+// 手填凭证：不传的字段后端不动，传空串才是清空
+export const updateCredentials = (payload) =>
+  http.post('/api/registered/update_credentials', payload)
+
 export const bulkDeleteRegistered = (payload) =>
   http.post('/api/registered/bulk_delete', payload) // { emails } 或 { all: true }
 

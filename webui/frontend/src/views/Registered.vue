@@ -5,7 +5,7 @@ import { ElMessage, ElMessageBox } from 'element-plus'
 import {
   listRegistered, getRegistered, deleteRegistered,
   bulkDeleteRegistered, checkPlus,
-  listExportFormats, exportRegistered,
+  listExportFormats, exportRegistered, updateCredentials,
 } from '@/api/register'
 import { copyText, fmtTime } from '@/api/request'
 import { useFormStore } from '@/stores/form'
@@ -173,7 +173,8 @@ function downloadExport() {
 const credVisible = ref(false)
 const credEmail = ref('')
 const credData = ref(null)
-const CRED_KEYS = ['access_token', 'session_token', 'refresh_token', 'id_token', 'device_id', 'csrf_token', 'cookie_header', 'password']
+// totp_secret 放最前：它是唯一「服务端取不回」的字段，弹窗一打开就要能看到
+const CRED_KEYS = ['totp_secret', 'totp_factor_id', 'access_token', 'session_token', 'refresh_token', 'id_token', 'device_id', 'csrf_token', 'cookie_header', 'password']
 const credRows = computed(() => {
   if (!credData.value) return []
   return CRED_KEYS.filter((k) => credData.value[k]).map((k) => ({ key: k, val: credData.value[k] }))
@@ -196,6 +197,64 @@ async function copyCell(email, field) {
 }
 function copyAllJson() {
   if (credData.value) copyText(JSON.stringify(credData.value, null, 2))
+}
+
+// ── 手动编辑凭证 ──
+// 只改本地库，不同步 OpenAI。改完的值会被登录流程直接用上
+// （registrar 的 account_callback 走 db.get_registered，不区分数据来源）。
+const editVisible = ref(false)
+const editSaving = ref(false)
+const editEmail = ref('')
+const editPassword = ref('')
+const editSecret = ref('')
+// 打开弹窗时的原值，用来判断哪些字段真被改过（没改的不传，后端就不碰）
+const editOrigPassword = ref('')
+const editOrigSecret = ref('')
+
+function openEdit(row) {
+  editEmail.value = row.email
+  editPassword.value = row.password || ''
+  editSecret.value = row.totp_secret || ''
+  editOrigPassword.value = row.password || ''
+  editOrigSecret.value = row.totp_secret || ''
+  editVisible.value = true
+}
+
+async function saveEdit() {
+  const pw = editPassword.value
+  const sec = editSecret.value.trim()
+  const payload = { email: editEmail.value }
+  // 只把真正改动过的字段传给后端 —— 没动的字段不传，后端就不会碰它
+  if (pw !== editOrigPassword.value) payload.password = pw
+  if (sec !== editOrigSecret.value) payload.totp_secret = sec
+  if (payload.password === undefined && payload.totp_secret === undefined) {
+    ElMessage.info('没有改动')
+    editVisible.value = false
+    return
+  }
+  // secret 是唯一「服务端取不回」的凭证：覆盖掉原值 = 该号 2FA 永久锁死。
+  // 只在「原本就有 secret」且「确实要改」时拦一道，新填不打扰。
+  if (payload.totp_secret !== undefined && editOrigSecret.value) {
+    try {
+      await ElMessageBox.confirm(
+        `该账号已有 2FA secret：\n${editOrigSecret.value}\n\n` +
+        '覆盖后原 secret 将永久丢失，服务端取不回。\n' +
+        '若原 secret 仍是账号上生效的那个，覆盖会导致该号 2FA 永远登不上。',
+        '确认覆盖 2FA secret？',
+        { type: 'warning', confirmButtonText: '确认覆盖', cancelButtonText: '取消' },
+      )
+    } catch { return }
+  }
+  editSaving.value = true
+  try {
+    const r = await updateCredentials(payload)
+    ElMessage.success(`已保存：${(r.changed || []).join(' + ') || '无改动'}`)
+    editVisible.value = false
+    await load()
+  } catch (e) {
+    // 后端 400 会带具体原因（如「TOTP secret 含非法字符」），原样透出
+    ElMessage.error('保存失败: ' + (e.response?.data?.detail || e.message))
+  } finally { editSaving.value = false }
 }
 
 watch(page, () => load())
@@ -256,14 +315,30 @@ onActivated(() => load())
         <el-table-column type="selection" width="44" />
         <el-table-column prop="email" label="邮箱" min-width="200" show-overflow-tooltip />
         <!-- 密码直接明文列出：随机 16 位，是登录账号的必需品，
-             藏进「查看凭证」弹窗每次都要多点两下。列表接口本来就在返回它。 -->
+             藏进「查看凭证」弹窗每次都要多点两下。列表接口本来就在返回它。
+             图标放在文字**后面**：放前面会把值整体右推 27px（见 .cell-copy 注释）。 -->
         <el-table-column label="密码" min-width="170">
           <template #default="{ row }">
             <el-button
               v-if="row.password" size="small" text type="primary"
-              class="mono" style="font-size: 12px" @click="copyText(row.password)"
+              class="cell-copy mono" @click="copyText(row.password)"
             >
-              <el-icon><CopyDocument /></el-icon>{{ row.password }}
+              {{ row.password }}<el-icon class="ico"><CopyDocument /></el-icon>
+            </el-button>
+            <span v-else class="hint">—</span>
+          </template>
+        </el-table-column>
+        <!-- 2FA secret 同样明文列出：它是唯一「服务端取不回」的凭证，
+             丢了这个号就永久锁死，必须一眼看见、一点就能复制。
+             min-width 必须装得下 32 位 base32：.cell 带 overflow:hidden，
+             宽度不够会**无声截断**，肉眼核对时看到的是残缺值。实测需 ~250px。 -->
+        <el-table-column label="2FA" min-width="260">
+          <template #default="{ row }">
+            <el-button
+              v-if="row.totp_secret" size="small" text type="warning"
+              class="cell-copy mono" @click="copyText(row.totp_secret)"
+            >
+              {{ row.totp_secret }}<el-icon class="ico"><CopyDocument /></el-icon>
             </el-button>
             <span v-else class="hint">—</span>
           </template>
@@ -301,9 +376,10 @@ onActivated(() => load())
         <el-table-column label="时间" width="160">
           <template #default="{ row }">{{ fmtTime(row.created_at) }}</template>
         </el-table-column>
-        <el-table-column label="操作" width="150" fixed="right">
+        <el-table-column label="操作" width="200" fixed="right">
           <template #default="{ row }">
             <el-button size="small" text @click="viewCred(row.email)">查看凭证</el-button>
+            <el-button size="small" text type="warning" @click="openEdit(row)">编辑</el-button>
             <el-button size="small" text type="danger" @click="deleteOne(row.email)">删除</el-button>
           </template>
         </el-table-column>
@@ -356,6 +432,60 @@ onActivated(() => load())
         </div>
         <el-empty v-if="!credRows.length" description="无凭证字段" />
       </el-dialog>
+
+      <!-- 手动编辑凭证：把外部已知的密码/2FA 补进来，或修正记录错误 -->
+      <el-dialog v-model="editVisible" title="编辑凭证" width="560px" top="10vh">
+        <el-alert
+          type="warning" :closable="false" show-icon style="margin-bottom: 16px"
+          title="仅修改本地记录，不会同步到 OpenAI"
+          description="这里改密码不等于改了账号密码。填入的值会被登录流程直接使用。"
+        />
+        <el-form label-position="top">
+          <el-form-item label="邮箱">
+            <el-input :model-value="editEmail" class="mono" disabled />
+          </el-form-item>
+          <el-form-item label="密码">
+            <el-input v-model="editPassword" class="mono" placeholder="留空表示该号无密码" />
+          </el-form-item>
+          <el-form-item label="2FA Secret">
+            <el-input
+              v-model="editSecret" class="mono"
+              placeholder="base32，支持带空格/小写/otpauth:// 链接，会自动规范化"
+            />
+            <div class="hint" style="margin-top: 6px; line-height: 1.6">
+              服务端取不回此值，覆盖后原 secret 永久丢失。清空则该号按无 2FA 处理。
+            </div>
+          </el-form-item>
+        </el-form>
+        <template #footer>
+          <el-button @click="editVisible = false">取消</el-button>
+          <el-button type="primary" :loading="editSaving" @click="saveEdit">保存</el-button>
+        </template>
+      </el-dialog>
     </el-card>
   </div>
 </template>
+
+<style scoped>
+/* 表格里「点一下就复制」的明文单元格（密码 / 2FA secret）。
+   :deep 是必需的：.el-button 由 Element Plus 渲染，scoped 的属性选择器打不到它。
+
+   为什么要重置 padding —— Element Plus 有两个长得很像的类：
+     .el-button--text  （旧版 type="text"）  padding 左右为 0
+     .el-button.is-text（新版 text 属性）    继承 --small 的 5px 11px
+   我们用的是后者，于是 11px padding + 12px 图标 + 4px 间隙 = 值被整体右推 27px，
+   同列的表头和空值「—」都贴着 cell 左沿，一眼就看出错位。 */
+:deep(.el-button.cell-copy.el-button--small) {
+  padding: 0 6px 0 0;
+  height: 20px;
+  font-size: 12px;
+}
+/* 图标默认透明但**保留占位**：用 opacity 而不是 display:none，
+   否则 hover 时图标撑开宽度会把文字挤得左右抖。 */
+:deep(.cell-copy .ico) {
+  margin-left: 5px;
+  opacity: 0;
+  transition: opacity 0.12s;
+}
+:deep(.cell-copy:hover .ico) { opacity: 0.65; }
+</style>

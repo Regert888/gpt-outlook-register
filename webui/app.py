@@ -75,6 +75,11 @@ class RegisterReq(BaseModel):
     proxy: str = ""
     otp_timeout: int = 10
     allow_existing_login: bool = True
+    # 注册成功后自动绑定 TOTP 2FA。前端两个页面都**默认开**（主人要求每个号都绑）。
+    # 这里的 default 保持 False —— 它只在「调用方没传这个字段」时生效，是给旧前端
+    # 缓存 / 直接打 API 的保守兜底：漏传时宁可不绑，也不替调用方做一个不可逆的决定。
+    # 真实默认值由前端 form store 的 want2fa / autoWant2fa 决定。
+    want_2fa: bool = False
 
 
 # ──────────────────────── API ────────────────────────
@@ -292,6 +297,7 @@ def api_register(req: RegisterReq):
         "proxy": req.proxy,
         "otp_timeout": int(req.otp_timeout),
         "allow_existing_login": req.allow_existing_login,
+        "want_2fa": req.want_2fa,
     }
     run_id = registrar.start_registration(account, options)
     logger.info(f"[run] {run_id} -> {account['email']} (mail_source={mail_source})")
@@ -736,6 +742,44 @@ def api_manual_export_to_panel(req: ManualExportReq):
     return {"ok": True, **out}
 
 
+class UpdateCredReq(BaseModel):
+    email: str = Field(..., description="要修改的已注册账号邮箱")
+    # None = 该字段不动；空串 = 主动清空。前端不填的字段就别传。
+    password: Optional[str] = Field(None, description="新密码，None=不修改")
+    totp_secret: Optional[str] = Field(None, description="新 TOTP secret，None=不修改")
+
+
+@app.post("/api/registered/update_credentials")
+def api_update_credentials(req: UpdateCredReq):
+    """手动修正已注册账号的密码 / TOTP secret。
+
+    ⚠️ 只改本地库，不会同步到 OpenAI。用途是把外部已知凭证补进来或修正记录。
+
+    改完的值会被登录流程直接用上（registrar 的 account_callback 走
+    db.get_registered，不区分数据来源），所以 totp_secret 必须过 base32
+    校验 —— 脏值存进去要等真登录时才炸，那时根本看不出是手填填错的。
+    """
+    email = (req.email or "").strip().lower()
+    if not email:
+        raise HTTPException(400, "email 不能为空")
+    if req.password is None and req.totp_secret is None:
+        raise HTTPException(400, "没有要修改的字段")
+    try:
+        ok = db.update_registered_manual(
+            email, password=req.password, totp_secret=req.totp_secret
+        )
+    except ValueError as e:
+        # 校验失败：把具体原因带给前端，别让用户猜哪里填错了
+        raise HTTPException(400, str(e))
+    if not ok:
+        raise HTTPException(404, f"未找到已注册账号: {email}")
+
+    changed = [n for n, v in (("密码", req.password), ("TOTP secret", req.totp_secret))
+               if v is not None]
+    logger.info(f"[registered] 手动修改凭证 email={email} 字段={'+'.join(changed)}")
+    return {"ok": True, "email": email, "changed": changed}
+
+
 # ──────────────────────── Plus 试用检查 ────────────────────────
 
 
@@ -871,6 +915,11 @@ class AutoLoopStartReq(BaseModel):
     allow_existing_login: bool = True
     cool_down_seconds: float = 3.0  # 每个 worker 跑完后冷却（防风控）
     target_count: int = 0        # 目标成功数（0=不限量，达标自动停止）
+    # 批量页已放开关且**默认开**（主人要求每个号都绑）。
+    # 这里的 default 仍保持 False —— 它只在「前端没传这个字段」时生效，
+    # 是给旧前端缓存 / 直接打 API 的保守兜底：漏传时宁可不绑，也不要
+    # 替调用方做一个不可逆的决定。真实默认值由 AutoLoop.vue 的 autoWant2fa 决定。
+    want_2fa: bool = False
 
 
 @app.post("/api/auto/start")
