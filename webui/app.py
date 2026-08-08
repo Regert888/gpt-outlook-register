@@ -747,10 +747,50 @@ class CheckPlusReq(BaseModel):
 @app.post("/api/registered/check_plus")
 def api_check_plus(req: CheckPlusReq):
     """用 access_token 查询账号的 Plus 试用状态。"""
+    from http_client import create_http_session
+
+    log = logging.getLogger("webui")
+    url = "https://chatgpt.com/backend-api/accounts/check/v4-2023-04-27"
+    ua = (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/145.0.0.0 Safari/537.36"
+    )
+
+    # 走和注册流程同一个 create_http_session，不再自己拼 proxies dict。
+    # 它负责两件这里以前漏掉的事：
+    #   1) socks5:// -> socks5h://，DNS 交给代理端解析。用本地 DNS 打
+    #      chatgpt.com 经常握手失败，这是「填了 SOCKS5 就检测不出来」的真正原因。
+    #   2) trust_env=False + 显式空代理，代理留空时是真直连，
+    #      不会被系统 HTTP_PROXY/HTTPS_PROXY 悄悄接管。
+    proxy = req.proxy.strip()
     try:
-        from curl_cffi import requests as cffi_requests
-    except ImportError:
-        raise HTTPException(500, "curl_cffi 未安装")
+        sess = create_http_session(proxy=proxy or None, impersonate="chrome110")
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(500, f"创建 HTTP 会话失败: {e}")
+
+    note = ""
+    fallback_used = False
+
+    def _check(access_token: str):
+        """打一次检测请求。代理整条路不通就降级直连，且只降一次 ——
+        后面的号直接用直连，不再逐个去撞已经确认不通的代理。"""
+        nonlocal sess, note, fallback_used
+        headers = {
+            "Authorization": f"Bearer {access_token}",
+            "Accept": "application/json",
+            "User-Agent": ua,
+        }
+        try:
+            return sess.get(url, headers=headers, timeout=15)
+        except Exception as e:  # noqa: BLE001
+            if fallback_used or not proxy:
+                raise
+            fallback_used = True
+            note = f"代理连不通（{type(e).__name__}），已自动改直连"
+            log.warning(f"[check_plus] {note}: {str(e)[:140]}")
+            sess = create_http_session(proxy=None, impersonate="chrome110")
+            return sess.get(url, headers=headers, timeout=15)
 
     results = {}
     for email in req.emails:
@@ -763,64 +803,57 @@ def api_check_plus(req: CheckPlusReq):
             results[email] = {"status": "no_at", "label": "无AT"}
             continue
         try:
-            proxies = None
-            proxy = req.proxy.strip()
-            if proxy:
-                proxies = {"https": proxy, "http": proxy}
-            resp = cffi_requests.get(
-                "https://chatgpt.com/backend-api/accounts/check/v4-2023-04-27",
-                headers={
-                    "Authorization": f"Bearer {at}",
-                    "Accept": "application/json",
-                    "User-Agent": (
-                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                        "AppleWebKit/537.36 (KHTML, like Gecko) "
-                        "Chrome/145.0.0.0 Safari/537.36"
-                    ),
-                },
-                proxies=proxies,
-                impersonate="chrome110",
-                timeout=15,
-            )
-            if resp.status_code == 401:
-                results[email] = {"status": "banned", "label": "封号"}
-                continue
-            if resp.status_code != 200:
-                # HTTP 非 200/401 不记录，让前端继续显示"未检测"
-                continue
+            resp = _check(at)
+        except Exception as e:  # noqa: BLE001
+            results[email] = {"status": "error", "label": "网络失败"}
+            log.warning(f"[check_plus] {email} 请求失败: {str(e)[:140]}")
+            continue
+        if resp.status_code == 401:
+            results[email] = {"status": "banned", "label": "封号"}
+            continue
+        if resp.status_code != 200:
+            results[email] = {"status": "error", "label": f"HTTP {resp.status_code}"}
+            continue
+        try:
             data = resp.json()
-            accts = data.get("accounts", {})
-            if not accts:
-                # 无账户数据不记录，让前端继续显示"未检测"
-                continue
-            info = next(iter(accts.values()))
-            acct = info.get("account", {})
-            ent = info.get("entitlement", {})
-            promo = info.get("eligible_promo_campaigns", {})
-            is_deactivated = acct.get("is_deactivated", False)
-            if is_deactivated:
-                results[email] = {"status": "banned", "label": "封号"}
-                continue
-            plan = acct.get("plan_type", "free")
-            has_sub = ent.get("has_active_subscription", False)
-            has_plus_promo = "plus" in promo and promo["plus"].get("id") == "plus-1-month-free"
-            if plan == "plus" or has_sub:
-                results[email] = {"status": "plus_active", "label": "Plus生效中"}
-            elif has_plus_promo:
-                results[email] = {"status": "plus_eligible", "label": "可领Plus试用"}
-            else:
-                results[email] = {"status": "free", "label": "Free"}
-        except Exception as e:
-            # 所有异常（包括 curl 网络错误）都不记录，让前端继续显示"未检测"
-            pass
+        except Exception:  # noqa: BLE001
+            results[email] = {"status": "error", "label": "响应非 JSON"}
+            continue
+        accts = data.get("accounts", {})
+        if not accts:
+            results[email] = {"status": "error", "label": "无账户数据"}
+            continue
+        info = next(iter(accts.values()))
+        acct = info.get("account", {})
+        ent = info.get("entitlement", {})
+        promo = info.get("eligible_promo_campaigns", {})
+        if acct.get("is_deactivated", False):
+            results[email] = {"status": "banned", "label": "封号"}
+            continue
+        plan = acct.get("plan_type", "free")
+        has_sub = ent.get("has_active_subscription", False)
+        has_plus_promo = "plus" in promo and promo["plus"].get("id") == "plus-1-month-free"
+        if plan == "plus" or has_sub:
+            results[email] = {"status": "plus_active", "label": "Plus生效中"}
+        elif has_plus_promo:
+            results[email] = {"status": "plus_eligible", "label": "可领Plus试用"}
+        else:
+            results[email] = {"status": "free", "label": "Free"}
 
-    import time as _time
-    checked_at = _time.time()
+    try:
+        sess.close()
+    except Exception:  # noqa: BLE001
+        pass
+
+    checked_at = time.time()
     for email, info in results.items():
-        if info["status"] not in ("not_found", "no_at"):
+        # error 和 not_found / no_at 一样不写库：它们不是「检测结论」而是没检测成，
+        # 写进去号就从 unchecked 过滤器里消失了，看着像已经检测过。
+        # 前端仍会收到 error 并显示红点，网络修好重新点一次即可覆盖。
+        if info["status"] not in ("not_found", "no_at", "error"):
             db.update_plus_check(email, {**info, "checked_at": checked_at})
 
-    return {"ok": True, "results": results}
+    return {"ok": True, "results": results, "note": note}
 
 
 # ──────────────────────── auto-loop ────────────────────────

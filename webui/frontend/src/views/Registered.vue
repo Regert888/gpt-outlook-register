@@ -56,16 +56,22 @@ async function doCheck(mode) {
   checking.value = true
   checkResult.value = `检查中... (${emails.length} 个)`
   try {
-    const { results } = await checkPlus(emails, form.value.proxy.trim())
-    let plus = 0, free = 0, banned = 0
+    const { results, note } = await checkPlus(emails, form.value.proxy.trim())
+    let plus = 0, free = 0, banned = 0, failed = 0
     for (const [email, info] of Object.entries(results)) {
       const row = rows.value.find((r) => r.email === email)
       if (row) row.plus_check = info
       if (info.status === 'plus_eligible' || info.status === 'plus_active') plus++
       else if (info.status === 'banned') banned++
       else if (info.status === 'free') free++
+      else if (info.status === 'error') failed++
     }
-    checkResult.value = `完成: ${plus} 可用Plus, ${free} Free, ${banned} 封号`
+    // failed 和 note 都不入库，只是这一次的现场说明：
+    // 以前网络/代理挂了这里只会显示「0 可用Plus, 0 Free, 0 封号」，看不出是没检测成。
+    const parts = [`完成: ${plus} 可用Plus, ${free} Free, ${banned} 封号`]
+    if (failed) parts.push(`${failed} 个没检测成`)
+    if (note) parts.push(note)
+    checkResult.value = parts.join(' · ')
   } catch (e) {
     checkResult.value = ''
     ElMessage.error('检查失败: ' + e.message)
