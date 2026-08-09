@@ -19,7 +19,6 @@
   - 国家列表改为**动态获取**（查询平台 API 实际库存，切换平台自动刷新）
   - 「📱 接码配置」Tab 一键启用 SmsBower / HeroSMS 平台
   - 命中 `add-phone` 时自动租号 → 接 SMS → 验证，**全程无人值守**
-  - 支持 **号码复用**（SmsBower / HeroSMS：一个号注册多个 ChatGPT，省钱）
   - 支持 **自动选最优国家**（按价格 + 库存）
   - WebUI 提供「测试余额」「查询国家排名」按钮
   - 兼容旧的 `OPENAI_PHONE_NUMBER` / `OPENAI_PHONE_OTP` 环境变量路径（未启用接码时自动回退）
@@ -265,7 +264,7 @@ WebUI「📱 接码配置」Tab 启用接码后，命中 add-phone 时会自动�
 
 | 平台 | 网址 | 特色 |
 |---|---|---|
-| **SmsBower** | smsbower.page | 号码复用 + V2 API + auto-resend |
+| **SmsBower** | smsbower.page | V2 API + auto-resend |
 | **HeroSMS** | hero-sms.com | 180+ 国家，SMS-Activate 继任平台 |
 
 
@@ -318,7 +317,6 @@ WebUI「📱 接码配置」Tab 启用接码后，命中 add-phone 时会自动�
 
 ### SMS 接码
 - **WhatsApp vs SMS**：OpenAI 自 2025 年起对大部分国家改用 WhatsApp 验证。如果租到的国家不在白名单，接码平台收不到 SMS → 超时 → cancel 退款。
-- **号码复用**：SmsBower / HeroSMS 在 20 分钟生命周期内同号最多复用 N 次（默认 3）。一个号注册多个 ChatGPT 可显著降本，但前提是 OpenAI 端没风控同号。
 - **HeroSMS 退款机制**：HeroSMS 购买后 2 分钟内不可取消，取消后 20 分钟自动退款到余额；SmsBower 可立即取消退款。注册机中号码不可用时会立刻换号，HeroSMS 的废号等 20 分钟后自动退回。
 - **OTP validate 失败 → resend 兜底**：phone-otp/validate 401 时会自动 resend 一次再等新码（OpenAI 偶尔拒第一条码但接受第二条）。
 

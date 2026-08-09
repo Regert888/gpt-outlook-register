@@ -27,6 +27,9 @@ const checkResult = ref('')
 
 const PLUS_TYPE = {
   plus_eligible: 'success', plus_active: 'primary', free: 'warning',
+  // token_invalid（401）是**凭证问题不是账号问题**，必须和 banned 区分开：
+  // 红色 = 号没了，橙色 = 号还在、只是库里的 access_token 不能用了。
+  token_invalid: 'warning',
   banned: 'danger', error: 'danger',
 }
 function plusOf(row) { return row.plus_check || null }
@@ -57,18 +60,20 @@ async function doCheck(mode) {
   checkResult.value = `检查中... (${emails.length} 个)`
   try {
     const { results, note } = await checkPlus(emails, form.value.proxy.trim())
-    let plus = 0, free = 0, banned = 0, failed = 0
+    let plus = 0, free = 0, banned = 0, failed = 0, badToken = 0
     for (const [email, info] of Object.entries(results)) {
       const row = rows.value.find((r) => r.email === email)
       if (row) row.plus_check = info
       if (info.status === 'plus_eligible' || info.status === 'plus_active') plus++
       else if (info.status === 'banned') banned++
       else if (info.status === 'free') free++
+      else if (info.status === 'token_invalid') badToken++
       else if (info.status === 'error') failed++
     }
-    // failed 和 note 都不入库，只是这一次的现场说明：
+    // failed / badToken / note 都不入库，只是这一次的现场说明：
     // 以前网络/代理挂了这里只会显示「0 可用Plus, 0 Free, 0 封号」，看不出是没检测成。
     const parts = [`完成: ${plus} 可用Plus, ${free} Free, ${banned} 封号`]
+    if (badToken) parts.push(`${badToken} 个凭证失效（非封号，需重新登录取凭证）`)
     if (failed) parts.push(`${failed} 个没检测成`)
     if (note) parts.push(note)
     checkResult.value = parts.join(' · ')

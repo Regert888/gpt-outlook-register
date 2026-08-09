@@ -853,7 +853,11 @@ def api_check_plus(req: CheckPlusReq):
             log.warning(f"[check_plus] {email} 请求失败: {str(e)[:140]}")
             continue
         if resp.status_code == 401:
-            results[email] = {"status": "banned", "label": "封号"}
+            # 401 = access_token 无效 / 过期 / 被吊销，**不是封号**。
+            # 实测场景：注册时（free）签发的 AT，账号升级 Plus 后旧 AT 失效 →
+            # 这里返回 401 → 以前判成「封号」，用户看到一个活得好好的 Plus 号显示封号。
+            # 封号只认下面 200 响应里的 is_deactivated，判据不变。
+            results[email] = {"status": "token_invalid", "label": "凭证失效"}
             continue
         if resp.status_code != 200:
             results[email] = {"status": "error", "label": f"HTTP {resp.status_code}"}
@@ -891,10 +895,12 @@ def api_check_plus(req: CheckPlusReq):
 
     checked_at = time.time()
     for email, info in results.items():
-        # error 和 not_found / no_at 一样不写库：它们不是「检测结论」而是没检测成，
-        # 写进去号就从 unchecked 过滤器里消失了，看着像已经检测过。
-        # 前端仍会收到 error 并显示红点，网络修好重新点一次即可覆盖。
-        if info["status"] not in ("not_found", "no_at", "error"):
+        # error 和 not_found / no_at / token_invalid 一样不写库：它们不是「检测结论」
+        # 而是没检测成，写进去号就从 unchecked 过滤器里消失了，看着像已经检测过。
+        # token_invalid 尤其不能写：它会覆盖掉这个号之前查到的正确 plus 状态，
+        # 而且换了新凭证后本该重查，写库反而让「检查未检测」永远跳过它。
+        # 前端仍会收到这些状态并显示对应标签，修好后重新点一次即可覆盖。
+        if info["status"] not in ("not_found", "no_at", "error", "token_invalid"):
             db.update_plus_check(email, {**info, "checked_at": checked_at})
 
     return {"ok": True, "results": results, "note": note}
