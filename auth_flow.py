@@ -23,7 +23,11 @@ from typing import Optional, Any
 from urllib.parse import urlparse, parse_qs, parse_qsl, urljoin, urlencode, urlunparse
 
 from config import Config
-from fingerprint import generate_fingerprint, ua_for_impersonate
+from fingerprint import (
+    generate_fingerprint,
+    ua_for_impersonate,
+    fingerprint_for_impersonate,
+)
 from mail_providers import MailProvider
 from http_client import create_http_session, USER_AGENT
 
@@ -1528,12 +1532,29 @@ class AuthFlow:
         return out
 
     def _rotate_impersonate_session(self) -> bool:
-        """仅在 curl_cffi 指纹模式内切换 UA 指纹版本重试，同时联动更新 UA。"""
+        """仅在 curl_cffi 指纹模式内切换 UA 指纹版本重试，同时联动更新 UA。
+
+        ⚠️ 这里必须连 self._fingerprint 里的 client hints 一起换掉。
+        旧版只更新了 self._ua 和 session —— 但 _common_headers / _navigation_headers
+        的 sec-ch-ua* 全是从 self._fingerprint 取的，于是换完会变成
+        「UA 说 Chrome/136、sec-ch-ua 说 v=146」，连 not_a_brand 都对不上
+        （三个版本各不相同："Not.A/Brand";v="99" / "Not/A)Brand";v="8" /
+        "Not?A_Brand";v="99"）—— 这正是上一轮刚消灭的「UA 与头自相矛盾」，
+        是 CF 最容易抓的特征。之前没爆只因这条路几乎没走到过。
+
+        fallback_impersonates 是**同家族**构造的（见 fingerprint.py 各 _gen_*），
+        所以只会 chrome→chrome、safari→safari，不会跨族；但同族换版本一样要同步头。
+        """
         if self._impersonate_idx >= len(self._impersonate_candidates) - 1:
             return False
         self._impersonate_idx += 1
         imp = self._impersonate_candidates[self._impersonate_idx]
         self._ua = ua_for_impersonate(imp, self._ua)
+        # 让 client hints 跟上新版本，保持 UA 与头自洽
+        try:
+            self._fingerprint = fingerprint_for_impersonate(imp, self._fingerprint)
+        except Exception as e:  # 兜底：宁可维持旧指纹也不要把流程搞崩
+            logger.warning(f"client hints 同步失败（沿用旧指纹）: {e}")
         logger.warning(f"TLS 异常，切换指纹重试: impersonate={imp}, ua={self._ua[:60]}...")
         self.session = create_http_session(
             proxy=self.config.proxy, impersonate=imp, user_agent=self._ua,
@@ -1616,23 +1637,132 @@ class AuthFlow:
         headers.update(self._datadog_trace_headers())
         return headers
 
+    def _navigation_headers(self) -> dict:
+        """文档导航请求（地址栏直达那种）的头，含 client hints。
+
+        和 _common_headers 的区别只在 Sec-Fetch-* 那组：那边是 XHR（empty/cors/
+        same-origin），这里是整页导航（document/navigate/none + user + UIR）。
+        **client hints 两边必须一致**，都从 self._fingerprint 取：Chrome 指纹发
+        全套，Safari/Firefox 指纹 sec_ch_ua 为空串、一个都不发——这正是真实浏览器
+        的行为。旧 warmup 手搓头漏了这段，导致 Chrome UA 裸奔，实测 403 率 4/5，
+        补齐后 5/5 通过（详见 warmup docstring）。
+        """
+        fp = self._fingerprint
+        headers = {
+            "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,"
+                      "image/avif,image/webp,image/apng,*/*;q=0.8",
+            "Accept-Language": fp["lang_full"],
+            "Accept-Encoding": "gzip, deflate, br, zstd",
+            "sec-fetch-dest": "document",
+            "sec-fetch-mode": "navigate",
+            "sec-fetch-site": "none",
+            "sec-fetch-user": "?1",
+            "upgrade-insecure-requests": "1",
+            "priority": "u=0, i",
+            "User-Agent": self._ua,
+        }
+        if fp.get("sec_ch_ua"):
+            headers["sec-ch-ua"] = fp["sec_ch_ua"]
+            headers["sec-ch-ua-mobile"] = fp.get("sec_ch_ua_mobile") or "?0"
+            headers["sec-ch-ua-platform"] = fp["sec_ch_ua_platform"]
+            for key, name in (
+                ("sec_ch_ua_full_version_list", "sec-ch-ua-full-version-list"),
+                ("sec_ch_ua_arch", "sec-ch-ua-arch"),
+                ("sec_ch_ua_bitness", "sec-ch-ua-bitness"),
+                ("sec_ch_ua_model", "sec-ch-ua-model"),
+                ("sec_ch_ua_platform_version", "sec-ch-ua-platform-version"),
+            ):
+                if fp.get(key):
+                    headers[name] = fp[key]
+        return headers
+
     def warmup(self) -> bool:
-        """GET chatgpt.com 首页获取 __cf_bm cookie（Cloudflare 预热 + 连通性验证）。"""
-        try:
-            resp = self.session.get("https://chatgpt.com", headers={
-                "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                "sec-fetch-dest": "document",
-                "sec-fetch-mode": "navigate",
-                "sec-fetch-site": "none",
-                "sec-fetch-user": "?1",
-                "upgrade-insecure-requests": "1",
-                "User-Agent": self._ua,
-            }, timeout=15)
-            logger.info("chatgpt.com warmup 完成")
-            return True
-        except Exception as e:
-            logger.warning(f"Cloudflare warmup 失败: {e}")
-            return False
+        """GET chatgpt.com 种全套 cookie（含 oai-did），成功返回 True。
+
+        为什么这步不能失败（2026-08-10 实测 26 轮，跨 40+ 出口 IP）：
+        `POST /api/auth/signin/openai` 依据 chatgpt.com 的 cookie 决定返回什么——
+        有 oai-did 就返 auth.openai.com/authorize URL，没有就返 NextAuth 页，
+        后者到 authorize/continue 必然 409 invalid_state。
+        实测：无 oai-did 的 5 轮 **5/5 全 409**；有 oai-did 的 17 轮只有 3 次 409。
+
+        旧实现两个问题，实测各占一半失败：
+        1. 单次无重试 + timeout=15。实测种 cookie 失败率 19%，形态有三种：
+           TLS curl(35) 断连、15s 超时、CF 403。成功轮实际耗时 3.4~10.9s，
+           15s 卡边缘，40s 才有富余。
+        2. **返回值和实际结果对不上**：只 catch 异常，不看 status_code——
+           403 照样 return True（实测 3 轮 True 但没 cookie），
+           而超时前 cookie 其实已经种上了却 return False（实测 1 轮）。
+           所以判据改成直接查 cookie jar，这是唯一可信的信号。
+
+        3. **没发 client hints，自称 Chrome 却不带 sec-ch-ua —— CF 一眼假。**
+           这是 403 的真因。真 Chrome 每个导航请求必带 sec-ch-ua/-mobile/-platform，
+           而旧 warmup 是手搓 headers、一个都没带（_common_headers 带了，只有这里漏）。
+           2026-08-10 实测，同一 impersonate 各打 5 次（每次新 IP）：
+
+               impersonate   裸头(旧)   补 CH 全套
+               chrome146      1/5        5/5
+               chrome136      1/5        5/5
+               chrome142      4/5        4/5   ← 唯一失败是 SSL 断连，不是 403
+
+           补齐后 403 **全部消失**。此前"chrome 族被 CF 拦"的结论是误判：
+           safari/firefox 当时 4/4 不是因为它们更干净，而是**它们本来就不该发
+           client hints**，裸头对它们恰好是正确的头。所以修法是把头补齐，
+           不是换成 safari —— 换指纹只是绕开症状，且会让 self._fingerprint 与
+           self._ua 不一致（后续 _common_headers 会拿旧家族的 CH 配新 UA，更假）。
+
+        重试只换出口 IP，不换指纹（指纹本来就没问题，见上）：代理池按会话分配
+        出口，新 session ≈ 新 IP，绕开连不上的坏 IP。cookie 跟着 session 一起
+        清掉是对的：失败轮本来就没种到有用的东西。
+
+        注：URL 保持首页 `/`。实测对比过 `/auth/login`（16 轮 vs 10 轮），
+        失败率 18.75% vs 20%，无差异，不值得换。
+
+        【最终验证 2026-08-10】本处 + auth_oauth_init + _follow_redirects 三处
+        统一走 _navigation_headers 后，用真实 CF 域名跑完整 run_register
+        **3/3 全成功**（各约 100s，password + access_token 齐全），409 = 0。
+        """
+        headers = self._navigation_headers()
+
+        for attempt in range(4):
+            if attempt:
+                # 只换出口 IP（新 session = 新出口），指纹保持不变：
+                # 403 是缺 client hints 导致的，已在头里修好，不是指纹的锅。
+                time.sleep(3 + attempt * 2)
+                self.session = create_http_session(
+                    proxy=self.config.proxy,
+                    impersonate=self._impersonate_candidates[self._impersonate_idx],
+                    user_agent=self._ua,
+                )
+            try:
+                resp = self.session.get(
+                    "https://chatgpt.com", headers=headers, timeout=40,
+                )
+                status = resp.status_code
+            except Exception as e:
+                status = None
+                logger.warning(f"warmup 第 {attempt + 1}/4 次请求失败: {e}")
+
+            # 唯一判据：cookie 到底种上没有。HTTP 200 不代表拿到 oai-did（CF 403 只给
+            # __cf_bm），请求抛异常也不代表没拿到（超时前可能已经种上了）。
+            try:
+                cookies = self.session.cookies.get_dict()
+            except Exception:
+                cookies = {}
+            if "oai-did" in cookies:
+                logger.info(
+                    f"chatgpt.com warmup 完成（第 {attempt + 1} 次，oai-did 已种，"
+                    f"共 {len(cookies)} 个 cookie）"
+                )
+                return True
+
+            logger.warning(
+                f"warmup 第 {attempt + 1}/4 次未种到 oai-did"
+                + (f"（HTTP {status}）" if status is not None else "")
+                + (f"，已有 cookie: {sorted(cookies)}" if cookies else "，无任何 cookie")
+            )
+
+        logger.error("warmup 4 次均未种到 oai-did cookie —— 此时继续走注册链必然 409 invalid_state")
+        return False
 
     # ── Step 1: 检查代理连通性 ──
     def check_proxy(self) -> bool:
@@ -1753,12 +1883,29 @@ class AuthFlow:
 
     # ── Step 4: OAuth 初始化 & 获取 device_id ──
     def auth_oauth_init(self, auth_url: str) -> str:
+        """跟随 authorize 链，落 authorize 会话状态并取回 oai-did。
+
+        这一步**建立的就是后面 authorize/continue 要用的那个 state**，头不像真
+        浏览器就拿不到有效状态，下一步必 409 invalid_state。
+
+        旧实现只发 Accept/Referer/UA，缺 client hints、**整组 Sec-Fetch-* 也没有**
+        （真浏览器跳转必带 document/navigate/cross-site）。2026-08-10 实测 A/B
+        对照各 6 轮（400 invalid_username 视为会话正常，只是 .test 域名被拒）：
+
+            A 现状裸头        会话正常 2/6，**409 = 3**
+            B 补齐 CH+SecFetch 会话正常 5/6，**409 = 0**
+
+        和 warmup 那处是同一个病（详见 warmup docstring），当时只修了 warmup，
+        漏了这里，所以主人实跑仍 409。头统一从 _navigation_headers 派生，
+        保证 client hints 与 self._fingerprint / self._ua 同族。
+        """
         logger.info("[3/10] OAuth 初始化...")
-        headers = {
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Referer": "https://chatgpt.com/auth/login",
-            "User-Agent": self._ua,
-        }
+        headers = self._navigation_headers()
+        headers["Referer"] = "https://chatgpt.com/"
+        # chatgpt.com -> auth.openai.com 是跨站跳转，不是首次直达
+        headers["sec-fetch-site"] = "cross-site"
+        # 302 自动跟随不是用户手动点击，真浏览器此时不发 sec-fetch-user
+        headers.pop("sec-fetch-user", None)
         resp = self.session.get(auth_url, headers=headers, timeout=30, allow_redirects=True)
         self._trace_http("auth_oauth_init", resp)
 
@@ -2465,11 +2612,21 @@ class AuthFlow:
         referer = "https://auth.openai.com/"
 
         for i in range(max_hops):
-            headers = {
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                "Referer": referer,
-                "User-Agent": self._ua,
-            }
+            # 逐跳整页导航，头必须像浏览器：同 auth_oauth_init，旧版只发
+            # Accept/Referer/UA，缺 client hints 和 Sec-Fetch-*（实测那正是
+            # 409 invalid_state 的来源，见 auth_oauth_init docstring）。
+            headers = self._navigation_headers()
+            headers["Referer"] = referer
+            headers.pop("sec-fetch-user", None)   # 302 跟随非用户点击
+            # 跨站跳转（chatgpt.com <-> auth.openai.com）标 cross-site，同站标 same-origin
+            try:
+                headers["sec-fetch-site"] = (
+                    "same-origin"
+                    if urlparse(current_url).netloc == urlparse(referer).netloc
+                    else "cross-site"
+                )
+            except Exception:
+                headers["sec-fetch-site"] = "cross-site"
             resp = self.session.get(
                 current_url, headers=headers, timeout=30, allow_redirects=False
             )
@@ -2890,7 +3047,14 @@ class AuthFlow:
         # 检查网络
         if not self.check_proxy():
             logger.warning("网络预检查未通过，继续尝试注册链路以获取精确错误...")
-        self.warmup()
+        # warmup 失败 = 没拿到 oai-did = 后面 authorize/continue 必 409（实测 5/5）。
+        # 必须在 create_mailbox 之前拦掉：邮箱是花钱的，不能为一个注定 409 的轮次浪费。
+        if not self.warmup():
+            raise RuntimeError(
+                "warmup 失败：4 次重试均未拿到 chatgpt.com 的 oai-did cookie，"
+                "继续注册必然 409 invalid_state（多为代理出口 IP 不通或被 CF 拦），"
+                "请检查代理后重试"
+            )
 
         # 创建邮箱
         email = mail_provider.create_mailbox()
@@ -3276,7 +3440,14 @@ class AuthFlow:
 
         if not self.check_proxy():
             logger.warning("网络预检查未通过，继续尝试登录链路以获取精确错误...")
-        self.warmup()
+        # 同 run_register：没 oai-did 就走不通 authorize 链，早失败早换 IP。
+        # 这里不花钱建邮箱，但报错说清原因，省得当成"密码错"排查。
+        if not self.warmup():
+            raise RuntimeError(
+                "warmup 失败：4 次重试均未拿到 chatgpt.com 的 oai-did cookie，"
+                "继续登录必然 409 invalid_state（多为代理出口 IP 不通或被 CF 拦），"
+                "请检查代理后重试"
+            )
 
         # run_protocol_login 的语义即"登录已有账号"（docstring 明写）。kickoff_otp_delivery
         # 依据 _is_existing_account 选 resend vs send_passwordless_otp 分支；落到 send

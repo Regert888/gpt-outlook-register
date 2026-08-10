@@ -19,10 +19,24 @@ const defaults = {
   autoWant2fa: true,
 }
 
+// el-select 的 clearable 清空时把值写成 **undefined**（不是 ''），而 proxy 在三个
+// 页面都是 `form.value.proxy.trim()` 直接调 —— 主人点一次叉，下次提交就
+// "Cannot read properties of undefined (reading 'trim')"。这里统一兜底成字符串，
+// 免得每个调用点各写各的可选链，也顺手挡住 localStorage 里的历史脏值。
+export function proxyText(form) {
+  return String(form?.proxy ?? '').trim()
+}
+
 export const useFormStore = defineStore('form', () => {
   let saved = {}
   try { saved = JSON.parse(localStorage.getItem(KEY) || '{}') } catch (_) { saved = {} }
   const form = reactive({ ...defaults, ...saved })
+
+  // clearable 清空后 proxy 会变成 undefined 并被持久化进 localStorage，
+  // 刷新页面后依然是 undefined。这里watch 回填成 ''，保证存量数据也是干净的。
+  watch(() => form.proxy, (v) => {
+    if (v === undefined || v === null) form.proxy = ''
+  })
 
   watch(form, (v) => {
     try { localStorage.setItem(KEY, JSON.stringify(v)) } catch (_) {}

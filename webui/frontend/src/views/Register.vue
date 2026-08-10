@@ -5,7 +5,7 @@ import { storeToRefs } from 'pinia'
 import { ElMessage } from 'element-plus'
 import { startRegister, getRegistered } from '@/api/register'
 import { copyText } from '@/api/request'
-import { useFormStore } from '@/stores/form'
+import { useFormStore, proxyText } from '@/stores/form'
 import { useProxyStore } from '@/stores/proxy'
 import { useRuntimeStore } from '@/stores/runtime'
 import LogPanel from '@/components/LogPanel.vue'
@@ -34,7 +34,7 @@ async function run() {
   try {
     const r = await startRegister({
       email: regEmail.value.trim() || null,
-      proxy: form.value.proxy.trim(),
+      proxy: proxyText(form.value),
       otp_timeout: parseInt(form.value.otpTimeout, 10) || 10,
       want_access_token: true,
       want_session_token: true,

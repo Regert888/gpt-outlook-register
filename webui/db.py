@@ -708,6 +708,10 @@ def _registered_where(filt: str) -> str:
         return "WHERE (extra_json LIKE '%\"plus_eligible\"%' OR extra_json LIKE '%\"plus_active\"%')"
     if filt == "banned":
         return "WHERE extra_json LIKE '%\"banned\"%'"
+    if filt == "token_invalid":
+        # token_invalid 从 2026-08-10 起会写库，得能筛出来，否则等于埋了：
+        # 它既不在 unchecked 里（已有结论），又不在 free/plus/banned 里。
+        return "WHERE extra_json LIKE '%\"token_invalid\"%'"
     return ""
 
 

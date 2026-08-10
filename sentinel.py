@@ -84,4 +84,11 @@ def get_sentinel_token(
     except RuntimeError:
         raise
     except Exception as e:
+        # 网络类异常原样上抛：包成 RuntimeError("QuickJS 异常") 会让日志看起来像
+        # PoW 算不出来，实际是链路 TLS 瞬断（见 sentinel_quickjs 同处注释）。
+        # 保留原异常类型，registrar 的 classify_error 也才能稳定判成 network。
+        from http_client import _is_tls_handshake_error
+
+        if _is_tls_handshake_error(e):
+            raise
         raise RuntimeError(f"Sentinel QuickJS 异常: {e}")

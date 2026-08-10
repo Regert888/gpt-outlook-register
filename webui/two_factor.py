@@ -221,7 +221,12 @@ def bind_totp_2fa(
 
         logger.info("[2fa] 1/11 检查代理 / 预热...")
         flow.check_proxy()
-        flow.warmup()
+        # 没拿到 oai-did 就直接 409，不如早退：2FA 是注册后置步骤，
+        # 失败只告警不废号（见调用方 registrar），所以这里 raise 是安全的。
+        if not flow.warmup():
+            raise RuntimeError(
+                "warmup 失败：未拿到 oai-did cookie，绑定链路必然 409 invalid_state"
+            )
 
         logger.info("[2fa] 2/11 获取 csrf_token...")
         csrf = flow.get_csrf_token()

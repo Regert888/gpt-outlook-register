@@ -316,5 +316,17 @@ def get_sentinel_token_via_quickjs(
             f"so={'Y' if so_token_raw else 'N/A(服务端未要求)'})")
         return (sdk_token, so_token_raw)
     except Exception as e:
+        # ⚠️ 这里曾经是个纯 catch-all：任何异常都降级成一行 INFO 日志 + return None，
+        #    上层只能看到"主 token 缺失"，真因全被掩盖。2026-08-10 主人批量跑 10 个号，
+        #    其中一次失败日志是「Sentinel QuickJS 失败（主 token 缺失…）」，看着像 PoW
+        #    算不出来，实际是 /sentinel/req 那个 POST 撞了链路级 TLS 瞬断
+        #    （curl:(35)，全局 5.4% 偶发）—— 排查方向被带偏了一整轮。
+        #    网络类异常现在原样抛出去，让 registrar 的 classify_error 判成 network，
+        #    也让 http_client 的 TLS 重试有机会先兜住；真正的 JS/PoW 问题才 return None。
+        from http_client import _is_tls_handshake_error
+
+        if _is_tls_handshake_error(e):
+            log(f"Sentinel 网络异常（非 PoW 问题，原样上抛）: {e}")
+            raise
         log(f"Sentinel QuickJS 异常: {e}")
         return None

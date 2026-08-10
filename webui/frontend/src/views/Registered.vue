@@ -8,11 +8,16 @@ import {
   listExportFormats, exportRegistered, updateCredentials,
 } from '@/api/register'
 import { copyText, fmtTime } from '@/api/request'
-import { useFormStore } from '@/stores/form'
+import { useFormStore, proxyText } from '@/stores/form'
+import { useProxyStore } from '@/stores/proxy'
 import { useRuntimeStore } from '@/stores/runtime'
 import StatusDot from '@/components/StatusDot.vue'
 
 const { form } = storeToRefs(useFormStore())
+// 检测用的代理必须能从代理池里挑：以前这页只在代码里读 form.proxy，页面上
+// 连个输入框都没有，主人在代理池换了密码，这里还在用 localStorage 里的旧值，
+// 结果是 curl:(97) 代理鉴权被拒 → 静默降级直连 → 拿真实 IP 打 chatgpt.com。
+const { list: proxyList } = storeToRefs(useProxyStore())
 const { dataVersion } = storeToRefs(useRuntimeStore())
 
 const PAGE_SIZE = 20
@@ -27,9 +32,10 @@ const checkResult = ref('')
 
 const PLUS_TYPE = {
   plus_eligible: 'success', plus_active: 'primary', free: 'warning',
-  // token_invalid（401）是**凭证问题不是账号问题**，必须和 banned 区分开：
-  // 红色 = 号没了，橙色 = 号还在、只是库里的 access_token 不能用了。
-  token_invalid: 'warning',
+  // token_invalid（401 且响应体没有封号措辞）仍与 banned 分开显示——判据不同，
+  // 不能混成一个。但配色从橙改红：AT 未到期却 401 = 被吊销，实测多半就是封号，
+  // 橙色（=号还在）会让主人以为重新登录就能救回来。
+  token_invalid: 'danger',
   banned: 'danger', error: 'danger',
 }
 function plusOf(row) { return row.plus_check || null }
@@ -59,7 +65,7 @@ async function doCheck(mode) {
   checking.value = true
   checkResult.value = `检查中... (${emails.length} 个)`
   try {
-    const { results, note } = await checkPlus(emails, form.value.proxy.trim())
+    const { results, note } = await checkPlus(emails, proxyText(form.value))
     let plus = 0, free = 0, banned = 0, failed = 0, badToken = 0
     for (const [email, info] of Object.entries(results)) {
       const row = rows.value.find((r) => r.email === email)
@@ -70,10 +76,12 @@ async function doCheck(mode) {
       else if (info.status === 'token_invalid') badToken++
       else if (info.status === 'error') failed++
     }
-    // failed / badToken / note 都不入库，只是这一次的现场说明：
+    // failed / note 不入库，只是这一次的现场说明：
     // 以前网络/代理挂了这里只会显示「0 可用Plus, 0 Free, 0 封号」，看不出是没检测成。
+    // badToken 从 2026-08-10 起是**会入库**的结论，措辞也跟着改：
+    // AT 没过期却 401 = 被吊销，大概率就是封号，不该再说得像只是要重新登录。
     const parts = [`完成: ${plus} 可用Plus, ${free} Free, ${banned} 封号`]
-    if (badToken) parts.push(`${badToken} 个凭证失效（非封号，需重新登录取凭证）`)
+    if (badToken) parts.push(`${badToken} 个凭证失效（AT 被吊销，多半已封）`)
     if (failed) parts.push(`${failed} 个没检测成`)
     if (note) parts.push(note)
     checkResult.value = parts.join(' · ')
@@ -281,6 +289,14 @@ onActivated(() => load())
           <el-option label="Free" value="free" />
           <el-option label="可领Plus" value="plus" />
           <el-option label="已封号" value="banned" />
+          <el-option label="凭证失效" value="token_invalid" />
+        </el-select>
+        <el-select
+          v-model="form.proxy" filterable clearable allow-create default-first-option
+          :reserve-keyword="false" placeholder="检测代理（留空直连）"
+          style="width: 260px"
+        >
+          <el-option v-for="p in proxyList" :key="p" :label="p" :value="p" />
         </el-select>
         <el-button :loading="checking" @click="doCheck('unchecked')">检查未检测</el-button>
         <el-button :loading="checking" @click="doCheck('all')">重新检查</el-button>

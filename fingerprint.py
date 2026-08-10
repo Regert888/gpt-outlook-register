@@ -648,6 +648,64 @@ for f in _FIREFOX_VERSIONS:
     _ALL_IMPERSONATES[f["impersonate"]] = {"type": "firefox", "data": f}
 
 
+def fingerprint_for_impersonate(impersonate: str, current_fp: dict) -> dict:
+    """把指纹里**随 impersonate 版本变化**的字段同步到新版本，其余原样保留。
+
+    TLS 旋转（_rotate_impersonate_session）换 impersonate 时，光换 UA 是不够的：
+    _common_headers / _navigation_headers 的 sec-ch-ua* 全从指纹取，不同步就会出现
+    「UA 说 Chrome/136、sec-ch-ua 说 v=146」，连 not_a_brand 都对不上
+    （136:"Not.A/Brand";v="99" / 142:"Not/A)Brand";v="8" / 146:"Not?A_Brand";v="99"），
+    是 CF 一抓一个准的自相矛盾特征。
+
+    只动版本相关字段（sec_ch_ua / full_version_list / user_agent），
+    屏幕、语言、时区、硬件等会话级属性保持不变 —— 那些跟浏览器版本无关，
+    换了反而破坏"同一台机器"的一致性。
+
+    未知 impersonate 或非 Chrome 家族：Safari/Firefox 本就不发 client hints
+    （sec_ch_ua 为空串），无需同步，原样返回副本。
+    """
+    entry = _ALL_IMPERSONATES.get(impersonate)
+    fp = dict(current_fp or {})
+    if not entry:
+        return fp
+
+    t, d = entry["type"], entry["data"]
+    fp["impersonate"] = impersonate
+    fp["browser_type"] = t
+    fp["user_agent"] = ua_for_impersonate(impersonate, fp.get("user_agent", ""))
+
+    if t == "chrome":
+        fp["sec_ch_ua"] = (
+            f'"Chromium";v="{d["ver"]}", '
+            f'"Google Chrome";v="{d["ver"]}", '
+            f'{d["not_a_brand"]}'
+        )
+        fp["sec_ch_ua_full_version_list"] = (
+            f'"Chromium";v="{d["full_ver"]}", '
+            f'"Google Chrome";v="{d["full_ver"]}", '
+            f'{d["not_a_brand"]}'
+        )
+        # platform/mobile/arch/bitness/model/platform_version 只跟设备走，
+        # 不随 Chrome 版本变，沿用原指纹即可（缺失时给桌面 Windows 默认值）
+        fp.setdefault("sec_ch_ua_platform", '"Windows"')
+        fp.setdefault("sec_ch_ua_mobile", "?0")
+        fp.setdefault("sec_ch_ua_arch", '"x86"')
+        fp.setdefault("sec_ch_ua_bitness", '"64"')
+        fp.setdefault("sec_ch_ua_model", '""')
+        fp.setdefault("sec_ch_ua_platform_version", '"10.0.19045"')
+    else:
+        # 非 Chromium：一个 client hint 都不发（真实浏览器行为）
+        fp["sec_ch_ua"] = ""
+        fp["sec_ch_ua_platform"] = ""
+        fp["sec_ch_ua_mobile"] = ""
+        fp["sec_ch_ua_full_version_list"] = ""
+        fp["sec_ch_ua_arch"] = ""
+        fp["sec_ch_ua_bitness"] = ""
+        fp["sec_ch_ua_model"] = ""
+        fp["sec_ch_ua_platform_version"] = ""
+    return fp
+
+
 def ua_for_impersonate(impersonate: str, current_ua: str) -> str:
     """根据 impersonate 名生成匹配的 UA。"""
     entry = _ALL_IMPERSONATES.get(impersonate)

@@ -4,7 +4,7 @@ import { useRouter } from 'vue-router'
 import { storeToRefs } from 'pinia'
 import { ElMessage } from 'element-plus'
 import { autoStart, autoPause, autoResume, autoStop } from '@/api/register'
-import { useFormStore } from '@/stores/form'
+import { useFormStore, proxyText } from '@/stores/form'
 import { useProxyStore } from '@/stores/proxy'
 import { useRuntimeStore } from '@/stores/runtime'
 import LogPanel from '@/components/LogPanel.vue'
@@ -35,7 +35,7 @@ const workers = computed(() => Array.isArray(autoStatus.value.workers) ? autoSta
 async function start() {
   try {
     await autoStart({
-      proxy: form.value.proxy.trim(),
+      proxy: proxyText(form.value),
       proxy_pool: proxyStore.text,
       concurrency: parseInt(form.value.autoConcurrency, 10) || 1,
       otp_timeout: parseInt(form.value.otpTimeout, 10) || 10,
