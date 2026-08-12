@@ -320,4 +320,14 @@ WebUI「📱 接码配置」Tab 启用接码后，命中 add-phone 时会自动�
 - **HeroSMS 退款机制**：HeroSMS 购买后 2 分钟内不可取消，取消后 20 分钟自动退款到余额；SmsBower 可立即取消退款。注册机中号码不可用时会立刻换号，HeroSMS 的废号等 20 分钟后自动退回。
 - **OTP validate 失败 → resend 兜底**：phone-otp/validate 401 时会自动 resend 一次再等新码（OpenAI 偶尔拒第一条码但接受第二条）。
 
+## License
 
+本项目采用 **AGPL-3.0** 许可证，完整条款见 [LICENSE](LICENSE)。
+
+- **个人学习和研究**：可自由使用。
+- **商业使用**：需遵守 AGPL-3.0 条款——衍生作品须以相同许可证**开源**，
+  并保留原作者署名和本项目地址 <https://github.com/Regert888/gpt-outlook-register>。
+- **AGPL 特有条款**：通过网络提供服务（例如把本项目的 WebUI 架在服务器上给别人用）
+  同样视为分发，**必须向使用者提供对应的完整源码**。
+
+二次开发欢迎，但请带上出处，谢谢。
