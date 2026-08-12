@@ -23,6 +23,10 @@ export const updateCredentials = (payload) =>
 export const bulkDeleteRegistered = (payload) =>
   http.post('/api/registered/bulk_delete', payload) // { emails } 或 { all: true }
 
+// 导出后清理用：把号池那一行也删掉。
+// 从 accounts.js 转出来一份，省得 Registered.vue 同时 import 两个 api 模块。
+export { bulkDeleteAccounts } from './accounts'
+
 // 批量导出：格式清单由后端 export_formats.py 提供，加格式前端不用改
 export const listExportFormats = () => http.get('/api/registered/export/formats')
 export const exportRegistered = (payload) => http.post('/api/registered/export', payload)

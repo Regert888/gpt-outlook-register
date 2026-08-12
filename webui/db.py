@@ -748,10 +748,19 @@ def list_registered(limit: int = 20, offset: int = 0, filter_rt: str = "all") ->
 
 
 def list_registered_full(limit: int = 5000) -> list[dict]:
-    """返回完整凭证（用于批量导出）。每行同 get_registered 的格式。"""
+    """返回完整凭证（用于批量导出）。每行同 get_registered 的格式，外加 relay_url。
+
+    ⚠️ relay_url（中转取件链接）**不在 registered 表里**，它跟着号池那一行走
+       （outlook_accounts.relay_url，icloud_relay 这类号一号一条 token）。
+       导出格式「邮箱----密码----2FA----取件url」要用它，所以这里 LEFT JOIN 带出来。
+       用 JOIN 而不是给 registered 加列的原因：不用迁移、**已经注册完的老号也能导**
+       （只要号池那行还在）；号池行被删掉就是空串，照约定留空、分隔符保留。
+    """
     con = _conn()
     cur = con.execute(
-        "SELECT * FROM registered ORDER BY created_at DESC LIMIT ?",
+        "SELECT r.*, a.relay_url AS relay_url "
+        "FROM registered r LEFT JOIN outlook_accounts a ON a.email = r.email "
+        "ORDER BY r.created_at DESC LIMIT ?",
         (limit,),
     )
     out = []
@@ -773,6 +782,7 @@ def list_registered_by_emails(emails: list[str]) -> list[dict]:
     - 行序 = created_at 倒序，和「注册结果」表格里看到的一致，方便核对。
     - 查不到的 email 直接不出现（号已被删掉的情况），不报错。
     - SQLite 单条语句变量数有上限（默认 999），所以分批查。
+    - relay_url 从号池表 LEFT JOIN 带出（原因见 list_registered_full）。
     """
     cleaned = [e.strip().lower() for e in (emails or []) if e and e.strip()]
     if not cleaned:
@@ -785,7 +795,9 @@ def list_registered_by_emails(emails: list[str]) -> list[dict]:
         part = cleaned[i:i + CHUNK]
         placeholders = ",".join("?" * len(part))
         cur = con.execute(
-            f"SELECT * FROM registered WHERE email IN ({placeholders})",
+            f"SELECT r.*, a.relay_url AS relay_url "
+            f"FROM registered r LEFT JOIN outlook_accounts a ON a.email = r.email "
+            f"WHERE r.email IN ({placeholders})",
             part,
         )
         for row in cur.fetchall():

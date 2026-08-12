@@ -842,8 +842,12 @@ class AuthFlow:
         if not email:
             logger.warning("Codex 登录推进缺少 email")
             return ""
-        password = (self.result.password or "").strip() or self._default_password_from_email(email)
-        self.result.password = password
+        password, pw_is_real = self._resolve_login_password(email)
+        if pw_is_real:
+            self.result.password = password
+        else:
+            # 猜的密码只拿去碰一下 401，不落进 result（否则会被当成真密码存库/打日志）
+            logger.info("Codex 登录推进：该号无已知密码，用默认规则猜一个试试（多半 401）")
 
         device_id = (self.result.device_id or "").strip() or (self.session.cookies.get("oai-did", "") or "").strip()
         if not device_id:
@@ -2281,10 +2285,47 @@ class AuthFlow:
 
     @staticmethod
     def _default_password_from_email(email: str) -> str:
+        """⚠️ 这是**猜**出来的密码，不是这个号真的密码。
+
+        只在实在拿不到真密码时用来碰一下运气（碰上早期用这个规则建的号）。
+        调用方必须走 _resolve_login_password，别直接调这个 —— 见那边的注释。
+        """
         pwd = (email or "").replace("@", "")
         if len(pwd) < 8:
             pwd = f"{pwd}2026OpenAI"
         return pwd
+
+    def _resolve_login_password(self, email: str) -> tuple[str, bool]:
+        """找出登录这个号该用的密码。返回 (密码, 是否为真密码)。
+
+        真密码三个来源，按优先级：
+            ① self.result.password —— 本轮 register_password 刚设的
+            ② LOGIN_PASSWORD 环境变量 —— 主人手动指定
+            ③ account_callback —— 数据库里存的（**重跑老号全靠这条**）
+        三条都空才退到 _default_password_from_email 猜一个，此时第二个返回值 False。
+
+        ⚠️ 猜出来的密码**绝不能**写回 self.result.password。那个字段有两个下游：
+             · to_dict() → registrar 落库，会把假密码存成这个号的密码；
+             · registrar 异常兜底那行「该号已生成密码，请自行留存」。
+           实测：一个 passwordless 老号（从没设过密码）被打成「邮箱去掉 @」，
+           照着存等于存了个死密码。所以赋值一律由调用方按 is_real 决定。
+        """
+        pwd = (self.result.password or "").strip()
+        if pwd:
+            return pwd, True
+        pwd = (os.getenv("LOGIN_PASSWORD", "") or "").strip()
+        if pwd:
+            return pwd, True
+        if self._account_callback:
+            try:
+                cred = self._account_callback(email) or {}
+                pwd = (cred.get("password") or "").strip()
+                if pwd:
+                    logger.info("已从数据库加载密码")
+                    return pwd, True
+            except Exception as e:
+                logger.warning(f"account_callback 加载密码异常: {e}")
+        return self._default_password_from_email(email), False
 
     @staticmethod
     def _random_password(length: int = 16) -> str:
@@ -3182,19 +3223,11 @@ class AuthFlow:
 
             if page_type == "login_password":
                 logger.info("已有账号进入 login_password 分支，先走密码校验再 OTP")
-                login_password = (os.getenv("LOGIN_PASSWORD", "") or "").strip()
-                if not login_password and self._account_callback:
-                    # 从数据库加载真实密码
-                    try:
-                        cred = self._account_callback(email)
-                        if cred and cred.get("password"):
-                            login_password = cred["password"]
-                            logger.info("已从数据库加载密码")
-                    except Exception as e:
-                        logger.warning(f"account_callback 加载密码异常: {e}")
-                if not login_password:
-                    login_password = self._default_password_from_email(email)
-                self.result.password = login_password
+                login_password, pw_is_real = self._resolve_login_password(email)
+                if pw_is_real:
+                    self.result.password = login_password
+                else:
+                    logger.info("该号无已知密码，用默认规则猜一个试试（多半 401）")
                 login_resp = self.login_password_verify(login_password)
                 login_page_type = self._extract_page_type(login_resp)
                 continue_url = self._normalize_continue_url(
@@ -3459,8 +3492,15 @@ class AuthFlow:
 
         email = email.strip()
         self.result.email = email
-        login_password = (password or "").strip() or self._default_password_from_email(email)
-        self.result.password = login_password
+        login_password = (password or "").strip()
+        if login_password:
+            self.result.password = login_password
+        else:
+            login_password, pw_is_real = self._resolve_login_password(email)
+            if pw_is_real:
+                self.result.password = login_password
+            else:
+                logger.info("协议登录：调用方没给密码、库里也没有，用默认规则猜一个试试")
 
         csrf_token = self.get_csrf_token()
         auth_url = self.get_auth_url(csrf_token, email=email)

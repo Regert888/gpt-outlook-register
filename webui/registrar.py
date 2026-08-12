@@ -228,11 +228,12 @@ def _do_register(
         _tfa_box: dict = {}
 
         def _bind_2fa_hook(_flow, at: str) -> None:
-            if not (getattr(_flow.result, "password", "") or "").strip():
-                logging.getLogger("registrar").warning(
-                    "[register] 勾了 2FA 但该号无密码，跳过绑定"
-                )
-                return
+            # ⚠️ 这里**不查密码**。快路径 bind_totp_2fa_inline 只拿 access_token 打
+            #    mfa_info / enroll / activate，全程不碰密码（two_factor.py:153）。
+            #    以前拿 flow.result.password 当门禁，把**重跑的老号全挡在门外**：
+            #    老号被 OpenAI 认成已有账号 → 本轮不走 register_password →
+            #    内存里密码是空的（真密码在库里，靠下面那段回读补），于是 at 明明齐活
+            #    也绑不上（实测一个重跑的老号：at 长度 1762 齐活，却被跳过）。
             from .two_factor import bind_totp_2fa_inline
             info = bind_totp_2fa_inline(_flow, at)
             if info and info.get("secret"):
@@ -313,6 +314,28 @@ def _do_register(
             d["refresh_token"] = full.get("refresh_token", "")
             d["id_token"] = full.get("id_token", "")
 
+        # ─ 密码回读：必须在 2FA 之前 ─
+        # ⚠️ d 是**本轮内存里**的结果，它不一定知道这个号有密码：
+        #    重跑一个之前设过密码的邮箱时，OpenAI 会认成已有账号 → passwordless_login
+        #    → register_password 根本不执行 → d["password"] 是空的，
+        #    但上一轮 save_password_early 存的密码还在库里。
+        #    两个下游都要它：① 2FA 慢路径要用密码重走 login 链；
+        #    ② 前端 done 事件 `v-if="lastRunResult.password"` 判空会把密码行
+        #       连同两个复制按钮一起藏掉，主人会以为密码丢了。
+        #    以前这段在 2FA **之后**，于是老号在 2FA 眼里永远"无密码"→ 被跳过。
+        #    只在 d 里密码为空时查一次，正常路径零额外开销。
+        if not (d.get("password") or "").strip():
+            try:
+                _saved = db.get_registered(d.get("email") or "")
+                _pw = ((_saved or {}).get("password") or "").strip()
+                if _pw:
+                    d["password"] = _pw
+                    logging.getLogger("registrar").info(
+                        "[register] 本轮未设密码，沿用库中已存密码（上一轮 register_password 留下的）"
+                    )
+            except Exception as e:
+                logging.getLogger("registrar").warning(f"[register] 回读已存密码失败: {e}")
+
         # ─ 可选：绑定 TOTP 2FA（仅用户勾选 want_2fa 时才跑） ─
         #   正常情况上面的 on_session_ready 钩子已经在【Codex 授权之前】绑完了，
         #   这里只是兜底：钩子没跑到（run_register 中途抛异常走 partial 分支、
@@ -324,7 +347,9 @@ def _do_register(
         #     慢 bind_totp_2fa —— 新起 AuthFlow 重走 login 正式链，约 40s + 一次 PoW
         #        + 一封验证码邮件。只在快路径没成时兜底。
         #   失败仅告警、绝不废掉已注册成功的号；secret 一次性下发，成功即随 d 落库+推前端。
-        if options.get("want_2fa") and (d.get("password") or "").strip():
+        #   ⚠️ 入口条件**不查密码**：快路径只要 access_token。密码只是慢路径
+        #      （重走 login 链）的前提，所以判断挪到回落那一步再做。
+        if options.get("want_2fa"):
             _emit_status(run_id, "phase", {"phase": "binding_2fa", "email": d.get("email")})
             try:
                 from .two_factor import bind_totp_2fa, bind_totp_2fa_inline
@@ -333,13 +358,20 @@ def _do_register(
                 if not tinfo:
                     tinfo = bind_totp_2fa_inline(flow, full.get("access_token", ""))
                 if not (tinfo and tinfo.get("secret")):
-                    logging.getLogger("registrar").info(
-                        "[register] 2FA 快路径未成，回落重走登录链..."
-                    )
-                    tinfo = bind_totp_2fa(
-                        cfg, d.get("email", ""), d.get("password", ""),
-                        mail_provider=mail, env_overrides=env_overrides,
-                    )
+                    # 慢路径要拿密码重登一次，没密码就只能到此为止
+                    if (d.get("password") or "").strip():
+                        logging.getLogger("registrar").info(
+                            "[register] 2FA 快路径未成，回落重走登录链..."
+                        )
+                        tinfo = bind_totp_2fa(
+                            cfg, d.get("email", ""), d.get("password", ""),
+                            mail_provider=mail, env_overrides=env_overrides,
+                        )
+                    else:
+                        logging.getLogger("registrar").warning(
+                            "[register] 2FA 快路径未成，且该号无密码（库里也没有），"
+                            "慢路径走不了，跳过绑定"
+                        )
                 if tinfo and tinfo.get("secret"):
                     d["totp_secret"] = tinfo["secret"]
                     d["totp_factor_id"] = tinfo.get("factor_id", "")
@@ -355,33 +387,8 @@ def _do_register(
                 logging.getLogger("registrar").warning(
                     f"[register] 2FA 绑定异常（账号仍有效）: {e}"
                 )
-        elif options.get("want_2fa"):
-            logging.getLogger("registrar").warning(
-                "[register] 勾选了 2FA 但该号无密码，跳过绑定"
-            )
-
-        # 落库
+        # 落库（密码已在 2FA 之前回读补齐，这里 d 里该有的都有了）
         db.save_registered(d)
-        # ⚠️ d 是**本轮内存里**的结果，它不一定知道这个号有密码：
-        #    重跑一个之前设过密码的邮箱时，OpenAI 会认成已有账号 → passwordless_login
-        #    → register_password 根本不执行 → d["password"] 是空的。
-        #    但上一轮 save_password_early 存的密码还在库里，save_registered 刚刚
-        #    已经把它保留下来了（空值不覆盖非空旧值）——「注册结果」页读 DB 显示正确，
-        #    唯独跑完这一刻的 done 事件拿的是 d，前端 `v-if="lastRunResult.password"`
-        #    判空 → 密码行连同「复制密码」「复制 email----password」两个按钮一起消失，
-        #    主人会以为密码又丢了。所以这里从库里回读补回来。
-        #    只在 d 里密码为空时查一次，正常路径零额外开销。
-        if not (d.get("password") or "").strip():
-            try:
-                _saved = db.get_registered(d.get("email") or "")
-                _pw = ((_saved or {}).get("password") or "").strip()
-                if _pw:
-                    d["password"] = _pw
-                    logging.getLogger("registrar").info(
-                        "[register] 本轮未设密码，沿用库中已存密码（上一轮 register_password 留下的）"
-                    )
-            except Exception as e:
-                logging.getLogger("registrar").warning(f"[register] 回读已存密码失败: {e}")
         # 非池化 provider 的 email 是虚拟占位（xxx_placeholder_N@placeholder.local），
         # 号池里根本没这行，不能去 mark。判据用 provider 的 pooled，不写死 kind。
         if is_pooled:

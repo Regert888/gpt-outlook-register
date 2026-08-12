@@ -435,6 +435,11 @@ def api_export_registered(req: ExportRegisteredReq):
         "label": fmt.label,
         "mode": fmt.mode,
         "mime": fmt.mime,
+        # 这一批导出的 email 原样带回去 —— 前端「下载并删除」照着它删，删得准。
+        # ⚠️ 必须由后端给：`all=true` 时前端手里只有当前页那 20 行，
+        #    自己凑列表会漏删；而用 all/status 那种"全清"接口去删号池，
+        #    会把**还没跑过的号**一起清掉。所以这里回传精确列表。
+        "emails": [(r.get("email") or "") for r in rows],
     }
 
     if fmt.mode == "download":

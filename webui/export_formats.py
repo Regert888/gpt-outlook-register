@@ -74,6 +74,22 @@ FORMATS: list[ExportFormat] = [
         ),
         note="secret 仅下发一次，取不回，务必留存",
     ),
+    # 比上面那条多一段中转取件链接。
+    # ⚠️ relay_url 不在 registered 表里，是 db.list_registered_full /
+    #    list_registered_by_emails 从号池表（outlook_accounts）LEFT JOIN 带出来的。
+    #    所以：① 只有 icloud_relay 这类「一号一条取件链接」的号有值；
+    #          ② 号池那行被删掉了就是空 —— 照约定留空、分隔符保留，不跳行。
+    #    链接里嵌着 token，等于这个邮箱的收件权限，导出来的文件请当密码保管。
+    ExportFormat(
+        id="email_pw_2fa_relay",
+        label="邮箱----密码----2FA----取件url",
+        filename="账号密码2FA取件url.txt",
+        render=lambda r: (
+            f'{_s(r, "email")}----{_s(r, "password")}----'
+            f'{_s(r, "totp_secret")}----{_s(r, "relay_url")}'
+        ),
+        note="取件链接含 token，等同收件权限，妥善保管",
+    ),
 ]
 
 _BY_ID = {f.id: f for f in FORMATS}

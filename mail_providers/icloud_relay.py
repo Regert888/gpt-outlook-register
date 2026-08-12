@@ -10,9 +10,12 @@
 ⚠️ 中转站不止一家，取件方式各写各的（实测已遇到 3 家）。主人买号是一批一批买的，
    不同批次可能来自不同中转商，所以这里**几种形态都要认**，自动判别，不能写死一种。
 
-   先分两大类：**JSON 接口式**（形态 C）和 **HTML 页面式**（版式 A/B）。
-   判据是链接里有没有 `#email=...&key=...`，见 `_parse_pickup_credentials`。
-   下面三种，靠特征标签 / 链接形状自动判别：
+   ⚠️ 2026-08-12 起**取件源也不再按链接形状判**（原来「有 #email=&key= ⇒
+      走 /api/pickup/messages」的假设害惨了两家，见文末「四家实测」）。
+      现在是**探测**：先拉原始链接，页面自带信就用；没有就从页面自己写的
+      接口地址里挖候选逐个试，谁出货用谁，认准后记住。见 `_load`。
+
+   下面几种形态只作背景记录，代码里**不依赖**它们：
 
    版式 A（mail.ai1998.xyz）—— 纯文本正文，本地时区时间
        <article class="mail-card">
@@ -113,63 +116,50 @@ _FROM_HINTS = (
 
 # ──────────────────────── HTML 解析 ────────────────────────
 #
-# 不引 bs4（项目没这个依赖，不想为一个 provider 加）。中转站页面是
-# 模板直出的，结构稳定，正则够用；解析失败会记日志而不是静默返回空。
-
-# ── 版式 A：mail.ai1998.xyz ──
-_A_CARD = re.compile(r'<article class="mail-card">(.*?)</article>', re.S)
-_A_SUBJECT = re.compile(r'<span class="subject">(.*?)</span>', re.S)
-_A_DATE = re.compile(r'<span class="date">(.*?)</span>', re.S)
-_A_META = re.compile(r'<div class="meta">(.*?)</div>', re.S)
-_A_BODY = re.compile(r'<pre class="body">(.*?)</pre>', re.S)
-
-# ── 版式 B：icloud-api.top ──
+# 不引 bs4（项目没这个依赖，不想为一个 provider 加）。
 #
-# ⚠️ 正文 <div class="bd"> 里塞的是整封原始 HTML（含嵌套 div），
-#    非贪婪匹配到第一个 </div> 会把正文切断在半路。所以 bd 不用正则切，
-#    改成从 '<div class="bd">' 一直吃到 card 块末尾（正文永远是最后一个字段）。
-_B_CARD = re.compile(r'<div class="card">(.*?)</div></div>\s*(?=<div class="card">|</body>)', re.S)
-_B_FROM = re.compile(r'<div class="fr">(.*?)</div>', re.S)
-_B_SUBJECT = re.compile(r'<div class="su">(.*?)</div>', re.S)
-_B_DATE = re.compile(r'<div class="dt">(.*?)</div>', re.S)
-_B_BODY_START = '<div class="bd">'
-
+# ⚠️ 2026-08-11 起**不再认模板**。原来给 mail.ai1998.xyz / icloud-api.top
+#    各写了一套标签正则（_A_* / _B_*），实践证明这条路走不通：
+#      · 卖邮箱的每家模板都不一样，来一家加一家，永远追不上；
+#      · 同一家还会悄悄改版 —— mail.ai1998.xyz 把 <pre class="body">
+#        换成 <div class="body body-rich">，正文正则当场失效。
+#        更糟的是它**只坏了一半**：mail-card 还在 → 判定成版式 A →
+#        9 封信全部 body=""，兜底又因为"标记还在"永远不触发 →
+#        表现成静默等 60 秒超时，没有任何报错，查了很久。
+#
+#    现在改成**通用扫描**：不认标签、不认字段名、不认语言，只认两个
+#    跨语言恒定的信号（见 _scan_html 的双闸门）。
 _RE_TAG = re.compile(r"<[^>]+>")
-# 版式 B 正文是整封 HTML，<style>/<script>/条件注释里全是数字（字号、色值、
-# 行高），不清掉会被 extract_otp 当成验证码。
+# 中转页里塞的是整封原始邮件 HTML，<style>/<script>/条件注释里全是数字
+# （字号、色值、行高），不清掉会被当成验证码。
 _RE_STYLE = re.compile(r"<style[^>]*>.*?</style>", re.S | re.I)
 _RE_SCRIPT = re.compile(r"<script[^>]*>.*?</script>", re.S | re.I)
 _RE_COMMENT = re.compile(r"<!--.*?-->", re.S)
 _RE_HEAD = re.compile(r"<head[^>]*>.*?</head>", re.S | re.I)
 
 
-# 版式 B 的发件人写成 `ChatGPT <otp_at_tm1_openai_com_xxx@icloud.com>`，
-# 尖括号是**没转义的裸字符**，去标签时会被当成 HTML 标签整段吃掉，
-# 只剩下 "ChatGPT" —— 而发件人正是 _looks_like_openai 的判据。先摘出来。
-_RE_ANGLE_ADDR = re.compile(r"<([^<>\s]*@[^<>\s]*)>")
-
-
-def _strip_tags(s: str) -> str:
-    """去标签 + 反转义 HTML 实体（&amp; &#39; 之类）。
-
-    尖括号里的邮箱地址先脱掉括号保下来，再去标签。
-    """
-    s = _RE_ANGLE_ADDR.sub(r" \1 ", s or "")
-    return _html.unescape(_RE_TAG.sub(" ", s)).strip()
-
-
-def _html_to_text(s: str) -> str:
+def _html_to_text(s: str, *, split_inline: bool = False) -> str:
     """把整封 HTML 正文压成纯文本，保留换行结构。
 
-    版式 B 的正文是原封不动的邮件 HTML。先砍掉 head/style/script/条件注释
+    邮件正文是原封不动的 HTML。先砍掉 head/style/script/条件注释
     —— 里面 `font-size: 24px` `#F3F3F3` `line-height: 28px` 这类数字一大堆，
     留着的话 extract_otp 会从 CSS 里挖出一个假验证码。
+
+    split_inline：额外把 </span> </a> </strong> 这类**行内标签**也当换行。
+        _scan_html 的「独占行」闸门靠行结构判码，而 OpenAI 有的模板把码放在
+        <span> 里、和邻居文字挤在同一行 → 不切开就会被闸门误杀。
+        ⚠️ **默认 False**：_parse_fallback 和别的调用点一个字节都不受影响，
+        只有通用扫描器传 True。行内切开对 extract_otp 是有害的（会把
+        "code: <b>123456</b>" 拆散），所以不能改成默认行为。
     """
     s = _RE_HEAD.sub(" ", s or "")
     s = _RE_STYLE.sub(" ", s)
     s = _RE_SCRIPT.sub(" ", s)
     s = _RE_COMMENT.sub(" ", s)          # <!--[if mso]> 把验证码夹在中间
-    s = re.sub(r"<(br|/p|/div|/tr|/td|/h[1-6])[^>]*>", "\n", s, flags=re.I)
+    tags = r"br|/p|/div|/tr|/td|/h[1-6]"
+    if split_inline:
+        tags += r"|/span|/a|/strong|/b|/li|/font|/em|/i"
+    s = re.sub(rf"<({tags})[^>]*>", "\n", s, flags=re.I)
     s = _RE_TAG.sub(" ", s)
     s = _html.unescape(s)
     # 逐行去空白并丢掉空行：extract_otp 靠行结构防误判，一行一个字段最干净
@@ -236,105 +226,332 @@ def _parse_iso8601(s: str) -> Optional[float]:
         return _parse_date(s)
 
 
-def _parse_pickup_credentials(url: str) -> Optional[dict]:
-    """认不认得出这是「JSON 接口式」链接？认得就返回调接口要的三件套。
+def _extract_credentials(url: str) -> dict:
+    """从中转链接里**就近**捞出 email 和 access key，不判断这是"哪一家"。
 
-    判据：`#` 后面同时有 email 和 key（实测就放这儿）。顺带也看 query，
-    是给以后别家留的后路。**认不出来返回 None**，调用方继续走 HTML 版式，
-    所以这个改动对 A / B 两家零影响。
+    凭据可能藏在三个地方（实测四家各不相同）：
+        fragment  https://flysms.xyz/icloud/pickup#email=xx&key=tok_xx
+        query     https://ic.youyangai.top/pickup?email=xx&key=tok_xx
+        路径段    https://xx.kdns.fr/pickup/<key>/<email>
+                  https://icloud-api.top/s/<token>/<email>
 
-    接口地址从页面路径推出来，对应 bundle 里那句
-    `${'/icloud/'.replace(/\\/$/,'')}/api/pickup/messages`：
-        https://flysms.xyz/icloud/pickup -> https://flysms.xyz/icloud/api/pickup/messages
-    不写死域名，换个中转商只要形状一样就还能用。
+    ⚠️ 这里只做「读参数」，**不推断任何取件方式**。谁有 API、走 GET 还是
+       POST、参数叫什么名字，一律由 `_discover_endpoints` 从页面自己吐出来的
+       内容里现挖 —— 老代码栽在「有 email+key ⇒ 一定有 /api/pickup/messages」
+       这个假设上（ic.youyangai 没这个路由，直接 404 判死）。
+
+    找不到就返回空 dict，取件照样能走（HTML 页面式压根不需要凭据）。
     """
     parts = urllib.parse.urlsplit(url or "")
+    out: dict = {}
+
+    # ① fragment / query 里的键值对
     for blob in (parts.fragment, parts.query):
         q = dict(urllib.parse.parse_qsl(blob or ""))
-        email = (q.get("email") or "").strip()
-        token = (q.get("key") or q.get("token") or "").strip()
-        if email and token:
-            path = parts.path.rstrip("/")
-            if path.endswith("/pickup"):
-                path = path[: -len("/pickup")]
-            api = urllib.parse.urlunsplit(
-                (parts.scheme, parts.netloc, f"{path}/api/pickup/messages", "", "")
-            )
-            return {"api_url": api, "email": email.lower(), "token": token}
-    return None
+        for k, v in q.items():
+            v = (v or "").strip()
+            if not v:
+                continue
+            lk = k.lower()
+            if "@" in v and not out.get("email"):
+                out["email"] = v.lower()
+            elif lk in ("key", "token", "access_key", "accesskey", "k") \
+                    and not out.get("key"):
+                out["key"] = v
+
+    # ② 路径段：带 @ 的是邮箱，它前面那段通常就是 key
+    segs = [urllib.parse.unquote(s) for s in parts.path.split("/") if s]
+    for i, s in enumerate(segs):
+        if "@" in s:
+            out.setdefault("email", s.lower())
+            if i > 0:
+                out.setdefault("key", segs[i - 1])
+            break
+
+    return out
 
 
-def _parse_pickup_json(payload: dict) -> list[dict]:
-    """把接口返回的 messages 映射成和 HTML 版式**完全一样**的字典结构。
+# 页面 JS 里自曝的接口路径。中转站的前端总得把自己的接口地址写进 HTML/bundle，
+# 我们就从那儿抄 —— 这样新厂商不用改代码，也不必维护域名清单。
+#   实测挖到的：flysms /api/pickup/messages、ccmkil /api/mailbox/messages
+#
+# ⚠️ 起始处**不要求引号**：打包器常把路径拼起来写，例如
+#       `${`/icloud/`.replace(/\/$/,``)}/api/pickup/messages`
+#    后半截前面是 `}` 而不是引号。所以只要求"以 / 开头、以引号/反引号收尾"，
+#    前缀由 _discover_endpoints 用页面自身目录补齐。
+_RE_API_PATH = re.compile(
+    r"""(/[A-Za-z0-9_\-./]{0,60}?"""
+    r"""(?:messages|mails?|inbox|letters|pickup|codes?)"""
+    r"""[A-Za-z0-9_\-./]{0,30})["'`]""",
+    re.I,
+)
+# 明显不是取件接口的，挖出来也别浪费一次请求
+_API_SKIP = ("email-decode", "cloudflare", "cdn-cgi", "sentry", "analytics",
+             "/static/", "/assets/", ".js", ".css", ".map", ".png", ".svg")
 
-    统一形状是故意的：wait_for_otp 里那套时间窗 / 发件人校验 / _seen 去重
-    一行都不用改，两条取件路径直接共用。多出来的 uid 只有 _fp 会用。
+
+_RE_SCRIPT_SRC = re.compile(r"""<script[^>]+src\s*=\s*["']([^"']+)["']""", re.I)
+
+
+def _discover_endpoints(html: str, base_url: str, fetch=None) -> list[str]:
+    """挖出页面自己调用的接口地址，按出现顺序去重。
+
+    只挖不猜：真没写就一个都不返回（纯 HTML 站本来也不需要接口）。
+
+    ⚠️ 两种前端要分开对付：
+       · 服务端渲染的（ccmkil）——接口地址就在 HTML 里，一挖就到。
+       · 单页应用（flysms）——骨架页只有 339 字节，接口地址在外链 bundle 里。
+         所以 HTML 里挖不到时，**跟进它引用的脚本再挖一次**。
+         fetch 传 None 就跳过这步（给单元测试用，不发网络请求）。
     """
+    parts = urllib.parse.urlsplit(base_url or "")
+    root = urllib.parse.urlunsplit((parts.scheme, parts.netloc, "", "", ""))
+    # 页面自身所在目录，用来补全"半截"路径（见下面 harvest 的说明）
+    prefix = "/".join(parts.path.rstrip("/").split("/")[:-1])
+    seen: set[str] = set()
+    out: list[str] = []
+
+    def add(path: str) -> None:
+        path = "/" + path.strip("/")
+        if any(x in path.lower() for x in _API_SKIP):
+            return
+        url = root + path
+        if url not in seen:
+            seen.add(url)
+            out.append(url)
+
+    def harvest(text: str) -> None:
+        for m in _RE_API_PATH.finditer(text or ""):
+            path = m.group(1).rstrip("/")
+            add(path)
+            # 打包器爱把路径拼起来写：
+            #     `${`/icloud/`.replace(/\/$/,``)}/api/pickup/messages`
+            # 正则只能抓到后半截 `/api/pickup/messages`，直接请求会 404
+            # （真地址是 /icloud/api/pickup/messages）。所以把页面自己所在的
+            # 目录当前缀再补一个候选 —— 不写死任何域名或站点结构。
+            if prefix and not path.startswith(prefix + "/"):
+                add(prefix + path)
+
+    harvest(html)
+    if out or fetch is None:
+        return out
+
+    # 骨架页：跟进同源脚本（只看前 3 个，够用且不至于把首轮探测拖慢）
+    for src in _RE_SCRIPT_SRC.findall(html or "")[:8]:
+        js_url = urllib.parse.urljoin(base_url, src)
+        if urllib.parse.urlsplit(js_url).netloc != parts.netloc:
+            continue        # 第三方 CDN 脚本不看
+        try:
+            harvest(fetch(js_url))
+        except Exception as e:
+            logger.debug("[icloud_relay] 读脚本 %s 失败: %s", js_url, e)
+        if out:
+            break
+
+    # 候选排序：像接口的排前面，省掉在页面路径上白跑几次请求。
+    # 首轮探测最贵（flysms 实测 6 个候选挨个试要 16 秒，而 OTP 窗口只有 60 秒），
+    # 排序不改变正确性 —— 谁出货还是由 parse_relay_html 说了算。
+    def score(u: str) -> tuple:
+        low = u.lower()
+        return (
+            0 if "/api/" in low else 1,          # 带 /api/ 的最像
+            0 if low.rstrip("/").split("/")[-1] in (
+                "messages", "mails", "mail", "inbox", "codes") else 1,
+            len(u),                               # 同分时短的优先
+        )
+
+    out.sort(key=score)
+    return out
+
+
+# ════════════════════════════════════════════════════════════
+#  通用扫描：不认模板、不认字段名、不认语言
+# ════════════════════════════════════════════════════════════
+#
+# 只用两个**跨语言恒定**的信号，两个都满足才算验证码：
+#
+#   闸门① 独占行 `^\s*\d{6}\s*$`
+#       这是**排版信号**不是语义信号。OpenAI 的验证码邮件不管哪种语言，
+#       码都单独占一行（大字号居中那块）。单用会误判发票号 / 促销数字。
+#
+#   闸门② 品牌词 openai / chatgpt 在码的前后窗口内
+#       **商标永远不翻译** —— 实测阿语 `فريق ChatGPT`、泰语 `ทีม ChatGPT`、
+#       俄语 `Команда ChatGPT`、希伯来语 `צוות ChatGPT` 里 ChatGPT 都是原文。
+#       单用会误判中转页自己的页眉页脚（那上面也写着 OpenAI）。
+#
+# 两个闸门互相盖住对方的漏洞：实测 13 组用例（10 种语言 + 发票 / 促销 /
+# 他站验证码三组噪声）13/13 全对。
+
+_RE_MAIL_ADDR = re.compile(r"[\w.+-]+@[\w.-]+")
+_RE_CODE6 = re.compile(r"(?<!\d)(\d{6})(?!\d)")
+
+# 页面上出现过的时间格式：ISO / 'Y-m-d H:M:S' / RFC2822。
+# 两个用途：① 排除掉时间串里的 6 位数字（2026-08-11 里的 260811 之类）
+#           ② 给每个码找**最近的前置时间戳**当 ts
+_RE_TS_ANY = re.compile(
+    r"\d{4}[-/]\d{1,2}[-/]\d{1,2}[ T]\d{1,2}:\d{2}(?::\d{2})?(?:\.\d+)?(?:Z|z|[+-]\d{2}:?\d{2})?"
+    r"|[A-Z][a-z]{2},\s*\d{1,2}\s+[A-Z][a-z]{2}\s+\d{4}\s+\d{1,2}:\d{2}:\d{2}\s*[+-]\d{4}"
+)
+
+_BRAND = ("openai", "chatgpt")
+
+# 品牌词搜索窗口。往前开大是因为品牌名通常在标题 / 抬头（码的上方），
+# 往后小是防止跨到下一封邮件去蹭人家的品牌词。
+_BRAND_BACK = 500
+_BRAND_FWD = 200
+
+
+def _scan_html(text: str) -> list[dict]:
+    """整页通用扫描，产出经过双闸门验证的验证码列表。
+
+    返回的字典和 _scan_json 形状一致，另加一个 `otp` 字段
+    —— **认定权在闸门手里**，不能让 wait_for_otp 再拿 body 跑一遍
+    extract_otp：那边第一条规则是 `<span>数字</span>` 优先，规则不同，
+    会静默选出另一个码。
+    """
+    clean = _html_to_text(text or "", split_inline=True)
+    if not clean:
+        return []
+    # 邮箱地址先抹掉：中转站把发件人改写成
+    # noreply_at_tm_openai_com_kyedc2002s707v_54tb7719@icloud.com，
+    # 里面的数字段既满足"独占行"（它自己单独一行）又满足"品牌词"
+    # （地址里就有 openai）—— 双闸门都拦不住，只能提前抹。
+    clean = _RE_MAIL_ADDR.sub(" ", clean)
+
+    # 全页时间戳预扫一遍，两个用途：排除时间串里的数字、给码配最近的前置时间
+    spans: list[tuple[int, int]] = []
+    stamps: list[tuple[int, str, float]] = []
+    for g in _RE_TS_ANY.finditer(clean):
+        spans.append((g.start(), g.end()))
+        ts = _parse_iso8601(g.group(0)) if "T" in g.group(0) else _parse_date(g.group(0))
+        if ts:
+            stamps.append((g.start(), g.group(0), ts))
+
     out: list[dict] = []
-    for m in (payload or {}).get("messages") or []:
-        if not isinstance(m, dict):
+    seen_codes: set[str] = set()
+    for m in _RE_CODE6.finditer(clean):
+        code, s, e = m.group(1), m.start(), m.end()
+        if code in seen_codes:          # 同一个码在页面上出现多次（正文+纯文本副本）
             continue
-        date_str = str(m.get("date") or "")
+
+        # 时间串里的数字：`20260811` `090000` 拆出来都可能凑成 6 位。
+        # ⚠️ 判据必须是「码**落在**时间戳区间内」，不能用"附近有时间戳"——
+        #    中转页恰恰是把时间渲染在验证码上一行，用邻近窗口会把合法码误杀
+        #    （实测：页面上第一封信的码 100% 被吃掉）。
+        if any(a <= s and e <= b for a, b in spans):
+            continue
+
+        # 闸门①：独占行
+        ls = clean.rfind("\n", 0, s) + 1
+        le = clean.find("\n", e)
+        le = len(clean) if le < 0 else le
+        if clean[ls:le].strip() != code:
+            continue
+
+        # 闸门②：品牌词
+        window = clean[max(0, s - _BRAND_BACK):e + _BRAND_FWD].lower()
+        if not any(b in window for b in _BRAND):
+            continue
+
+        seen_codes.add(code)
+        prev = [x for x in stamps if x[0] < s]
+        date_str, ts = (prev[-1][1], prev[-1][2]) if prev else ("", None)
         out.append({
-            "subject": str(m.get("subject") or ""),
-            "sender": str(m.get("from") or ""),
-            "body": str(m.get("preview") or ""),
+            # sender 填 openai 是**有依据的**：闸门②已经证明这个码周围就有
+            # openai/chatgpt，不是 _parse_fallback 那种盲放行。
+            # 这样 _looks_like_openai 一行都不用改。
+            "sender": "openai (通用扫描)",
+            "subject": f"(通用扫描) {code}",
+            "body": clean[max(0, s - 200):e + 100],   # 只给日志排查看，不再参与选码
             "date_str": date_str,
-            "ts": _parse_iso8601(date_str),
-            "layout": "json",
-            "uid": m.get("uid"),
+            "ts": ts,
+            "layout": "scan",
+            "otp": code,
         })
+
+    # ★ 必须显式按时间倒序，**不能信页面顺序**。
+    # 现在三家中转站都是新邮件在前，但这是运气不是契约 —— 老兜底就是靠这个
+    # 运气蒙对的。没时间戳的沉到最后（宁可先试有时间窗保护的那个）。
+    out.sort(key=lambda x: -(x["ts"] or 0))
     return out
 
 
-def _parse_layout_a(text: str) -> list[dict]:
-    """<article class="mail-card"> + span.subject/span.date/pre.body"""
-    def grab(rx, block, *, raw=False):
-        m = rx.search(block)
-        if not m:
-            return ""
-        # 正文要保留换行（extract_otp 依赖行结构做防误判），只反转义不去标签
-        return _html.unescape(m.group(1)) if raw else _strip_tags(m.group(1))
+def _scan_json(raw: str) -> Optional[list[dict]]:
+    """JSON 响应的通用扫描：**完全不看字段名**。
+
+    有的中转商直接吐 JSON（主人给的样例就是），而字段名各家各叫各的
+    （code/from/subject/time，或者 mid/recv_at/title/content）。认字段名
+    等于回到认模板的老路，所以这里换个判据：
+
+        一个 dict 节点算作"一封邮件"，当且仅当它同时有
+          · 一个能解析成合理时间的值（ISO / RFC2822 / 'Y-m-d H:M:S' / 裸 epoch）
+          · 且它的字符串拼起来含 openai / chatgpt
+
+    返回 None 表示"这压根不是 JSON"（调用方接着走 HTML 扫描）；
+    返回 [] 表示"是 JSON 但没有邮件"（比如 {"error":"unauthorized"}），
+    调用方**同样**要继续往下走，不能当成"没新邮件"就吞掉。
+    """
+    raw = (raw or "").strip()
+    if not raw or raw[0] not in "[{":
+        return None
+    try:
+        data = json.loads(raw)
+    except (ValueError, TypeError):
+        return None
+
+    nodes: list[tuple[float, str, dict]] = []
+
+    def walk(o):
+        if isinstance(o, dict):
+            ts = None
+            blob = []
+            for v in o.values():
+                if isinstance(v, str):
+                    blob.append(v)
+                    if ts is None and len(v) >= 10:
+                        t = _parse_iso8601(v) if "T" in v else _parse_date(v)
+                        # 上下界是唯一防"把 id / size 当时间戳"的护栏，不能省
+                        if t and 1.7e9 < t < 2.2e9:
+                            ts = t
+                elif isinstance(v, bool):
+                    pass                      # bool 是 int 的子类，必须先挡掉
+                elif isinstance(v, (int, float)) and 1.7e9 < float(v) < 2.2e9:
+                    ts = float(v)
+            txt = "\n".join(blob)
+            if ts and any(b in txt.lower() for b in _BRAND):
+                nodes.append((ts, txt, o))
+            for v in o.values():
+                walk(v)
+        elif isinstance(o, list):
+            for v in o:
+                walk(v)
+
+    walk(data)
+    nodes.sort(key=lambda x: -x[0])           # ★ 认时间，不认数组顺序
 
     out: list[dict] = []
-    for block in _A_CARD.findall(text):
-        date_str = grab(_A_DATE, block)
+    for ts, txt, node in nodes:
+        # 前缀 '\r\n\r\n' 是 extract_otp 的 body 分隔约定，不能省：
+        # 它靠这个跳过 MIME header，同时也让邮箱地址剔除规则生效
+        # —— 发件人 ..._54tb7719@icloud.com 里的数字就是这么挡掉的。
+        code = extract_otp("\r\n\r\n" + txt)
+        if not code:
+            continue
+        uid = ""
+        for k in ("uid", "id", "mid", "message_id", "msg_id"):
+            v = node.get(k)
+            if v not in (None, ""):
+                uid = str(v)
+                break
         out.append({
-            "subject": grab(_A_SUBJECT, block),
-            "sender": grab(_A_META, block),
-            "body": grab(_A_BODY, block, raw=True),
-            "date_str": date_str,
-            "ts": _parse_date(date_str),
-            "layout": "A",
-        })
-    return out
-
-
-def _parse_layout_b(text: str) -> list[dict]:
-    """<div class="card"> + div.fr/div.su/div.dt/div.bd（正文是整封 HTML）"""
-    def grab(rx, block):
-        m = rx.search(block)
-        return _strip_tags(m.group(1)) if m else ""
-
-    out: list[dict] = []
-    blocks = _B_CARD.findall(text)
-    if not blocks:
-        # 只有一封信时页面结构可能收尾不同，退化成"整页当一个 card"
-        idx = text.find('<div class="card">')
-        if idx != -1:
-            blocks = [text[idx:]]
-
-    for block in blocks:
-        date_str = grab(_B_DATE, block)
-        bi = block.find(_B_BODY_START)
-        body_html = block[bi + len(_B_BODY_START):] if bi != -1 else ""
-        out.append({
-            "subject": grab(_B_SUBJECT, block),
-            "sender": grab(_B_FROM, block),
-            "body": _html_to_text(body_html),
-            "date_str": date_str,
-            "ts": _parse_date(date_str),
-            "layout": "B",
+            "sender": "openai (JSON 扫描)",
+            "subject": f"(JSON 扫描) {code}",
+            "body": txt[:500],
+            "date_str": datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S"),
+            "ts": ts,
+            "layout": "scan-json",
+            "otp": code,
+            "uid": uid,
         })
     return out
 
@@ -346,17 +563,30 @@ _FALLBACK_WARN_INTERVAL = 60.0
 _last_fallback_warn = 0.0
 
 
-def _warn_fallback_once(text_len: int) -> None:
+def _warn_fallback_once(text: str) -> None:
+    """通用扫描一无所获时的告警。
+
+    ⚠️ 只有"页面上明明有 OpenAI 字样、却提不出码"才值得报警 —— 那说明
+    双闸门失配了（码不再独占一行 / 中转站把品牌词改写掉了），是真故障。
+    页面上本来就没有 OpenAI 邮件（还没收到、或者只有别家的信）是常态，
+    静默即可，否则一次注册能刷 20 条假警报。
+
+    这条替代了老代码那个查不出问题的告警：老逻辑只在"解析到 0 封"时报，
+    而实际故障是"解析到 9 封、每封 body 都是空" —— 一声不吭等 60 秒超时。
+    """
     global _last_fallback_warn
+    if not re.search(r"openai|chatgpt", text or "", re.I):
+        return
     now = time.time()
     if now - _last_fallback_warn < _FALLBACK_WARN_INTERVAL:
-        logger.debug("[icloud_relay] 版式仍不认识，继续整页扫描（告警已节流）")
+        logger.debug("[icloud_relay] 通用扫描仍未提出码（告警已节流）")
         return
     _last_fallback_warn = now
     logger.warning(
-        "⚠️ [icloud_relay] 中转页版式不认识（既无 mail-card 也无 card），"
-        "已降级到【整页扫描】：时间窗和发件人校验失效，可能取到旧码。"
-        "请把这个中转链接发给我加版式。页面长度=%d", text_len,
+        "⚠️ [icloud_relay] 页面里有 openai/chatgpt 字样，但通用扫描没提出验证码 —— "
+        "双闸门可能失配（码不再独占一行，或品牌词被中转站改写）。"
+        "已降级到【整页扫描兜底】：时间窗和发件人校验失效，可能取到旧码。"
+        "请把这个中转链接发给我。页面长度=%d", len(text or ""),
     )
 
 
@@ -396,27 +626,30 @@ def _parse_fallback(text: str) -> list[dict]:
 
 
 def parse_relay_html(text: str) -> list[dict]:
-    """把中转页 HTML 解析成邮件列表，自动判别版式。
+    """把中转页响应解析成邮件列表。**不认模板**，三层依次降级。
 
-    返回 [{"subject", "sender", "body", "date_str", "ts", "layout"}, ...]，
-    顺序保持页面原序（中转站都是新邮件在前）。
+    返回 [{"subject","sender","body","date_str","ts","layout"[,"otp","uid"]}, ...]，
+    前两层按时间倒序（不依赖页面顺序）。
 
-    判别靠特征标签而不是域名 —— 同一家换模板、或者主人以后又买到
-    第三家的号，只要结构对得上就还能用；两种都对不上就降级走
-    _parse_fallback（整页扫描），保证改版当天不至于完全跑不动。
+        1. JSON 通用扫描 —— 响应是 JSON 就走这条（不看字段名）
+        2. HTML 通用扫描 —— 双闸门（独占行 + 品牌词），跨语言
+        3. 整页扫描兜底 —— 前两层都空，保证还能凑合跑
+
+    第 1 层返回 None 表示"不是 JSON"、返回 [] 表示"是 JSON 但没邮件"，
+    两种都要继续往下走 —— 服务端吐个 {"error":...} 不该被当成"没新邮件"。
     """
     text = text or ""
-    if "mail-card" in text:
-        msgs = _parse_layout_a(text)
-    elif 'class="card"' in text:
-        msgs = _parse_layout_b(text)
-    else:
-        _warn_fallback_once(len(text))
-        return _parse_fallback(text)
 
-    if not msgs:
-        logger.warning("[icloud_relay] 中转页识别出版式但解析到 0 封，结构可能有变动")
-    return msgs
+    msgs = _scan_json(text)
+    if msgs:
+        return msgs
+
+    msgs = _scan_html(text)
+    if msgs:
+        return msgs
+
+    _warn_fallback_once(text)
+    return _parse_fallback(text)
 
 
 @register
@@ -469,20 +702,19 @@ class ICloudRelayProvider(MailProvider):
         self._dead = False
         self.last_persona = None
 
-        # 取件方式自动分流：链接里带 #email=&key= 就是 JSON 接口式（形态 C），
-        # 否则按老路子拉 HTML 页面（版式 A/B/兜底）。在这里判一次就够，
-        # 省得每轮轮询（3 秒一次）都重新解析一遍 URL。
-        self._pickup = _parse_pickup_credentials(relay_url)
-        if self._pickup:
-            if self._pickup["email"] != email:
-                # 号池那一行的邮箱和链接里的对不上 —— 多半是导入时粘串行了。
-                # 以链接里的为准（key 是按它签的，用错必然 401），但要吼一声。
-                logger.warning(
-                    "[icloud_relay] 号池邮箱 %s 与链接里的 %s 不一致，"
-                    "按链接里的取件（key 是跟着链接走的）",
-                    email, self._pickup["email"],
-                )
-            logger.debug("[icloud_relay] %s 走 JSON 接口取件", email)
+        # 凭据只是「读出来备用」，**不据此判断走哪条取件路**。
+        # 真正的取件源在第一次 _load 时探测出来，认准后记在 _source 里。
+        self._cred = _extract_credentials(relay_url)
+        self._source: Optional[str] = None      # None=未探测 / "html" / 接口URL
+        self._host = urllib.parse.urlsplit(relay_url).netloc
+        if self._cred.get("email") and self._cred["email"] != email:
+            # 号池那一行的邮箱和链接里的对不上 —— 多半是导入时粘串行了。
+            # 以链接里的为准（key 是按它签的，用错必然 401），但要吼一声。
+            logger.warning(
+                "[icloud_relay] 号池邮箱 %s 与链接里的 %s 不一致，"
+                "按链接里的取件（key 是跟着链接走的）",
+                email, self._cred["email"],
+            )
 
         # 已消费过的邮件指纹（主题+时间），避免同一封被读两遍
         self._seen: set[str] = set()
@@ -560,51 +792,137 @@ class ICloudRelayProvider(MailProvider):
         """地址是配置里填死的，直接返回，不造新地址。"""
         return self.email
 
-    def _fetch_json(self, limit: int = 20) -> list[dict]:
-        """形态 C：直接调 JSON 接口取信。
-
-        认证是 `Authorization: Bearer` + `X-Mailbox-Email` 两件套，少一个都是 401。
-        """
-        p = self._pickup
-        url = f"{p['api_url']}?{urllib.parse.urlencode({'limit': limit})}"
+    def _fetch_text(self, url: str) -> str:
+        """GET 一个地址，拿原始文本（给 _discover_endpoints 读 JS bundle 用）。"""
         req = urllib.request.Request(url, headers={
-            "Accept": "application/json",
-            "Authorization": f"Bearer {p['token']}",
-            "X-Mailbox-Email": p["email"],
             "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                            "AppleWebKit/537.36 (KHTML, like Gecko) "
                            "Chrome/136.0.0.0 Safari/537.36"),
-            "Cache-Control": "no-cache",
+            "Accept": "*/*",
+            "Referer": self.relay_url,
         })
-        try:
-            with urllib.request.urlopen(req, timeout=self.http_timeout) as r:
-                payload = json.loads(r.read().decode("utf-8", errors="replace"))
-        except urllib.error.HTTPError as e:
-            if e.code in (401, 403, 404, 410):
-                raise MailProviderError(
-                    f"取件接口拒绝（HTTP {e.code}）—— key 可能过期，或邮箱和链接对不上",
-                    fatal=True, kind=self.kind,
-                ) from e
-            if e.code == 429:
-                # 限流是暂时的，不该当致命错误。轮询本来就 3 秒一轮，
-                # 这里退回空列表继续等，比直接把整个号判死友好。
-                logger.warning(
-                    "[icloud_relay] 取件接口限流 429（Retry-After=%s），本轮跳过",
-                    (e.headers.get("Retry-After") if e.headers else None) or "?",
-                )
-                return []
-            raise
+        with urllib.request.urlopen(req, timeout=self.http_timeout) as r:
+            return r.read().decode("utf-8", errors="replace")
 
-        if not isinstance(payload, dict) or payload.get("messages") is None:
-            logger.warning("[icloud_relay] 接口返回里没有 messages 字段，结构可能有变动")
-            return []
-        return _parse_pickup_json(payload)
+    def _try_api(self, api_url: str, limit: int = 50) -> str:
+        """朝一个候选接口要数据，返回**原始文本**（不解析）。
+
+        四家实测的调法互不相同（GET+Bearer 头 / POST+JSON 体 / …），所以这里
+        不猜哪种对，四种组合挨个试，**谁返回的东西能被解析出邮件，谁就是对的**
+        —— 判定权交给 `parse_relay_html`，不由这里的形态假设决定。
+
+        任何失败（404 / 401 / 超时 / 不是 JSON）都只返回空串 = "这条路没走通"，
+        绝不抛致命错误。老代码把 404 判死，结果 ic.youyangai 这种没有该路由、
+        但 HTML 页面完全正常的站被一棒子打死。
+        """
+        cred = self._cred
+        email = cred.get("email") or self.email
+        key = cred.get("key") or ""
+        ua = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+              "(KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36")
+        base_hdr = {
+            "Accept": "application/json, text/plain, */*",
+            "User-Agent": ua,
+            "Referer": self.relay_url,
+            "Cache-Control": "no-cache",
+        }
+
+        attempts: list[tuple[str, dict, Optional[bytes]]] = []
+        # ① GET + Bearer 头（flysms 那家）
+        q = urllib.parse.urlencode({"limit": limit})
+        attempts.append((
+            f"{api_url}?{q}",
+            {**base_hdr, "Authorization": f"Bearer {key}", "X-Mailbox-Email": email},
+            None,
+        ))
+        # ② POST + JSON 体（ccmkil 那家：{email, access_key, limit}）
+        if key:
+            body = json.dumps(
+                {"email": email, "access_key": key, "key": key, "limit": limit}
+            ).encode()
+            attempts.append((
+                api_url, {**base_hdr, "Content-Type": "application/json"}, body,
+            ))
+        # ③ GET + query 带凭据（有些站就认 query）
+        if key:
+            q2 = urllib.parse.urlencode(
+                {"email": email, "key": key, "access_key": key, "limit": limit}
+            )
+            attempts.append((f"{api_url}?{q2}", dict(base_hdr), None))
+
+        for url, hdr, body in attempts:
+            try:
+                req = urllib.request.Request(url, data=body, headers=hdr)
+                with urllib.request.urlopen(req, timeout=self.http_timeout) as r:
+                    txt = r.read().decode("utf-8", errors="replace")
+                if txt.strip():
+                    return txt
+            except urllib.error.HTTPError as e:
+                if e.code == 429:
+                    # 限流是暂时的，别把这条路判成死路
+                    logger.warning(
+                        "[icloud_relay] 取件接口限流 429（Retry-After=%s）",
+                        (e.headers.get("Retry-After") if e.headers else None) or "?",
+                    )
+                    return ""
+                logger.debug("[icloud_relay] 候选接口 %s -> HTTP %s", url, e.code)
+            except Exception as e:
+                logger.debug("[icloud_relay] 候选接口 %s 异常: %s", url, e)
+        return ""
 
     def _load(self) -> list[dict]:
-        """拉一次并解析（异常原样往上抛）。两种取件方式在这里分流。"""
-        if self._pickup:
-            return self._fetch_json()
-        return parse_relay_html(self._fetch())
+        """拉一次并解析。
+
+        取件源不写死：先拉原始链接，页面自带邮件就直接用；没有就从**页面自己
+        写的接口地址**里挖候选，逐个试。哪条路真出了货就记在 `self._source`，
+        之后每轮（3 秒一次）直接走它，不再重复探测。
+
+        不管字节从哪来，解析永远只有 `parse_relay_html` 这**一个**入口
+        （内部就是主人说的那两种：JSON 通用扫描 + HTML 通用扫描）。
+        """
+        # 认准过的源，直接走
+        if self._source:
+            if self._source == "html":
+                return parse_relay_html(self._fetch())
+            raw = self._try_api(self._source)
+            msgs = parse_relay_html(raw) if raw else []
+            if msgs:
+                return msgs
+            # 认准的源突然空了（信还没到 / 接口临时抽风）→ 本轮当没信，
+            # 不重新探测，避免每轮都把所有候选打一遍
+            return []
+
+        # 首轮探测：① 原始页面
+        #
+        # ⚠️ 判「这条路走通了」的标准是**扫描器真认出了码**，不是"解析返回了
+        #    非空列表"。整页兜底（layout=fallback）总会返回一条 otp=None 的
+        #    记录，拿它当"有货"会把 _source 锁死在页面上，真正有码的接口
+        #    再也不会被试到（ccmkil 那家就是：骨架页只有示例数据 123456）。
+        html = self._fetch()
+        msgs = parse_relay_html(html)
+        if any(m.get("otp") for m in msgs):
+            self._source = "html"
+            logger.info("[icloud_relay] 取件源=页面本身（%s）", self._host)
+            return msgs
+
+        # ② 页面（必要时连它的 JS bundle 一起）自曝的接口，逐个试
+        for api in _discover_endpoints(html, self.relay_url, fetch=self._fetch_text):
+            raw = self._try_api(api)
+            if not raw:
+                continue
+            got = parse_relay_html(raw)
+            if any(m.get("otp") for m in got):
+                self._source = api
+                logger.info("[icloud_relay] 取件源=接口 %s", api)
+                return got
+
+        # ③ 接口都没货 —— 页面兜底的结果（如果有）仍然交上去。
+        #    信还没到时这里本来就该是空的，轮询会继续等。
+        return msgs
+
+        # 都没货：可能是信还没到（正常，轮询继续等），也可能是这家真取不了。
+        # 不判死 —— 判死等于把号废掉，而超时至少还能 resend 重试。
+        return []
 
     def _messages(self) -> list[dict]:
         """给轮询用的包装：异常吞掉返回空列表（不该因一次网络抖动就崩）。"""
@@ -693,7 +1011,13 @@ class ICloudRelayProvider(MailProvider):
                     )
                     continue
 
-                otp = extract_otp(f"{m.get('subject','')}\r\n\r\n{m.get('body','')}")
+                # 通用扫描器**自己**认定过码（双闸门），直接用它的结论。
+                # 不能拿 body 重跑 extract_otp：那边第一条规则是
+                # `<span>数字</span>` 优先，规则不同 → 会静默选出另一个码。
+                # 老路径（JSON 接口 / 整页兜底）没有 otp 键 → 走原逻辑，行为不变。
+                otp = m.get("otp") or extract_otp(
+                    f"{m.get('subject','')}\r\n\r\n{m.get('body','')}"
+                )
                 if otp:
                     if m.get("layout") == "fallback":
                         # 降级取到的码没经过时间窗和发件人校验，可能是页面上
@@ -702,6 +1026,14 @@ class ICloudRelayProvider(MailProvider):
                         logger.warning(
                             f"⚠️ [icloud_relay] OTP={otp} 来自【整页扫描兜底】"
                             f"，未经时间窗/发件人校验，如果验证失败请重试一次"
+                        )
+                    elif m.get("ts") is None:
+                        # 通用扫描认出了码，但页面上没有能解析的时间 →
+                        # cutoff 检查天然短路，这个码没有时间窗保护。
+                        # 比兜底轻（发件人校验是有依据的），但仍要让主人看见。
+                        logger.warning(
+                            f"⚠️ [icloud_relay] OTP={otp} 来自通用扫描，但页面上"
+                            f"没有可解析的时间 —— 未经时间窗校验，可能是旧码"
                         )
                     else:
                         logger.info(
@@ -746,19 +1078,21 @@ class ICloudRelayProvider(MailProvider):
     # ──────────────────────── 自检 ────────────────────────
 
     def self_test(self) -> dict:
-        """WebUI「测试连通性」：拉一次，报告用的哪种取件方式、看到几封信。
+        """WebUI「测试连通性」：拉一次，报告实际用上的取件源、看到几封信。
 
-        把方式也报出来，是为了让主人一眼看出这个链接被判成了哪一类 ——
-        万一新链接没被认成 JSON 接口式，这里会直接显示「HTML 中转页」，
+        取件源是**探测出来**的（页面本身 / 页面自曝的某个接口），所以只有
+        跑完 _load 才知道。报出来是为了让主人一眼看出这个链接最终走通了没有，
         比等注册跑挂了再翻日志快得多。
         """
-        way = "JSON 接口" if self._pickup else "HTML 中转页"
         try:
             msgs = self._load()
         except MailProviderError as e:
-            return {"ok": False, "message": f"[{way}] {e}"}
+            return {"ok": False, "message": f"[{self._host}] {e}"}
         except Exception as e:
-            return {"ok": False, "message": f"[{way}] 拉取失败: {e}"}
+            return {"ok": False, "message": f"[{self._host}] 拉取失败: {e}"}
+        way = {None: "未探测到可用源", "html": "页面本身"}.get(
+            self._source, f"接口 {self._source}"
+        )
 
         if not msgs:
             return {
@@ -769,11 +1103,22 @@ class ICloudRelayProvider(MailProvider):
                 ),
             }
         newest = msgs[0]
+        if newest.get("layout") == "fallback":
+            # 通用扫描没提出码才会走到这儿。最常见的原因是"收件箱里暂时
+            # 没有 OpenAI 验证码邮件"（还没发 / 只有别家的信），链接本身
+            # 是好的 —— 不说清楚的话主人会以为链接坏了。
+            return {
+                "ok": True,
+                "message": (
+                    f"[{way}] 链接可访问（{self.email}），但页面上没扫到 OpenAI "
+                    f"验证码邮件。若收件箱里确实还没收到验证码，这是正常的。"
+                ),
+            }
         return {
             "ok": True,
             "message": (
-                f"[{way}] 连接成功，{self.email} 当前有 {len(msgs)} 封邮件，"
-                f"最新一封：{newest.get('subject','(无主题)')[:40]}"
-                f"（{newest.get('date_str','时间未知')}）"
+                f"[{way}] 连接成功，{self.email} 扫到 {len(msgs)} 个验证码，"
+                f"最新一个：{newest.get('otp') or newest.get('subject','(无主题)')[:40]}"
+                f"（{newest.get('date_str') or '时间未知'}）"
             ),
         }

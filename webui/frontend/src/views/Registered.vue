@@ -4,7 +4,7 @@ import { storeToRefs } from 'pinia'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import {
   listRegistered, getRegistered, deleteRegistered,
-  bulkDeleteRegistered, checkPlus,
+  bulkDeleteRegistered, bulkDeleteAccounts, checkPlus,
   listExportFormats, exportRegistered, updateCredentials,
 } from '@/api/register'
 import { copyText, fmtTime } from '@/api/request'
@@ -18,7 +18,10 @@ const { form } = storeToRefs(useFormStore())
 // 连个输入框都没有，主人在代理池换了密码，这里还在用 localStorage 里的旧值，
 // 结果是 curl:(97) 代理鉴权被拒 → 静默降级直连 → 拿真实 IP 打 chatgpt.com。
 const { list: proxyList } = storeToRefs(useProxyStore())
-const { dataVersion } = storeToRefs(useRuntimeStore())
+const runtime = useRuntimeStore()
+// dataVersion 要走 storeToRefs 才保持响应（watch 用）；bumpData 是 action，直接从
+// store 实例上取 —— storeToRefs 只转 state/getter，把 action 解构出来会丢 this。
+const { dataVersion } = storeToRefs(runtime)
 
 const PAGE_SIZE = 20
 const rows = ref([])
@@ -91,8 +94,16 @@ async function doCheck(mode) {
   } finally { checking.value = false }
 }
 
+// customClass 里的 pre-line 让消息里的 \n 真的换行。
+// 不用 dangerouslyUseHTMLString：消息里会拼邮箱、文件名这些数据，走 HTML 等于开 XSS 口子。
 async function confirm(msg) {
-  try { await ElMessageBox.confirm(msg, '确认', { type: 'warning', confirmButtonText: '确定', cancelButtonText: '取消' }); return true }
+  try {
+    await ElMessageBox.confirm(msg, '确认', {
+      type: 'warning', confirmButtonText: '确定', cancelButtonText: '取消',
+      customClass: 'confirm-multiline',
+    })
+    return true
+  }
   catch (_) { return false }
 }
 async function deleteOne(email) {
@@ -124,6 +135,13 @@ const exportText = ref('')
 const exportCount = ref(0)
 const exportFilename = ref('')
 const exportLabel = ref('')
+// 这一批导出的到底是哪些号 —— 「下载并删除」照着它删，来自后端 r.emails。
+// 为什么要后端给、为什么在导出那一刻就存下来：
+//   · 「导出全部」是跨页的，前端手里只有当前页 20 行，自己凑必漏；
+//   · 弹窗开着的时候主人可能改勾选、翻页，后台自动跑号还会插进新号进来，
+//     那时再去读 selected/表格，删的就不是刚下载的那批了。
+const exportedEmails = ref([])
+const deletingExported = ref(false)
 
 const exportBtnText = computed(() =>
   selected.value.length ? `导出选中 (${selected.value.length})` : '导出全部',
@@ -144,6 +162,7 @@ async function doExport(fmt) {
   exporting.value = true
   try {
     const r = await exportRegistered(payload)
+    exportedEmails.value = (r.emails || []).filter(Boolean)
     // download 模式（CPA zip / SUB2API json）：不弹预览，直接落盘
     if (r.mode === 'download') {
       saveBlob(b64ToBytes(r.b64), r.filename, r.mime)
@@ -180,6 +199,59 @@ function saveBlob(data, filename, mime) {
 
 function downloadExport() {
   saveBlob(exportText.value, exportFilename.value, 'text/plain;charset=utf-8')
+}
+
+// ──────────── 下载并删除 ────────────
+// 主人的原话：「不然分不清楚越堆越多」。导出的 txt 里邮箱/密码/2FA/取件url 都齐了，
+// 这两张表就没有留存价值了，一起清掉。
+//
+// ⚠️ 顺序**必须**是「先下载、再确认、最后删」：
+//    删库是不可恢复的，而浏览器下载可能被拦（弹窗拦截 / 用户点了取消 / 磁盘满）。
+//    先把文件落盘再问，主人是在**手里已经有 txt** 的前提下点的确认。
+//    确认框里再报一遍将要删的两张表各多少条，删完之前还有最后一次反悔机会。
+async function downloadAndDelete() {
+  downloadExport()
+
+  const emails = exportedEmails.value
+  if (!emails.length) {
+    ElMessage.warning('这批导出没有拿到 email 列表，只下载不删除')
+    return
+  }
+
+  const ok = await confirm(
+    `已下载 ${exportFilename.value}。\n\n` +
+    `现在删除这 ${emails.length} 个号：\n` +
+    `  · 注册结果（凭证、2FA secret）\n` +
+    `  · 邮箱列表（号池那一行，含取件链接）\n\n` +
+    `删掉后只剩刚下载的 txt 这一份，不可恢复。确定？`,
+  )
+  if (!ok) return
+
+  deletingExported.value = true
+  try {
+    // 两张表分别删。先删注册结果：它是主人真正在看的那张表，
+    // 万一号池那边报错（比如这批号根本不是号池导入的、压根没有对应行），
+    // 至少结果表已经清干净了，不会出现"删了一半还看得见"。
+    const r1 = await bulkDeleteRegistered({ emails })
+    let poolDeleted = 0
+    try {
+      const r2 = await bulkDeleteAccounts({ emails })
+      poolDeleted = r2.deleted || 0
+    } catch (e) {
+      // 号池删失败不算整体失败：凭证已经清掉了，主人该知道的是号池还剩着
+      ElMessage.warning('注册结果已删，但邮箱列表删除失败: ' + e.message)
+    }
+    ElMessage.success(`已删除：注册结果 ${r1.deleted} 条 / 邮箱列表 ${poolDeleted} 条`)
+    exportVisible.value = false
+    exportedEmails.value = []
+    selected.value = []
+    load(true)          // 回第一页：这一批没了，停在旧页码多半是空页
+    runtime.bumpData()  // 通知「邮箱列表」那一页也刷新，否则主人切过去还看得到已删的号
+  } catch (e) {
+    ElMessage.error('删除失败: ' + e.message)
+  } finally {
+    deletingExported.value = false
+  }
 }
 
 // 凭证弹窗
@@ -433,6 +505,16 @@ onActivated(() => load())
           <el-button type="primary" @click="downloadExport">
             <el-icon><Download /></el-icon>下载 {{ exportFilename }}
           </el-button>
+          <!-- 危险动作放最右、danger 色，和左边的纯下载拉开距离，避免手滑。
+               先下载文件、再弹二次确认，确认框里会报清楚要删哪两张表各多少条。 -->
+          <el-button
+            type="danger" plain
+            :loading="deletingExported"
+            :disabled="!exportedEmails.length"
+            @click="downloadAndDelete"
+          >
+            <el-icon><Delete /></el-icon>下载并删除这 {{ exportedEmails.length }} 个号
+          </el-button>
         </template>
       </el-dialog>
 
@@ -509,4 +591,10 @@ onActivated(() => load())
   transition: opacity 0.12s;
 }
 :deep(.cell-copy:hover .ico) { opacity: 0.65; }
+</style>
+
+<!-- 非 scoped：ElMessageBox 是挂到 body 上的，不在本组件的 scope 属性范围内，
+     scoped 样式打不到它。只作用在自家 customClass 上，不会污染别处的确认框。 -->
+<style>
+.confirm-multiline .el-message-box__message { white-space: pre-line; }
 </style>
