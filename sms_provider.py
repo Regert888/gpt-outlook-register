@@ -233,6 +233,7 @@ class SmsBowerProvider(BaseSmsProvider):
         default_service: str = SMS_DEFAULT_SERVICE,
         default_country: str = SMS_DEFAULT_COUNTRY,
         max_price: float = -1,
+        fixed_price: float = -1,
         proxy: Optional[str] = None,
         reuse_phone_to_max: bool = True,
         phone_success_max: int = 3,
@@ -242,6 +243,7 @@ class SmsBowerProvider(BaseSmsProvider):
         self.default_service = str(default_service or SMS_DEFAULT_SERVICE).strip()
         self.default_country = str(default_country or SMS_DEFAULT_COUNTRY).strip()
         self.max_price = float(max_price or -1)
+        self.fixed_price = float(fixed_price or -1)
         self._proxy = (proxy or "").strip() or None
         self._proxies = {"http": self._proxy, "https": self._proxy} if self._proxy else None
         self.reuse_phone_to_max = bool(reuse_phone_to_max)
@@ -476,8 +478,16 @@ class SmsBowerProvider(BaseSmsProvider):
         借鉴 GuJumpgate：每个国家分别试 V2 / V1，而不是内部自动 fallback。
         """
         common = {"action": action, "service": service, "country": country}
-        # 用户配了 max_price 才传，空 / <=0 时根本不传（让平台用默认）
-        if self.max_price > 0:
+        # 固定价格模式：SmsBower 用 minPrice=maxPrice（必须相等），HeroSMS 用 fixedPrice=true
+        if self.fixed_price > 0:
+            if "hero-sms.com" in self.base_url:
+                common["maxPrice"] = self.fixed_price
+                common["fixedPrice"] = "true"
+            else:
+                # SmsBower：minPrice 和 maxPrice 必须相等才能固定价格
+                common["minPrice"] = self.fixed_price
+                common["maxPrice"] = self.fixed_price
+        elif self.max_price > 0:
             common["maxPrice"] = self.max_price
         logger.info("SmsBower %s: service=%s country=%s maxPrice=%s",
                     action, service, country, common.get("maxPrice", "未设置"))
@@ -826,6 +836,7 @@ def create_sms_provider(provider_key: str, config: dict) -> BaseSmsProvider:
     # 也允许调用方显式传 sms_proxy 覆盖（保留扩展点，目前 WebUI 不暴露）。
     proxy = (str(config.get("sms_proxy") or config.get("proxy") or "")).strip() or None
     max_price = _safe_float(config.get("sms_max_price"), -1)
+    fixed_price = _safe_float(config.get("sms_fixed_price"), -1)
     reuse = _safe_bool(config.get("sms_reuse_phone"), False)
     succ_max = max(0, _safe_int(config.get("sms_phone_success_max"), 3))
 
@@ -834,6 +845,7 @@ def create_sms_provider(provider_key: str, config: dict) -> BaseSmsProvider:
                                 default_service=service,
                                 default_country=country or SMS_DEFAULT_COUNTRY,
                                 max_price=max_price,
+                                fixed_price=fixed_price,
                                 proxy=proxy,
                                 reuse_phone_to_max=reuse,
                                 phone_success_max=succ_max)
@@ -843,6 +855,7 @@ def create_sms_provider(provider_key: str, config: dict) -> BaseSmsProvider:
                                 default_service=service,
                                 default_country=country or SMS_DEFAULT_COUNTRY,
                                 max_price=max_price,
+                                fixed_price=fixed_price,
                                 proxy=proxy,
                                 reuse_phone_to_max=reuse,
                                 phone_success_max=succ_max)

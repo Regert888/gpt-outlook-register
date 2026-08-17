@@ -549,6 +549,7 @@ class SaveSmsConfigReq(BaseModel):
     sms_country: Optional[str] = None              # ID 或国家代码（'52' / 'th'）
     sms_service: Optional[str] = None              # OpenAI = 'dr'
     sms_max_price: Optional[str] = None
+    sms_fixed_price: Optional[str] = None
     sms_reuse_phone: Optional[str] = None
     sms_phone_success_max: Optional[str] = None
     sms_auto_country: Optional[str] = None

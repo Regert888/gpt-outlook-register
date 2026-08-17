@@ -238,6 +238,26 @@ def _do_register(
             info = bind_totp_2fa_inline(_flow, at)
             if info and info.get("secret"):
                 _tfa_box.update(info)
+                # ★ 一拿到 secret 立刻落盘，别等后面 Codex 授权 + 接码那几分钟。
+                #   接码太久用户一关进程，_tfa_box 内存里的 secret 就永久没了，
+                #   而 secret 一次性下发、服务端取不回（跟 _save_password_early 同理）。
+                #   ⚠️ 必须用【真正的注册邮箱】flow.result.email，绝不能用外层 email：
+                #      非池化 provider（CF 等）外层 email 是占位符
+                #      xxx_placeholder_N@placeholder.local，用它落盘会跟后面 save_registered
+                #      的真实邮箱对不上 —— 库里凭空多出一条占位垃圾行（两行）。
+                #      run_register 一开头就设了 result.email（auth_flow.py:3102），
+                #      走到这个钩子时它必然已是真实邮箱；取不到再退回外层 email 兜底。
+                #   这里绝不能拖垮注册，包一层 try：落盘失败也还有 _tfa_box 兜着。
+                try:
+                    real_email = getattr(getattr(_flow, "result", None), "email", "") or email
+                    db.save_totp_early(real_email, info["secret"], info.get("factor_id", ""))
+                    logging.getLogger("registrar").info(
+                        f"[register] 2FA secret 已早落盘 email={real_email}"
+                    )
+                except Exception as e:
+                    logging.getLogger("registrar").warning(
+                        f"[register] 2FA secret 早落盘失败（内存仍保留）: {e}"
+                    )
 
         def _account_callback_for_flow(email: str) -> dict:
             """从数据库加载账号凭证（密码和 totp_secret）供 AuthFlow 登录时使用。

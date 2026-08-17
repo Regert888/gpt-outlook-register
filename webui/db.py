@@ -592,6 +592,49 @@ def save_password_early(email: str, password: str) -> None:
         con.commit()
 
 
+def save_totp_early(email: str, secret: str, factor_id: str = "") -> None:
+    """2FA secret 一从 enroll 响应拿到就落盘，不等整个注册流程跑完。
+
+    由 registrar 的 _bind_2fa_hook 触发（钩子在「拿到 session」和「Codex 授权 /
+    绑手机号接码」之间调 bind_totp_2fa_inline，成功即拿到 secret）。
+
+    ⚠️ 早落盘的理由和 save_password_early 一模一样、甚至更急：
+       secret 绑成之后，流程还要走 Codex 授权 + add-phone 接码（可能好几分钟），
+       这段时间 secret 只活在 registrar 内存的 _tfa_box 里。接码太久用户一关进程，
+       secret 就永久蒸发 —— 而它【一次性下发、服务端取不回】，丢了该号 2FA 锁死。
+       所以一拿到手就先写库，后面接码怎么中断都不怕。
+
+    只写 totp 两列；token / 密码留给后续 save_registered 用同一 email 主键补齐。
+    ⚠️ 行已存在时**只 UPDATE totp 两列**，绝不动已有的密码 / token
+       —— 重跑老号时不能把人家已存的凭证清空。
+    """
+    email = (email or "").strip().lower()
+    secret = (secret or "").strip()
+    if not email or not secret:
+        return
+    factor_id = (factor_id or "").strip()
+    with _lock:
+        con = _conn()
+        con.execute(
+            "INSERT INTO registered "
+            "(email, password, access_token, session_token, refresh_token, "
+            "id_token, device_id, csrf_token, cookie_header, "
+            "totp_secret, totp_factor_id, extra_json, created_at) "
+            "VALUES (?, '', '', '', '', '', '', '', '', ?, ?, ?, ?) "
+            "ON CONFLICT(email) DO UPDATE SET "
+            "totp_secret=excluded.totp_secret, "
+            "totp_factor_id=excluded.totp_factor_id",
+            (
+                email,
+                secret,
+                factor_id,
+                json.dumps({"pending": True}, ensure_ascii=False),
+                time.time(),
+            ),
+        )
+        con.commit()
+
+
 def normalize_totp_secret(raw: str) -> str:
     """把用户手填的 TOTP secret 规范化成可用的 base32，非法值抛 ValueError。
 
@@ -1013,6 +1056,7 @@ def get_sms_config() -> dict:
         "sms_country":             get_setting("sms_country", "52"),
         "sms_service":             get_setting("sms_service", "dr"),
         "sms_max_price":           get_setting("sms_max_price", ""),
+        "sms_fixed_price":         get_setting("sms_fixed_price", ""),
         "sms_reuse_phone":         get_setting("sms_reuse_phone", "0"),
         "sms_phone_success_max":   get_setting("sms_phone_success_max", "3"),
         "sms_auto_country":        get_setting("sms_auto_country", "0"),
@@ -1036,7 +1080,7 @@ def save_sms_config(data: dict) -> None:
         set_setting("sms_provider", p)
     # 字符串字段直接落
     for key in (
-        "sms_country", "sms_service", "sms_max_price",
+        "sms_country", "sms_service", "sms_max_price", "sms_fixed_price",
         "sms_phone_success_max", "sms_auto_min_stock", "sms_auto_max_price",
         "sms_max_phone_attempts", "sms_per_phone_timeout",
         "sms_allowed_countries",
@@ -1066,6 +1110,7 @@ def get_sms_internal_config() -> dict:
         "sms_country":             get_setting("sms_country", "52"),
         "sms_service":             get_setting("sms_service", "dr"),
         "sms_max_price":           get_setting("sms_max_price", ""),
+        "sms_fixed_price":         get_setting("sms_fixed_price", ""),
         "sms_reuse_phone":         get_setting("sms_reuse_phone", "0") in ("1", "true"),
         "sms_phone_success_max":   get_setting("sms_phone_success_max", "3"),
         "sms_auto_country":        get_setting("sms_auto_country", "0") in ("1", "true"),
