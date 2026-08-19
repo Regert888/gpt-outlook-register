@@ -192,7 +192,8 @@ def _extract_credentials(url: str) -> dict:
 _RE_API_PATH = re.compile(
     r"""(/[A-Za-z0-9_\-./]{0,60}?"""
     r"""(?:messages|mails?|inbox|letters|pickup|codes?)"""
-    r"""[A-Za-z0-9_\-./]{0,30})["'`]""",
+    r"""[A-Za-z0-9_\-./]{0,30})"""
+    r"""(?:\?[^\s"'`<>]{0,200})?["'`]""",
     re.I,
 )
 # Ignore obvious non-inbox endpoints.
@@ -812,14 +813,20 @@ class ICloudRelayProvider(MailProvider):
             f"(timeout={timeout}s, cutoff={cutoff})"
         )
 
-        # Mark messages present before the run as seen.
+        # Mark messages present before the run as seen. When the caller gives
+        # us the send time, keep dated messages inside that window eligible:
+        # delivery may finish before this first inbox request completes.
+        # Undated messages remain part of the snapshot because their age cannot
+        # be verified safely on a persistent relay account.
         #
         # Capture this snapshot only once. Resend retries reuse the provider;
         # another snapshot would hide codes that arrived during the first wait.
         if not self._snapshot_done:
             try:
                 for m in self._messages():
-                    self._seen.add(self._fp(m))
+                    ts = m.get("ts")
+                    if cutoff is None or ts is None or ts < cutoff:
+                        self._seen.add(self._fp(m))
                 self._snapshot_done = True
                 logger.debug(f"[icloud_relay] Skipped {len(self._seen)} messages from the initial snapshot")
             except MailProviderError:
