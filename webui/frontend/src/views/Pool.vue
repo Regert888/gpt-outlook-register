@@ -26,13 +26,13 @@ const kindFilter = ref('')
 const bulkStatus = ref('')
 const selected = ref([])
 const loading = ref(false)
-// 号池现在可以混放多种邮箱，这两个用来显示「来源」列和按来源过滤
+// The pool can contain multiple email providers. These values drive the Provider column and filter.
 const providers = ref([])
 const byKind = ref({})
 
 const STATUS_TYPE = { available: 'success', in_use: 'warning', done: 'primary', failed: 'danger' }
 
-// 列表里只列池子里真有号的来源，免得下拉框塞一堆空选项
+// List only pooled providers so the filter does not contain empty choices.
 const kindOptions = computed(() =>
   providers.value.filter((p) => p.pooled).map((p) => ({
     kind: p.kind,
@@ -48,7 +48,7 @@ function kindLabel(k) {
 async function loadProviders() {
   try {
     providers.value = (await getMailProviders()).providers || []
-  } catch (_) { /* 拿不到就退化成显示原始 kind 字符串 */ }
+  } catch (_) { /* Fall back to the raw kind string when provider metadata is unavailable. */ }
 }
 
 async function load(resetPage) {
@@ -73,43 +73,43 @@ async function load(resetPage) {
 
 function afterMutate() { load(); statsStore.refresh() }
 
-async function confirm(msg, title = '确认') {
-  try { await ElMessageBox.confirm(msg, title, { type: 'warning', confirmButtonText: '确定', cancelButtonText: '取消' }); return true }
+async function confirm(msg, title = 'Confirm') {
+  try { await ElMessageBox.confirm(msg, title, { type: 'warning', confirmButtonText: 'Confirm', cancelButtonText: 'Cancel' }); return true }
   catch (_) { return false }
 }
 
 async function resetFailedAll() {
-  if (!(await confirm('把所有 failed 号重置为 available？'))) return
-  try { const r = await resetFailed(); ElMessage.success(`重置 ${r.reset} 个`); afterMutate() }
+  if (!(await confirm('Reset all failed accounts to available?'))) return
+  try { const r = await resetFailed(); ElMessage.success(`Reset ${r.reset} accounts`); afterMutate() }
   catch (e) { ElMessage.error(e.message) }
 }
 async function releaseStaleAll() {
-  try { const r = await releaseStale(); ElMessage.success(`释放 ${r.released} 个卡死号`); afterMutate() }
+  try { const r = await releaseStale(); ElMessage.success(`Released ${r.released} stalled accounts`); afterMutate() }
   catch (e) { ElMessage.error(e.message) }
 }
 async function resetSelected() {
   const emails = selected.value.map((r) => r.email)
   if (!emails.length) return
-  if (!(await confirm(`重置选中的 ${emails.length} 个号为 available？（已保存凭证不变）`))) return
-  try { const r = await bulkResetAccounts(emails); ElMessage.success(`已重置 ${r.reset} 个`); afterMutate() }
+  if (!(await confirm(`Reset ${emails.length} selected accounts to available? Saved credentials will not change.`))) return
+  try { const r = await bulkResetAccounts(emails); ElMessage.success(`Reset ${r.reset} accounts`); afterMutate() }
   catch (e) { ElMessage.error(e.message) }
 }
 async function deleteSelected() {
   const emails = selected.value.map((r) => r.email)
   if (!emails.length) return
-  if (!(await confirm(`确定删除选中的 ${emails.length} 个号？(不可恢复)`))) return
-  try { const r = await bulkDeleteAccounts({ emails }); ElMessage.success(`已删除 ${r.deleted} 个`); afterMutate() }
+  if (!(await confirm(`Delete ${emails.length} selected accounts? This cannot be undone.`))) return
+  try { const r = await bulkDeleteAccounts({ emails }); ElMessage.success(`Deleted ${r.deleted} accounts`); afterMutate() }
   catch (e) { ElMessage.error(e.message) }
 }
 async function bulkDeleteByStatus() {
-  if (!bulkStatus.value) { ElMessage.warning('请先选择要删除的状态'); return }
+  if (!bulkStatus.value) { ElMessage.warning('Select a status to delete first'); return }
   const tip = bulkStatus.value === 'all'
-    ? '这会删除邮箱列表里所有号（含未注册的），确定？'
-    : `确定删除全部 ${bulkStatus.value} 状态的号？`
+    ? 'Delete every account in the email pool, including unregistered accounts?'
+    : `Delete all accounts with status ${bulkStatus.value}?`
   if (!(await confirm(tip))) return
   try {
     const r = await bulkDeleteAccounts({ status: bulkStatus.value })
-    ElMessage.success(`已删除 ${r.deleted} 个 ${bulkStatus.value} 号`)
+    ElMessage.success(`Deleted ${r.deleted} ${bulkStatus.value} accounts`)
     bulkStatus.value = ''
     afterMutate()
   } catch (e) { ElMessage.error(e.message) }
@@ -118,13 +118,13 @@ function useAccount(email) {
   router.push({ path: '/register', query: { email } })
 }
 async function resetOne(email) {
-  if (!(await confirm(`重置 ${email} 为 available？`))) return
-  try { await resetAccount(email); ElMessage.success('已重置'); afterMutate() }
+  if (!(await confirm(`Reset ${email} to available?`))) return
+  try { await resetAccount(email); ElMessage.success('Account reset'); afterMutate() }
   catch (e) { ElMessage.error(e.message) }
 }
 async function deleteOne(email) {
-  if (!(await confirm(`删除 ${email}？`))) return
-  try { await deleteAccount(email); ElMessage.success('已删除'); afterMutate() }
+  if (!(await confirm(`Delete ${email}?`))) return
+  try { await deleteAccount(email); ElMessage.success('Account deleted'); afterMutate() }
   catch (e) { ElMessage.error(e.message) }
 }
 
@@ -137,48 +137,48 @@ loadProviders()
   <div class="page">
     <el-card shadow="never">
       <template #header>
-        <span class="section-title" style="margin: 0">邮箱列表</span>
+        <span class="section-title" style="margin: 0">Email Account Pool</span>
       </template>
 
       <el-space wrap style="margin-bottom: 12px">
-        <el-select v-model="statusFilter" placeholder="全部" style="width: 130px" @change="load(true)">
-          <el-option label="全部" value="" />
+        <el-select v-model="statusFilter" placeholder="All statuses" style="width: 130px" @change="load(true)">
+          <el-option label="All statuses" value="" />
           <el-option label="available" value="available" />
           <el-option label="in_use" value="in_use" />
           <el-option label="done" value="done" />
           <el-option label="failed" value="failed" />
         </el-select>
-        <!-- 号池混放多种邮箱时才有意义，只有一种来源就不显示 -->
+        <!-- The provider filter is useful only when the pool contains multiple providers. -->
         <el-select
           v-if="kindOptions.length > 1"
-          v-model="kindFilter" placeholder="全部来源" style="width: 190px" @change="load(true)"
+          v-model="kindFilter" placeholder="All providers" style="width: 190px" @change="load(true)"
         >
-          <el-option label="全部来源" value="" />
+          <el-option label="All providers" value="" />
           <el-option
             v-for="o in kindOptions" :key="o.kind"
             :label="`${o.label} (${o.count})`" :value="o.kind"
           />
         </el-select>
-        <el-button @click="load(false)"><el-icon><Refresh /></el-icon>刷新</el-button>
-        <el-button @click="resetFailedAll">重试 failed</el-button>
-        <el-button @click="releaseStaleAll">释放卡死号</el-button>
+        <el-button @click="load(false)"><el-icon><Refresh /></el-icon>Refresh</el-button>
+        <el-button @click="resetFailedAll">Retry Failed</el-button>
+        <el-button @click="releaseStaleAll">Release Stalled Accounts</el-button>
       </el-space>
 
       <el-space wrap style="margin-bottom: 12px">
         <el-button type="primary" plain :disabled="!selected.length" @click="resetSelected">
-          重置选中 ({{ selected.length }})
+          Reset Selected ({{ selected.length }})
         </el-button>
         <el-button type="danger" plain :disabled="!selected.length" @click="deleteSelected">
-          删除选中 ({{ selected.length }})
+          Delete Selected ({{ selected.length }})
         </el-button>
-        <el-select v-model="bulkStatus" placeholder="— 按状态批量删 —" style="width: 180px">
-          <el-option label="删全部 failed" value="failed" />
-          <el-option label="删全部 done" value="done" />
-          <el-option label="删全部 available" value="available" />
-          <el-option label="删全部 in_use" value="in_use" />
-          <el-option label="删全部（危险）" value="all" />
+        <el-select v-model="bulkStatus" placeholder="Delete by status" style="width: 180px">
+          <el-option label="Delete all failed" value="failed" />
+          <el-option label="Delete all done" value="done" />
+          <el-option label="Delete all available" value="available" />
+          <el-option label="Delete all in_use" value="in_use" />
+          <el-option label="Delete everything (dangerous)" value="all" />
         </el-select>
-        <el-button @click="bulkDeleteByStatus">执行</el-button>
+        <el-button @click="bulkDeleteByStatus">Apply</el-button>
       </el-space>
 
       <el-skeleton v-if="loading && !rows.length" :rows="6" animated style="padding: 8px 0" />
@@ -188,30 +188,30 @@ loadProviders()
         @selection-change="(v) => (selected = v)"
       >
         <el-table-column type="selection" width="44" />
-        <el-table-column prop="email" label="邮箱" min-width="220" show-overflow-tooltip />
-        <el-table-column v-if="kindOptions.length > 1" label="来源" width="130">
+        <el-table-column prop="email" label="Email" min-width="220" show-overflow-tooltip />
+        <el-table-column v-if="kindOptions.length > 1" label="Provider" width="130">
           <template #default="{ row }">
             <el-tag size="small" type="info">{{ kindLabel(row.kind) }}</el-tag>
           </template>
         </el-table-column>
-        <el-table-column label="状态" width="110">
+        <el-table-column label="Status" width="110">
           <template #default="{ row }">
             <StatusDot :type="STATUS_TYPE[row.status] || 'info'" :text="row.status" />
           </template>
         </el-table-column>
-        <el-table-column prop="fail_reason" label="失败原因" min-width="180" show-overflow-tooltip />
-        <el-table-column label="操作" width="220" fixed="right">
+        <el-table-column prop="fail_reason" label="Failure reason" min-width="180" show-overflow-tooltip />
+        <el-table-column label="Actions" width="220" fixed="right">
           <template #default="{ row }">
-            <el-button size="small" text @click="useAccount(row.email)">使用</el-button>
+            <el-button size="small" text @click="useAccount(row.email)">Use</el-button>
             <el-button
               v-if="row.status === 'done' || row.status === 'failed'"
               size="small" text type="primary" @click="resetOne(row.email)"
-            >重置</el-button>
-            <el-button size="small" text type="danger" @click="deleteOne(row.email)">删除</el-button>
+            >Reset</el-button>
+            <el-button size="small" text type="danger" @click="deleteOne(row.email)">Delete</el-button>
           </template>
         </el-table-column>
         <template #empty>
-          <el-empty description="暂无数据，去「导入邮箱」添加接码号" :image-size="70" />
+          <el-empty description="No accounts yet. Add accounts from Import Email Accounts." :image-size="70" />
         </template>
       </el-table>
 

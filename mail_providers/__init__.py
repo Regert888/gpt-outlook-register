@@ -1,19 +1,20 @@
-"""邮箱 Provider 包 —— 加新邮箱只改这个目录。
+"""Mail provider package: add new providers only in this directory.
 
-用法（registrar / app / auto_loop 的唯一入口）：
+This is the only entry point used by registrar, app, and auto_loop::
 
     from mail_providers import create_mail_provider, list_providers
 
     mail = create_mail_provider("outlook", settings, account)
     mail = create_mail_provider("cf_temp", settings)
 
-加一种新邮箱：
+To add a new mail provider:
 
-    1. 新建 mail_providers/xxx.py，继承 MailProvider，实现
+    1. Create mail_providers/xxx.py, inherit MailProvider, and implement
        create_mailbox() / wait_for_otp() / from_config()
-    2. 在本文件底部的「注册区」加一行 import
+    2. Add one import to the registration section at the bottom of this file.
 
-核心库（auth_flow / registrar / db / app / auto_loop）一行不动。
+No core-library changes are required in auth_flow, registrar, db, app, or
+auto_loop.
 """
 from __future__ import annotations
 
@@ -34,8 +35,8 @@ from .base import (  # noqa: F401
 )
 
 # ════════════════════════════════════════════════════════════
-#  注册区 —— 加 provider 在这里加一行 import 即可
-#  （import 时会触发模块内的 @register 装饰器完成注册）
+#  Registration section: add one import here for each provider.
+#  Importing the module triggers its @register decorator.
 # ════════════════════════════════════════════════════════════
 
 from . import outlook        # noqa: F401,E402  kind="outlook"

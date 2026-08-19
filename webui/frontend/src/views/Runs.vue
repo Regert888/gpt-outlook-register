@@ -29,8 +29,8 @@ onActivated(() => load())
     <el-card shadow="never">
       <template #header>
         <div style="display: flex; align-items: center; justify-content: space-between">
-          <span class="section-title" style="margin: 0">运行记录</span>
-          <el-button size="small" @click="load"><el-icon><Refresh /></el-icon>刷新</el-button>
+          <span class="section-title" style="margin: 0">Registration Runs</span>
+          <el-button size="small" @click="load"><el-icon><Refresh /></el-icon>Refresh</el-button>
         </div>
       </template>
       <el-skeleton v-if="loading && !rows.length" :rows="6" animated style="padding: 8px 0" />
@@ -38,18 +38,18 @@ onActivated(() => load())
         <el-table-column prop="run_id" label="run_id" width="180">
           <template #default="{ row }"><span class="mono">{{ row.run_id }}</span></template>
         </el-table-column>
-        <el-table-column prop="email" label="邮箱" min-width="200" show-overflow-tooltip />
-        <el-table-column label="状态" width="100">
+        <el-table-column prop="email" label="Email" min-width="200" show-overflow-tooltip />
+        <el-table-column label="Status" width="100">
           <template #default="{ row }">
             <StatusDot :type="STATUS_TYPE[row.status] || 'info'" :text="row.status" />
           </template>
         </el-table-column>
-        <el-table-column label="开始时间" width="170">
+        <el-table-column label="Started" width="170">
           <template #default="{ row }">{{ fmtTime(row.started_at) }}</template>
         </el-table-column>
-        <el-table-column prop="error" label="错误" min-width="200" show-overflow-tooltip />
+        <el-table-column prop="error" label="Error" min-width="200" show-overflow-tooltip />
         <template #empty>
-          <el-empty description="暂无运行记录" :image-size="70" />
+          <el-empty description="No registration runs yet" :image-size="70" />
         </template>
       </el-table>
     </el-card>

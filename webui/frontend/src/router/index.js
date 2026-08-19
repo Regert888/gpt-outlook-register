@@ -3,73 +3,73 @@ import NProgress from 'nprogress'
 
 NProgress.configure({ showSpinner: false, trickleSpeed: 120, minimum: 0.15 })
 
-// hash 路由：不依赖后端做 SPA 回退，FastAPI / 未来 Gin 都零配置可用。
+// Hash routing avoids requiring an SPA fallback from FastAPI or a future Gin backend.
 const routes = [
   {
     path: '/',
     name: 'dashboard',
     component: () => import('@/views/Dashboard.vue'),
-    meta: { title: '仪表盘', icon: 'Odometer', group: '概览' },
+    meta: { title: 'Dashboard', icon: 'Odometer', group: 'Overview' },
   },
   {
     path: '/import',
     name: 'import',
     component: () => import('@/views/Import.vue'),
-    meta: { title: '导入邮箱', icon: 'Upload', group: '注册' },
+    meta: { title: 'Import mailboxes', icon: 'Upload', group: 'Registration' },
   },
   {
     path: '/register',
     name: 'register',
     component: () => import('@/views/Register.vue'),
-    meta: { title: '单次注册', icon: 'VideoPlay', group: '注册' },
+    meta: { title: 'Single registration', icon: 'VideoPlay', group: 'Registration' },
   },
   {
     path: '/auto',
     name: 'auto',
     component: () => import('@/views/AutoLoop.vue'),
-    meta: { title: '全自动批量', icon: 'MagicStick', group: '注册' },
+    meta: { title: 'Automatic batch', icon: 'MagicStick', group: 'Registration' },
   },
   {
     path: '/proxy',
     name: 'proxy',
     component: () => import('@/views/ProxyPool.vue'),
-    meta: { title: '代理池', icon: 'Connection', group: '注册' },
+    meta: { title: 'Proxy pool', icon: 'Connection', group: 'Registration' },
   },
   {
     path: '/pool',
     name: 'pool',
     component: () => import('@/views/Pool.vue'),
-    meta: { title: '邮箱列表', icon: 'Files', group: '数据' },
+    meta: { title: 'Mailbox pool', icon: 'Files', group: 'Data' },
   },
   {
     path: '/registered',
     name: 'registered',
     component: () => import('@/views/Registered.vue'),
-    meta: { title: '注册结果', icon: 'CircleCheck', group: '数据' },
+    meta: { title: 'Registered accounts', icon: 'CircleCheck', group: 'Data' },
   },
   {
     path: '/runs',
     name: 'runs',
     component: () => import('@/views/Runs.vue'),
-    meta: { title: '运行记录', icon: 'Document', group: '数据' },
+    meta: { title: 'Runs', icon: 'Document', group: 'Data' },
   },
   {
     path: '/settings/mail',
     name: 'mail',
     component: () => import('@/views/MailConfig.vue'),
-    meta: { title: '邮箱配置', icon: 'Message', group: '配置' },
+    meta: { title: 'Mailbox settings', icon: 'Message', group: 'Settings' },
   },
   {
     path: '/settings/sms',
     name: 'sms',
     component: () => import('@/views/SmsConfig.vue'),
-    meta: { title: '接码配置', icon: 'Iphone', group: '配置' },
+    meta: { title: 'SMS settings', icon: 'Iphone', group: 'Settings' },
   },
   {
     path: '/settings/export',
     name: 'export',
     component: () => import('@/views/ExportConfig.vue'),
-    meta: { title: '自动导出', icon: 'Share', group: '配置' },
+    meta: { title: 'Export settings', icon: 'Share', group: 'Settings' },
   },
 ]
 
@@ -78,7 +78,7 @@ const router = createRouter({
   routes,
 })
 
-// 路由切换顶部进度条
+// Top progress bar for route changes.
 router.beforeEach((to, from, next) => {
   NProgress.start()
   if (to.meta?.title) document.title = `${to.meta.title} · Outlook Register`

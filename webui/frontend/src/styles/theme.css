@@ -1,7 +1,7 @@
-/* 企业级白色管理后台主题：中性蓝主色 + 克制留白，支持深色模式 */
+/* Enterprise admin theme with neutral blue accents, restrained spacing, and dark-mode support. */
 
 :root {
-  /* 主色：企业蓝，覆盖 Element Plus primary */
+  /* Brand color: enterprise blue overriding Element Plus primary. */
   --el-color-primary: #2563eb;
   --el-color-primary-light-3: #5b87f0;
   --el-color-primary-light-5: #8aa9f4;
@@ -10,7 +10,7 @@
   --el-color-primary-light-9: #e8f0fd;
   --el-color-primary-dark-2: #1d4fc4;
 
-  /* 自定义变量 */
+  /* Custom variables. */
   --brand: #2563eb;
   --brand-dark: #1d4fc4;
   --app-sidebar-bg: #ffffff;
@@ -18,7 +18,7 @@
   --app-content-bg: #f5f6f8;
   --app-border: var(--el-border-color-light);
   --app-title: var(--el-text-color-primary);
-  /* 日志：中性深色终端风 */
+  /* Log panel: neutral dark terminal style. */
   --app-log-bg: #1e1f22;
   --app-log-text: #d4d4d4;
 }
@@ -46,12 +46,12 @@ body {
   color: var(--el-text-color-primary);
 }
 
-/* 统计卡片 */
+/* Statistic cards. */
 .stat-card { border-radius: 8px; overflow: hidden; }
 .stat-card .stat-value { font-size: 28px; font-weight: 600; line-height: 1.1; }
 .stat-card .stat-label { font-size: 13px; color: var(--el-text-color-secondary); margin-top: 4px; }
 
-/* 实时日志框 */
+/* Live log panel. */
 .log-box {
   background: var(--app-log-bg);
   color: var(--app-log-text);
@@ -71,7 +71,7 @@ body {
 .log-box .line.ok   { color: #6a9955; }
 .log-box .line.evt  { color: #569cd6; }
 
-/* 页面 */
+/* Page layout. */
 .page { padding: 4px; }
 .page .el-card { margin-bottom: 16px; }
 .section-title {
@@ -83,7 +83,7 @@ body {
 .hint { color: var(--el-text-color-secondary); font-size: 12px; line-height: 1.6; }
 .mono { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; }
 
-/* 明文凭证展示（注册完成提示里的密码）：等宽 + 可选中，方便直接框选复制 */
+/* Plaintext credentials in completion notices: monospace and selectable for easy copying. */
 .cred-line { margin-top: 8px; display: flex; align-items: center; gap: 8px; }
 .cred-label { font-size: 12px; color: var(--el-text-color-secondary); }
 .cred-val {
@@ -96,8 +96,8 @@ body {
   word-break: break-all;
 }
 
-/* 批量导出弹窗的文本框：不换行 + 横向滚动，
-   长 access_token 一行就是一行，肉眼数行数 = 账号数，不会被折行骗到 */
+/* Bulk-export text area: preserve one account per line and scroll horizontally
+   so long access tokens do not wrap and obscure the account count. */
 .export-area .el-textarea__inner {
   white-space: pre;
   overflow-x: auto;
@@ -106,6 +106,6 @@ body {
   line-height: 1.65;
 }
 
-/* 路由进度条配色（品牌蓝） */
+/* Route progress bar in the brand color. */
 #nprogress .bar { background: var(--brand); height: 2px; }
 #nprogress .peg { box-shadow: 0 0 10px var(--brand), 0 0 5px var(--brand); }

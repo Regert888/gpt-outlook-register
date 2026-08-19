@@ -1,4 +1,4 @@
-/* 团子喵的粉色清爽风格 ~ */
+/* Light pink interface theme. */
 :root {
   --pink: #ff6fa3;
   --pink-light: #ffe5ef;
@@ -61,7 +61,7 @@ header {
   opacity: 0.6;
 }
 
-/* 顶部告警横幅（熔断 / 严重错误） */
+/* Top alert banner for circuit-breaker and critical errors. */
 .alert-banner {
   background: linear-gradient(135deg, #fce4e4, #fff4e1);
   border-bottom: 2px solid var(--bad);
@@ -189,7 +189,7 @@ button:disabled { opacity: 0.5; cursor: not-allowed; }
 .result.ok { color: var(--ok); }
 .result.bad { color: var(--bad); }
 
-/* 日志框 */
+/* Log panel. */
 .log {
   background: var(--code-bg);
   color: var(--code-text);
@@ -278,7 +278,7 @@ td .status {
 
 td button { padding: 3px 8px; font-size: 11px; margin-right: 4px; }
 
-/* 模态框 */
+/* Modal. */
 .modal {
   position: fixed; inset: 0;
   background: rgba(0,0,0,0.4);
@@ -310,7 +310,7 @@ td button { padding: 3px 8px; font-size: 11px; margin-right: 4px; }
   flex: 1;
 }
 
-/* 凭证模态框：每个字段独立卡片 + 复制按钮 */
+/* Credential modal: one card and copy button per field. */
 .cred-fields {
   padding: 14px 16px;
   overflow: auto;
@@ -357,7 +357,7 @@ td button { padding: 3px 8px; font-size: 11px; margin-right: 4px; }
   word-break: break-all;
 }
 
-/* 行内快捷复制按钮（注册结果表里 access/session/refresh 列） */
+/* Inline copy buttons for access, session, and refresh-token columns. */
 button.copy-cell {
   background: transparent;
   border: 1px dashed var(--border);
@@ -376,7 +376,7 @@ button.copy-cell.copied {
   border-color: var(--done);
 }
 
-/* 注册完成后状态栏的快捷复制按钮 */
+/* Quick-copy buttons in the registration completion status. */
 button.quick-copy {
   background: linear-gradient(135deg, #fff, var(--pink-light));
   border: 1.5px solid var(--pink);
@@ -389,7 +389,7 @@ button.quick-copy {
 button.quick-copy:hover { filter: brightness(1.05); }
 button.quick-copy.copied { background: #e2f0fb; color: var(--done); border-color: var(--done); }
 
-/* Plus 检测按钮 */
+/* Plus eligibility check button. */
 .plus-btn, button.quick-plus {
   background: linear-gradient(135deg, #ffe8d2, #ffcfa3);
   border: 1.5px solid #e8983c;
@@ -398,7 +398,7 @@ button.quick-copy.copied { background: #e2f0fb; color: var(--done); border-color
 }
 .plus-btn:hover, button.quick-plus:hover { filter: brightness(1.05); }
 
-/* Plus 模态框 */
+/* Plus details modal. */
 .plus-body { padding: 16px; overflow: auto; flex: 1; }
 .plus-grid {
   display: grid;
@@ -464,7 +464,7 @@ button.quick-copy.copied { background: #e2f0fb; color: var(--done); border-color
 .weight-medium { color: #ff9800; font-weight: bold; font-size: 10px; }
 .weight-weak { color: var(--muted); font-size: 10px; }
 
-/* Auto-Loop 控制条 */
+/* Automatic-loop controls. */
 .auto-bar {
   display: flex;
   align-items: center;
@@ -539,7 +539,7 @@ button.quick-copy.copied { background: #e2f0fb; color: var(--done); border-color
   color: var(--pink-dark);
 }
 
-/* 命中试用资格时的"立即支付"框 */
+/* Payment box shown when trial eligibility is detected. */
 .pay-box {
   margin: 14px 0;
   padding: 14px;
@@ -593,7 +593,7 @@ button.pay-copy.copied { background: #e2f0fb; color: var(--done); border-color: 
   color: var(--text);
 }
 
-/* probe 探测结果表 */
+/* Probe result table. */
 .probe-table {
   width: 100%;
   font-size: 11px;
@@ -627,7 +627,7 @@ button.pay-copy.copied { background: #e2f0fb; color: var(--done); border-color: 
   overflow: auto;
 }
 
-/* 分页 */
+/* Pagination. */
 .pagination {
   display: flex;
   align-items: center;

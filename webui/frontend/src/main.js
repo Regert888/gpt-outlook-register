@@ -1,13 +1,14 @@
 import { createApp } from 'vue'
 import { createPinia } from 'pinia'
 
-// 保留全量 CSS（保证 ElMessage/ElMessageBox 等程序式组件样式），JS 由 unplugin 按需 tree-shake
+// Keep the full CSS bundle so programmatic components such as ElMessage and
+// ElMessageBox are styled; unplugin tree-shakes JavaScript imports.
 import 'element-plus/dist/index.css'
 import 'element-plus/theme-chalk/dark/css-vars.css'
 import './styles/theme.css'
 import 'nprogress/nprogress.css'
 
-// 只注册实际用到的图标（动态 <component :is="name"> 需要全局注册）
+// Register only icons in use. Dynamic <component :is="name"> values require global registration.
 import {
   Platform, Fold, Expand, Moon, Sunny, User, ArrowDown,
   Odometer, Upload, VideoPlay, MagicStick, Connection, Files,

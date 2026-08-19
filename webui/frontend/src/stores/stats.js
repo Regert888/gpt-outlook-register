@@ -2,7 +2,7 @@ import { defineStore } from 'pinia'
 import { ref } from 'vue'
 import { getStats } from '@/api/accounts'
 
-// 号池统计（总计/可用/进行中/完成/失败），顶栏 + 仪表盘共用，5s 轮询。
+// Account-pool totals shared by the header and dashboard, refreshed every five seconds.
 export const useStatsStore = defineStore('stats', () => {
   const stats = ref({ total: 0, available: 0, in_use: 0, done: 0, failed: 0 })
   let timer = null
@@ -12,7 +12,7 @@ export const useStatsStore = defineStore('stats', () => {
       const { stats: s } = await getStats()
       if (s) stats.value = s
     } catch (e) {
-      // 静默：统计失败不打扰用户
+      // Keep polling failures silent so they do not interrupt the user.
       console.error('stats refresh:', e)
     }
   }

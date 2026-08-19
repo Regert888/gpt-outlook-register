@@ -1,21 +1,16 @@
-"""导出注册凭证到 CPA / SUB2API 面板（路线 2 实现）。
+"""Export registered credentials to CPA and SUB2API panels.
 
-参考 zc-zhangchen/any-auto-register 的 platforms/chatgpt/cpa_upload.py 和 sub2api_upload.py。
+Based on the CPA and SUB2API upload shapes used by any-auto-register.
 
-核心改造：
-  ★ 导出前先用 refresh_token 调 https://auth.openai.com/oauth/token 换新的 Codex
-    风格 access_token（client_id=app_EMoamEEZ73f0CkXaXp7hrann）。
-    主项目 run_register 末尾会用 get_auth_session() 把 Codex access_token 覆盖
-    成 ChatGPT 网页 NextAuth 风格，但 NextAuth 风格的 token 在 CPA/SUB2API 不可用，
-    所以这里单独刷新。
+Before export, exchange refresh_token at the OpenAI OAuth endpoint for a
+Codex-style access token. The main registration flow finishes with a ChatGPT
+NextAuth-style token, which CPA and SUB2API do not accept.
 
-两种导出目标：
-  1. CPA：multipart 文件上传 → POST /v0/management/auth-files
-     Bearer 鉴权，文件名 {email}.json
-  2. SUB2API：直接 POST /api/v1/admin/accounts
-     x-api-key 鉴权（无登录流程）
+Targets:
+  1. CPA multipart POST /v0/management/auth-files with Bearer auth.
+  2. SUB2API JSON POST /api/v1/admin/accounts with x-api-key auth.
 
-全部用 curl_cffi impersonate="chrome110" 模拟浏览器 TLS 指纹，绕过 CF Bot 拦截。
+Requests use curl_cffi browser impersonation for compatible TLS behavior.
 """
 from __future__ import annotations
 
@@ -29,24 +24,24 @@ from typing import Any, Callable, Optional
 
 logger = logging.getLogger(__name__)
 
-# OpenAI / Codex 常量
+# OpenAI and Codex constants.
 OPENAI_TOKEN_ENDPOINT = "https://auth.openai.com/oauth/token"
 CODEX_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
 CODEX_SCOPE = "openid email profile offline_access"
 
-# 默认值
+# Defaults.
 DEFAULT_TIMEOUT = 30
 DEFAULT_SUB2API_GROUP_IDS = [2]
-SUB2API_DEFAULT_EXPIRES_IN = 863999  # 跟 any-auto-register 一致
+SUB2API_DEFAULT_EXPIRES_IN = 863999  # Matches the target integration.
 MAX_ATTEMPTS = 3
 RETRY_DELAYS_S = [3.0, 7.0]
 
 
-# ──────────────────────── 工具函数 ────────────────────────
+# ----------------------------------- Utilities -----------------------------------
 
 
 def _decode_jwt_payload(token: str) -> dict:
-    """解析 JWT payload 段。失败返回 {}。"""
+    """Decode a JWT payload, returning {} on failure."""
     try:
         parts = str(token or "").split(".")
         if len(parts) < 2:
@@ -87,7 +82,7 @@ def _first(*values) -> str:
 
 
 def _parse_group_ids(raw: Any, fallback: list[int] | None = None) -> list[int]:
-    """支持字符串 '1,2'、列表、单值等格式，返回 list[int]。"""
+    """Parse comma-separated, iterable, or scalar group IDs into list[int]."""
     if isinstance(raw, str):
         candidates = [s.strip() for s in raw.split(",")]
     elif isinstance(raw, (list, tuple, set)):
@@ -110,38 +105,39 @@ def _parse_group_ids(raw: Any, fallback: list[int] | None = None) -> list[int]:
 
 
 def _import_cffi():
-    """惰性 import curl_cffi。失败抛 RuntimeError。"""
+    """Import curl_cffi lazily, raising RuntimeError when unavailable."""
     try:
         from curl_cffi import requests as cffi_requests
         return cffi_requests
     except ImportError as e:
-        raise RuntimeError(f"curl_cffi 未安装，无法导出（pip install curl-cffi）: {e}")
+        raise RuntimeError(
+            f"curl_cffi is not installed; export is unavailable "
+            f"(pip install curl-cffi): {e}"
+        )
 
 
 def _import_cffi_mime():
-    """惰性 import CurlMime。"""
+    """Import CurlMime lazily."""
     try:
         from curl_cffi import CurlMime
         return CurlMime
     except ImportError as e:
-        raise RuntimeError(f"curl_cffi CurlMime 不可用: {e}")
+        raise RuntimeError(f"curl_cffi CurlMime is unavailable: {e}")
 
 
-# ──────────────────────── 核心：刷新 Codex access_token ────────────────────────
+# ------------------------------ Refresh Codex token ------------------------------
 
 
 def refresh_codex_token(refresh_token: str, *, timeout: int = DEFAULT_TIMEOUT) -> dict:
-    """用 Codex refresh_token 换一组新的 access_token / id_token / refresh_token(滚动)。
+    """Exchange a Codex refresh token for a rotated token set.
 
-    参考 any-auto-register/platforms/chatgpt/token_refresh.py 风格。
-
-    返回 OpenAI 原始响应 dict：
+    Return the original OpenAI response dictionary:
         {access_token, refresh_token, id_token, expires_in, token_type}
-    失败抛 RuntimeError。
+    Raise RuntimeError on failure.
     """
     rt = str(refresh_token or "").strip()
     if not rt:
-        raise RuntimeError("缺少 refresh_token，无法刷新 Codex access_token")
+        raise RuntimeError("A refresh_token is required to refresh the Codex access token")
 
     cffi = _import_cffi()
     body = {
@@ -174,28 +170,29 @@ def refresh_codex_token(refresh_token: str, *, timeout: int = DEFAULT_TIMEOUT) -
         except Exception:
             pass
         raise RuntimeError(
-            f"OpenAI token 刷新失败 HTTP {resp.status_code}: {body_text}"
+            f"OpenAI token refresh failed with HTTP {resp.status_code}: {body_text}"
         )
 
     try:
         data = resp.json()
     except Exception:
-        raise RuntimeError("OpenAI token 刷新返回非 JSON")
+        raise RuntimeError("OpenAI token refresh returned a non-JSON response")
 
     if not isinstance(data, dict) or not data.get("access_token"):
-        raise RuntimeError(f"OpenAI token 刷新返回无 access_token: {str(data)[:200]}")
+        raise RuntimeError(
+            f"OpenAI token refresh returned no access_token: {str(data)[:200]}"
+        )
 
     return data
 
 
-# ──────────────────────── CPA：生成 token JSON ────────────────────────
+# ------------------------------- Build CPA token JSON -------------------------------
 
 
 def _build_compat_id_token(*, access_token: str, email: str) -> str:
-    """access_token 缺 id_token 时构造一个本地解析用的兼容 token。
+    """Build a locally parseable compatibility token when id_token is absent.
 
-    完全照 any-auto-register/cpa_upload.py:_build_compat_id_token 实现。
-    注意：签名是固定字符串，仅供 CPA 等不校验签名的本地环境解析。
+    The fixed signature is only for local consumers that do not verify it.
     """
     payload = _decode_jwt_payload(access_token)
     if not payload:
@@ -273,14 +270,13 @@ def _build_compat_id_token(*, access_token: str, email: str) -> str:
 
 
 def build_cpa_token_json(cred: dict) -> dict:
-    """生成 CPA `/v0/management/auth-files` 的 multipart 文件内容。
+    """Build the multipart JSON file for CPA `/v0/management/auth-files`.
 
-    严格对齐 any-auto-register/cpa_upload.py:generate_token_json：
-    8 个字段，UTC+8 时区。
+    The eight-field shape and UTC+8 timestamps match the target integration.
     """
     access_token = str(cred.get("access_token") or "").strip()
     if not access_token:
-        raise RuntimeError("未读取到可导入的 access_token")
+        raise RuntimeError("No exportable access_token was found")
     refresh_token = str(cred.get("refresh_token") or "").strip()
     id_token = str(cred.get("id_token") or "").strip()
     email = str(cred.get("email") or "").strip()
@@ -311,21 +307,21 @@ def build_cpa_token_json(cred: dict) -> dict:
     }
 
 
-# ──────────────────────── CPA：上传 ────────────────────────
+# ----------------------------------- CPA upload -----------------------------------
 
 
 def export_to_cpa(cred: dict, cfg: dict, *,
                     log_fn: Optional[Callable[[str, str], None]] = None) -> dict:
-    """CPA multipart 上传。"""
+    """Upload a CPA multipart credential file."""
     log = log_fn or (lambda m, lvl="info": logger.info(m))
 
     api_url = (cfg.get("cpa_url") or "").rstrip("/").strip()
     api_key = (cfg.get("cpa_mgmt_key") or "").strip()
     timeout = int(cfg.get("cpa_timeout") or DEFAULT_TIMEOUT)
     if not api_url:
-        raise RuntimeError("CPA 未配置 URL")
+        raise RuntimeError("CPA URL is not configured")
     if not api_key:
-        raise RuntimeError("CPA 未配置管理密钥")
+        raise RuntimeError("CPA management key is not configured")
 
     cffi = _import_cffi()
     CurlMime = _import_cffi_mime()
@@ -335,18 +331,18 @@ def export_to_cpa(cred: dict, cfg: dict, *,
     filename = f"{email}.json"
     file_content = json.dumps(token_data, ensure_ascii=False, indent=2).encode("utf-8")
     upload_url = f"{api_url}/v0/management/auth-files"
-    # CLIProxyAPI 官方文档：两种 header 都接受。同时发以应对不同版本/部署的解析差异。
+    # Send both accepted authentication headers for deployment compatibility.
     headers = {
         "Authorization": f"Bearer {api_key}",
         "X-Management-Key": api_key,
     }
 
     log(
-        f"[CPA] 上传目标: {upload_url}  "
-        f"文件名={filename}  内容大小={len(file_content)}B  "
-        f"含 access_token={'是' if token_data.get('access_token') else '否'}  "
-        f"含 refresh_token={'是' if token_data.get('refresh_token') else '否'}  "
-        f"含 id_token={'是' if token_data.get('id_token') else '否'}",
+        f"[CPA] Upload target: {upload_url}  "
+        f"file={filename}  size={len(file_content)}B  "
+        f"access_token={'yes' if token_data.get('access_token') else 'no'}  "
+        f"refresh_token={'yes' if token_data.get('refresh_token') else 'no'}  "
+        f"id_token={'yes' if token_data.get('id_token') else 'no'}",
         "info",
     )
 
@@ -354,7 +350,10 @@ def export_to_cpa(cred: dict, cfg: dict, *,
     for attempt in range(1, MAX_ATTEMPTS + 1):
         mime = None
         try:
-            log(f"[CPA] 第 {attempt}/{MAX_ATTEMPTS} 次 multipart 上传 {filename}...", "info")
+            log(
+                f"[CPA] Multipart upload attempt {attempt}/{MAX_ATTEMPTS}: {filename}...",
+                "info",
+            )
             mime = CurlMime()
             mime.addpart(
                 name="file",
@@ -371,19 +370,19 @@ def export_to_cpa(cred: dict, cfg: dict, *,
                 timeout=timeout,
                 impersonate="chrome110",
             )
-            # 详细日志：HTTP 状态 + 响应体
+            # Log HTTP status and a bounded response preview.
             try:
                 body_preview = (resp.text or "")[:400]
             except Exception:
-                body_preview = "(无法读取响应体)"
+                body_preview = "(response body unavailable)"
             log(
-                f"[CPA] 服务器响应: HTTP {resp.status_code}  body={body_preview!r}",
+                f"[CPA] Server response: HTTP {resp.status_code}  body={body_preview!r}",
                 "info" if resp.status_code in (200, 201) else "warn",
             )
             if resp.status_code in (200, 201):
-                log(f"[CPA] ✅ 上传成功 {filename}", "ok")
+                log(f"[CPA] ✅ Upload successful: {filename}", "ok")
                 return {"ok": True, "email": email, "file_name": filename,
-                        "message": f"CPA 上传成功: {filename}"}
+                        "message": f"CPA upload successful: {filename}"}
             msg = f"HTTP {resp.status_code}"
             try:
                 detail = resp.json()
@@ -392,11 +391,14 @@ def export_to_cpa(cred: dict, cfg: dict, *,
             except Exception:
                 msg = f"{msg}: {body_preview}"
             last_err = msg
-            # 失败时也打详细日志（即使 4xx 不重试，也要让主人看到原因）
-            log(f"[CPA] ❌ 上传失败: {msg}", "error")
+            # Log non-retryable 4xx failures as well as retryable errors.
+            log(f"[CPA] ❌ Upload failed: {msg}", "error")
             if attempt < MAX_ATTEMPTS and resp.status_code >= 500:
                 delay = RETRY_DELAYS_S[attempt - 1]
-                log(f"[CPA] 第 {attempt} 次失败 ({msg})，{delay:.0f}s 后重试", "warn")
+                log(
+                    f"[CPA] Attempt {attempt} failed ({msg}); retrying in {delay:.0f}s",
+                    "warn",
+                )
                 time.sleep(delay)
                 continue
             return {"ok": False, "error": msg, "email": email, "file_name": filename}
@@ -404,7 +406,11 @@ def export_to_cpa(cred: dict, cfg: dict, *,
             last_err = str(e)
             if attempt < MAX_ATTEMPTS:
                 delay = RETRY_DELAYS_S[attempt - 1]
-                log(f"[CPA] 第 {attempt} 次异常 ({e})，{delay:.0f}s 后重试", "warn")
+                log(
+                    f"[CPA] Attempt {attempt} raised an error ({e}); "
+                    f"retrying in {delay:.0f}s",
+                    "warn",
+                )
                 time.sleep(delay)
                 continue
             return {"ok": False, "error": str(e), "email": email, "file_name": filename}
@@ -414,20 +420,25 @@ def export_to_cpa(cred: dict, cfg: dict, *,
                     mime.close()
                 except Exception:
                     pass
-    return {"ok": False, "error": last_err or "重试耗尽", "email": email, "file_name": filename}
+    return {
+        "ok": False,
+        "error": last_err or "Retry limit reached",
+        "email": email,
+        "file_name": filename,
+    }
 
 
-# ──────────────────────── SUB2API：构建 payload ────────────────────────
+# ------------------------------- Build SUB2API payload -------------------------------
 
 
 def build_sub2api_payload(cred: dict, group_ids: list[int]) -> dict:
-    """构建 SUB2API POST /api/v1/admin/accounts 的 body。
+    """Build the SUB2API POST /api/v1/admin/accounts body.
 
-    严格对齐 any-auto-register/sub2api_upload.py:_build_sub2api_account_payload。
+    Match the target integration's account payload shape.
     """
     access_token = str(cred.get("access_token") or "").strip()
     if not access_token:
-        raise RuntimeError("未读取到可导入的 access_token")
+        raise RuntimeError("No exportable access_token was found")
     refresh_token = str(cred.get("refresh_token") or "").strip()
     id_token = str(cred.get("id_token") or "").strip()
     email = str(cred.get("email") or "").strip()
@@ -439,7 +450,7 @@ def build_sub2api_payload(cred: dict, group_ids: list[int]) -> dict:
     if not isinstance(expires_at, int) or expires_at <= 0:
         expires_at = int(time.time()) + SUB2API_DEFAULT_EXPIRES_IN
 
-    # organization_id 优先从 id_token 抽（更准），fallback 从 access_token
+    # Prefer organization_id from id_token, then fall back to access_token.
     id_auth = _get_auth(_decode_jwt_payload(id_token))
     organization_id = str(id_auth.get("organization_id") or "").strip()
     if not organization_id:
@@ -486,20 +497,20 @@ def build_sub2api_payload(cred: dict, group_ids: list[int]) -> dict:
     }
 
 
-# ──────────────────────── SUB2API：上传 ────────────────────────
+# -------------------------------- SUB2API upload --------------------------------
 
 
 def export_to_sub2api(cred: dict, cfg: dict, *,
                         log_fn: Optional[Callable[[str, str], None]] = None) -> dict:
-    """SUB2API x-api-key 直连上传（无登录流程）。"""
+    """Upload directly to SUB2API with x-api-key and no login flow."""
     log = log_fn or (lambda m, lvl="info": logger.info(m))
 
     api_url = (cfg.get("sub2api_url") or "").rstrip("/").strip()
     api_key = (cfg.get("sub2api_api_key") or "").strip()
     if not api_url:
-        raise RuntimeError("SUB2API 未配置 URL")
+        raise RuntimeError("SUB2API URL is not configured")
     if not api_key:
-        raise RuntimeError("SUB2API 未配置 API Key")
+        raise RuntimeError("SUB2API API key is not configured")
 
     group_ids = _parse_group_ids(cfg.get("sub2api_group_ids"))
     timeout = int(cfg.get("sub2api_timeout") or DEFAULT_TIMEOUT)
@@ -519,7 +530,7 @@ def export_to_sub2api(cred: dict, cfg: dict, *,
     for attempt in range(1, MAX_ATTEMPTS + 1):
         try:
             log(
-                f"[SUB2API] 第 {attempt}/{MAX_ATTEMPTS} 次上传 {email} "
+                f"[SUB2API] Upload attempt {attempt}/{MAX_ATTEMPTS}: {email} "
                 f"(group_ids={group_ids})...",
                 "info",
             )
@@ -540,9 +551,13 @@ def export_to_sub2api(cred: dict, cfg: dict, *,
                         new_id = str(data.get("id") or data.get("ID") or "").strip()
                 except Exception:
                     pass
-                log(f"[SUB2API] ✅ 上传成功 {email} (id={new_id or 'unknown'})", "ok")
+                log(
+                    f"[SUB2API] ✅ Upload successful: {email} "
+                    f"(id={new_id or 'unknown'})",
+                    "ok",
+                )
                 return {"ok": True, "email": email, "account_id": new_id,
-                        "message": f"SUB2API 上传成功 #{new_id or 'unknown'}"}
+                        "message": f"SUB2API upload successful #{new_id or 'unknown'}"}
             msg = f"HTTP {resp.status_code}"
             try:
                 detail = resp.json()
@@ -556,7 +571,11 @@ def export_to_sub2api(cred: dict, cfg: dict, *,
             last_err = msg
             if attempt < MAX_ATTEMPTS and resp.status_code >= 500:
                 delay = RETRY_DELAYS_S[attempt - 1]
-                log(f"[SUB2API] 第 {attempt} 次失败 ({msg})，{delay:.0f}s 后重试", "warn")
+                log(
+                    f"[SUB2API] Attempt {attempt} failed ({msg}); "
+                    f"retrying in {delay:.0f}s",
+                    "warn",
+                )
                 time.sleep(delay)
                 continue
             return {"ok": False, "error": msg, "email": email}
@@ -564,28 +583,32 @@ def export_to_sub2api(cred: dict, cfg: dict, *,
             last_err = str(e)
             if attempt < MAX_ATTEMPTS:
                 delay = RETRY_DELAYS_S[attempt - 1]
-                log(f"[SUB2API] 第 {attempt} 次异常 ({e})，{delay:.0f}s 后重试", "warn")
+                log(
+                    f"[SUB2API] Attempt {attempt} raised an error ({e}); "
+                    f"retrying in {delay:.0f}s",
+                    "warn",
+                )
                 time.sleep(delay)
                 continue
             return {"ok": False, "error": str(e), "email": email}
-    return {"ok": False, "error": last_err or "重试耗尽", "email": email}
+    return {"ok": False, "error": last_err or "Retry limit reached", "email": email}
 
 
-# ──────────────────────── 连通性测试 ────────────────────────
+# ------------------------------- Connectivity tests -------------------------------
 
 
 def test_cpa(cfg: dict) -> dict:
-    """CPA 连通性测试：GET /v0/management/auth-files 真校验 Bearer key。
+    """Test CPA connectivity and validate the Bearer key with a harmless GET.
 
-    用 GET 而不是 OPTIONS，因为 OPTIONS 是 CORS 预检，多数 CPA 实现不校验 Authorization，
-    会让 key 错误的配置误以为通了，到真上传时才返 401。
+    OPTIONS is only a CORS preflight and often skips authentication, which could
+    falsely report a bad key as healthy.
     """
     api_url = (cfg.get("cpa_url") or "").rstrip("/").strip()
     api_key = (cfg.get("cpa_mgmt_key") or "").strip()
     if not api_url:
-        raise RuntimeError("CPA 未配置 URL")
+        raise RuntimeError("CPA URL is not configured")
     if not api_key:
-        raise RuntimeError("CPA 未配置管理密钥")
+        raise RuntimeError("CPA management key is not configured")
     timeout = int(cfg.get("cpa_timeout") or DEFAULT_TIMEOUT)
     cffi = _import_cffi()
 
@@ -601,7 +624,10 @@ def test_cpa(cfg: dict) -> dict:
         impersonate="chrome110",
     )
     if resp.status_code in (200, 201, 204):
-        return {"ok": True, "message": f"CPA 连通正常 + 密钥有效 (HTTP {resp.status_code})"}
+        return {
+            "ok": True,
+            "message": f"CPA is reachable and the key is valid (HTTP {resp.status_code})",
+        }
     if resp.status_code in (401, 403):
         body = ""
         try:
@@ -609,22 +635,29 @@ def test_cpa(cfg: dict) -> dict:
         except Exception:
             pass
         raise RuntimeError(
-            f"CPA 鉴权失败 (HTTP {resp.status_code})：管理密钥错误。响应：{body}"
+            f"CPA authentication failed (HTTP {resp.status_code}): "
+            f"the management key is invalid. Response: {body}"
         )
-    # 405 Method Not Allowed 表示路径对但不允许 GET，至少 URL 通了
+    # HTTP 405 proves the URL is reachable even though GET cannot validate the key.
     if resp.status_code == 405:
-        return {"ok": True, "message": f"CPA URL 可达（HTTP 405），但无法用 GET 验证密钥；请实际上传一次确认"}
-    raise RuntimeError(f"CPA 返回 HTTP {resp.status_code}: {(resp.text or '')[:200]}")
+        return {
+            "ok": True,
+            "message": (
+                "CPA is reachable (HTTP 405), but GET cannot verify the key. "
+                "Confirm it with an actual upload."
+            ),
+        }
+    raise RuntimeError(f"CPA returned HTTP {resp.status_code}: {(resp.text or '')[:200]}")
 
 
 def test_sub2api(cfg: dict) -> dict:
-    """SUB2API 连通性测试：GET 一个无害端点（用 admin/accounts list 验证 key）。"""
+    """Test SUB2API connectivity and key validity through the account-list endpoint."""
     api_url = (cfg.get("sub2api_url") or "").rstrip("/").strip()
     api_key = (cfg.get("sub2api_api_key") or "").strip()
     if not api_url:
-        raise RuntimeError("SUB2API 未配置 URL")
+        raise RuntimeError("SUB2API URL is not configured")
     if not api_key:
-        raise RuntimeError("SUB2API 未配置 API Key")
+        raise RuntimeError("SUB2API API key is not configured")
     timeout = int(cfg.get("sub2api_timeout") or DEFAULT_TIMEOUT)
     cffi = _import_cffi()
 
@@ -641,29 +674,29 @@ def test_sub2api(cfg: dict) -> dict:
         impersonate="chrome110",
     )
     if resp.status_code in (200, 201):
-        return {"ok": True, "message": f"SUB2API 连通正常 (HTTP {resp.status_code})"}
+        return {"ok": True, "message": f"SUB2API is reachable (HTTP {resp.status_code})"}
     if resp.status_code in (401, 403):
-        raise RuntimeError(f"SUB2API 鉴权失败 (HTTP {resp.status_code})，请检查 API Key")
-    raise RuntimeError(f"SUB2API 返回 HTTP {resp.status_code}: {(resp.text or '')[:200]}")
+        raise RuntimeError(
+            f"SUB2API authentication failed (HTTP {resp.status_code}); check the API key"
+        )
+    raise RuntimeError(
+        f"SUB2API returned HTTP {resp.status_code}: {(resp.text or '')[:200]}"
+    )
 
 
-# ──────────────────────── 统一入口（注册完成后调用） ────────────────────────
+# ----------------------------- Post-registration entry -----------------------------
 
 
 def run_exports(cred: dict, *,
                   cpa_cfg: Optional[dict] = None,
                   sub2api_cfg: Optional[dict] = None,
                   log_fn: Optional[Callable[[str, str], None]] = None) -> dict:
-    """注册完成后的可选导出入口。
+    """Run configured exports after registration.
 
-    步骤：
-      1. 检查两个目标是否有任一启用，全部未启用直接返回
-      2. 用 cred['refresh_token'] 刷新一次拿新的 Codex access_token / id_token
-         （主项目最终保存的 access_token 是 NextAuth 风格的，CPA/SUB2API 不接受）
-      3. 用刷新后的 cred 走 CPA / SUB2API 导出
+    If a destination is enabled, refresh the NextAuth-style saved token into a
+    Codex-style token, then send the refreshed credential to that destination.
 
-    返回：
-        {"cpa": {...} 或 None, "sub2api": {...} 或 None, "any_attempted": bool}
+    Return {"cpa": dict|None, "sub2api": dict|None, "any_attempted": bool}.
     """
     log = log_fn or (lambda m, lvl="info": logger.info(m))
     out: dict = {"cpa": None, "sub2api": None, "any_attempted": False}
@@ -673,9 +706,9 @@ def run_exports(cred: dict, *,
     if not (cpa_on or sub2_on):
         return out
 
-    # ─ 关键：先用 refresh_token 换 Codex 风格 access_token ─
+    # First exchange refresh_token for a Codex-style access token.
     try:
-        log("[exporter] 用 refresh_token 换新的 Codex access_token...", "info")
+        log("[exporter] Refreshing the Codex access token...", "info")
         fresh = refresh_codex_token(cred.get("refresh_token", ""))
         cred = {
             **cred,
@@ -684,19 +717,19 @@ def run_exports(cred: dict, *,
             "id_token":      fresh.get("id_token") or cred.get("id_token", ""),
         }
         log(
-            f"[exporter] ✅ Codex token 刷新成功 "
+            f"[exporter] ✅ Codex token refresh successful "
             f"(access_token len={len(fresh['access_token'])} "
             f"id_token len={len(fresh.get('id_token') or '')})",
             "ok",
         )
     except Exception as e:
-        log(f"[exporter] ❌ Codex token 刷新失败，无法导出: {e}", "error")
+        log(f"[exporter] ❌ Codex token refresh failed; export cannot continue: {e}", "error")
         if cpa_on:
             out["any_attempted"] = True
-            out["cpa"] = {"ok": False, "error": f"Codex token 刷新失败: {e}"}
+            out["cpa"] = {"ok": False, "error": f"Codex token refresh failed: {e}"}
         if sub2_on:
             out["any_attempted"] = True
-            out["sub2api"] = {"ok": False, "error": f"Codex token 刷新失败: {e}"}
+            out["sub2api"] = {"ok": False, "error": f"Codex token refresh failed: {e}"}
         return out
 
     if cpa_on:
@@ -704,7 +737,7 @@ def run_exports(cred: dict, *,
         try:
             out["cpa"] = export_to_cpa(cred, cpa_cfg, log_fn=log)
         except Exception as e:
-            log(f"[CPA] 导出异常: {e}", "error")
+            log(f"[CPA] Export error: {e}", "error")
             out["cpa"] = {"ok": False, "error": str(e)}
 
     if sub2_on:
@@ -712,7 +745,7 @@ def run_exports(cred: dict, *,
         try:
             out["sub2api"] = export_to_sub2api(cred, sub2api_cfg, log_fn=log)
         except Exception as e:
-            log(f"[SUB2API] 导出异常: {e}", "error")
+            log(f"[SUB2API] Export error: {e}", "error")
             out["sub2api"] = {"ok": False, "error": str(e)}
 
     return out

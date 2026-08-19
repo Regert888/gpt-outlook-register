@@ -1,12 +1,12 @@
-"""auto-loop 控制器：多 worker 并发，每个 worker 用独立代理。
+"""Concurrent auto-loop controller with one independent proxy per worker.
 
-设计：
-  - 主控线程 manage_loop：监听 stop/pause、根据 concurrency 启停 worker
-  - 多个 worker 线程：claim_next() → 注册 → 完成 → 继续
-  - 代理池：每个 worker 按 worker index 取一个代理（round-robin），避免同 IP 多号
-  - 状态机：stopped → running → paused → running / stopped
-  - 优雅暂停/停止：当前 worker 跑完才退出，不强杀
-  - 复用 registrar.start_registration：每个号开一个 run，由 worker 等其结束
+Design:
+  - manage_loop observes stop/pause and scales workers to concurrency.
+  - Workers repeat claim_next -> register -> finish.
+  - Proxies are assigned round-robin to avoid multiple accounts on one IP.
+  - State transitions are stopped -> running -> paused -> running/stopped.
+  - Pause and stop let active workers finish rather than killing them.
+  - Each account uses registrar.start_registration and its worker waits.
 """
 from __future__ import annotations
 
@@ -30,7 +30,7 @@ class AutoLoopState:
 
 
 def _parse_proxy_pool(text: str) -> list[str]:
-    """把多行代理字符串拆成列表。空行 / # 开头注释跳过。"""
+    """Split newline-delimited proxies, skipping blanks and # comments."""
     out: list[str] = []
     for line in (text or "").splitlines():
         s = line.strip()
@@ -40,14 +40,14 @@ def _parse_proxy_pool(text: str) -> list[str]:
 
 
 class AutoLoopController:
-    """多 worker auto-loop 控制器。
+    """Multi-worker auto-loop controller.
 
-    options 关键字段：
-      proxy:                单代理（兼容旧版，concurrency=1 时用）
-      proxy_pool:           多代理字符串（每行一个；多 worker 会按 worker index 轮流取）
-      concurrency:          并发 worker 数（1-20）
-      cool_down_seconds:    每个 worker 跑完后冷却时间（默认 3）
-      其余参数透传给 registrar.start_registration
+    Important options:
+      proxy:                legacy single proxy when concurrency=1
+      proxy_pool:           one proxy per line, assigned by worker index
+      concurrency:          worker count (1-20)
+      cool_down_seconds:    delay after each worker run (default 3)
+      remaining values pass through to registrar.start_registration
     """
 
     def __init__(self):
@@ -57,33 +57,33 @@ class AutoLoopController:
         self._workers: list[threading.Thread] = []
         self._options: dict = {}
         self._stop_event = threading.Event()
-        self._pause_event = threading.Event()  # set = 暂停
-        # 进度统计
+        self._pause_event = threading.Event()  # Set means paused.
+        # Progress counters.
         self._started_at: float = 0.0
         self._registered_ok = 0
         self._registered_fail = 0
-        # 当前每个 worker 在跑啥（worker_id → email）
+        # Active work by worker_id -> email.
         self._worker_status: dict[int, dict] = {}
         self._last_message = ""
-        # 熔断状态
+        # Circuit-breaker state.
         self._consecutive_network_fails = 0
         self._circuit_break_threshold = 3
         self._last_break_reason = ""
-        # SSE 订阅
+        # SSE subscribers.
         self._subscribers: list[queue.Queue] = []
-        # 代理池 / 并发数
+        # Proxy pool and concurrency.
         self._proxy_pool: list[str] = []
         self._concurrency: int = 1
-        # 目标成功数：0 = 不限量（保持旧行为）；>0 时累计成功达标即自动停止
+        # Successful target: 0 is unlimited; >0 stops when reached.
         self._target_count: int = 0
 
-    # ──────────────────────── 公共 API ────────────────────────
+    # -------------------------------- Public API --------------------------------
 
     def start(self, options: dict) -> dict:
         with self._lock:
             if self._state in (AutoLoopState.RUNNING, AutoLoopState.PAUSED):
-                return {"ok": False, "error": f"已经在跑了 (state={self._state})"}
-            # 重置
+                return {"ok": False, "error": f"Auto-loop is already active (state={self._state})"}
+            # Reset state.
             self._stop_event.clear()
             self._pause_event.clear()
             self._options = dict(options or {})
@@ -93,14 +93,14 @@ class AutoLoopController:
             self._registered_fail = 0
             self._worker_status.clear()
             self._consecutive_network_fails = 0
-            self._last_message = "auto-loop 启动"
-            # 解析并发参数
+            self._last_message = "Auto-loop started"
+            # Parse concurrency settings.
             self._concurrency = max(1, min(20, int(self._options.get("concurrency") or 1)))
             pool_text = self._options.get("proxy_pool") or ""
             self._proxy_pool = _parse_proxy_pool(pool_text)
-            # 目标成功数（0=不限量）
+            # Successful target; 0 means unlimited.
             self._target_count = max(0, int(self._options.get("target_count") or 0))
-            # 启 manage 线程
+            # Start the management thread.
             self._manage_thread = threading.Thread(
                 target=self._manage_loop, daemon=True, name="auto-loop-manage"
             )
@@ -117,30 +117,30 @@ class AutoLoopController:
     def pause(self) -> dict:
         with self._lock:
             if self._state != AutoLoopState.RUNNING:
-                return {"ok": False, "error": f"当前 state={self._state}，不可暂停"}
+                return {"ok": False, "error": f"Cannot pause while state={self._state}"}
             self._pause_event.set()
             self._state = AutoLoopState.PAUSED
-            self._last_message = "已请求暂停（当前 worker 跑完才生效）"
+            self._last_message = "Pause requested; active workers will finish first"
         self._broadcast("state", self._snapshot())
         return {"ok": True, "state": self._state}
 
     def resume(self) -> dict:
         with self._lock:
             if self._state != AutoLoopState.PAUSED:
-                return {"ok": False, "error": f"当前 state={self._state}，不可恢复"}
+                return {"ok": False, "error": f"Cannot resume while state={self._state}"}
             self._pause_event.clear()
             self._state = AutoLoopState.RUNNING
-            self._last_message = "已恢复"
+            self._last_message = "Auto-loop resumed"
         self._broadcast("state", self._snapshot())
         return {"ok": True, "state": self._state}
 
     def stop(self) -> dict:
         with self._lock:
             if self._state == AutoLoopState.STOPPED:
-                return {"ok": False, "error": "没在跑"}
+                return {"ok": False, "error": "Auto-loop is not running"}
             self._stop_event.set()
             self._pause_event.clear()
-            self._last_message = "已请求停止（当前 worker 跑完才生效）"
+            self._last_message = "Stop requested; active workers will finish first"
         self._broadcast("state", self._snapshot())
         return {"ok": True}
 
@@ -162,7 +162,7 @@ class AutoLoopController:
             try: self._subscribers.remove(q)
             except ValueError: pass
 
-    # ──────────────────────── 内部 ────────────────────────
+    # -------------------------------- Internals --------------------------------
 
     def _snapshot(self) -> dict:
         with self._lock:
@@ -210,13 +210,13 @@ class AutoLoopController:
         self._broadcast("state", self._snapshot())
 
     def _proxy_for_worker(self, worker_id: int) -> str:
-        """按 worker_id 从代理池里挑一个代理。空池时回退到 options.proxy。"""
+        """Select by worker_id, falling back to options.proxy for an empty pool."""
         if self._proxy_pool:
             return self._proxy_pool[worker_id % len(self._proxy_pool)]
         return self._options.get("proxy", "") or ""
 
     def _record_finish(self, ok: bool, category: str):
-        """worker 结束一个 run 后调，更新计数 + 熔断。"""
+        """Update counters and circuit-breaker state after a worker run."""
         with self._lock:
             if ok:
                 self._registered_ok += 1
@@ -228,9 +228,9 @@ class AutoLoopController:
                 else:
                     self._consecutive_network_fails = 0
             self._last_message = (
-                f"累计 ok={self._registered_ok} fail={self._registered_fail}"
+                f"Totals: ok={self._registered_ok} fail={self._registered_fail}"
             )
-            # 目标数量：累计成功达标 → 触发停止（stop_event 幂等，多 worker 同时命中也安全）
+            # Reaching the target sets an idempotent stop event, safe across workers.
             target_reached = bool(
                 self._target_count and self._registered_ok >= self._target_count
             )
@@ -243,10 +243,13 @@ class AutoLoopController:
             with self._lock:
                 self._stop_event.set()
                 self._last_message = (
-                    f"🎯 已达目标 {self._target_count} 个，自动停止"
-                    f"（成功 {self._registered_ok} / 失败 {self._registered_fail}）"
+                    f"🎯 Target of {self._target_count} reached; stopping automatically "
+                    f"(successful {self._registered_ok} / failed {self._registered_fail})"
                 )
-            logger.info(f"已达目标 {self._target_count} 个成功，触发自动停止")
+            logger.info(
+                "Target of %s successful registrations reached; stopping automatically",
+                self._target_count,
+            )
             self._broadcast("state", self._snapshot())
             return
 
@@ -255,8 +258,9 @@ class AutoLoopController:
                 self._pause_event.set()
                 self._state = AutoLoopState.PAUSED
                 self._last_break_reason = (
-                    f"连续 {self._consecutive_network_fails} 次网络/环境错误，"
-                    f"自动暂停（号已自动 release，请检查代理后点恢复）"
+                    f"Paused automatically after {self._consecutive_network_fails} "
+                    "consecutive network/environment errors. Accounts were released; "
+                    "check the proxy before resuming."
                 )
                 self._last_message = self._last_break_reason
                 self._consecutive_network_fails = 0
@@ -264,7 +268,7 @@ class AutoLoopController:
             self._broadcast("circuit_break", {"reason": self._last_break_reason})
 
     def _manage_loop(self):
-        """主控线程：启动 worker，等所有 worker 结束，更新最终状态。"""
+        """Start workers, wait for them, and publish the final state."""
         try:
             workers = []
             for wid in range(self._concurrency):
@@ -274,60 +278,62 @@ class AutoLoopController:
                 )
                 t.start()
                 workers.append(t)
-                # 每个 worker 之间错开 1s 启动，避免同时打 OpenAI
+                # Stagger workers by one second to avoid simultaneous requests.
                 time.sleep(1.0)
             self._workers = workers
-            # 等所有 worker 退出
+            # Wait for every worker to exit.
             for t in workers:
                 t.join()
         except Exception as e:
-            logger.exception(f"manage_loop 异常: {e}")
+            logger.exception(f"manage_loop error: {e}")
         finally:
             with self._lock:
                 self._state = AutoLoopState.STOPPED
                 self._worker_status.clear()
                 self._last_message = (
-                    f"已停止（成功 {self._registered_ok} / 失败 {self._registered_fail}）"
+                    f"Stopped (successful {self._registered_ok} / "
+                    f"failed {self._registered_fail})"
                 )
             self._broadcast("state", self._snapshot())
 
     def _worker_loop(self, worker_id: int):
-        """单 worker 循环：claim → 跑 → 等结束 → 继续。"""
+        """Run one worker's claim -> start -> wait -> repeat loop."""
         idle_round = 0
         proxy = self._proxy_for_worker(worker_id)
-        logger.info(f"[worker-{worker_id}] 启动 (proxy={proxy or '直连'})")
+        logger.info(f"[worker-{worker_id}] Started (proxy={proxy or 'direct'})")
 
         while True:
-            # 检查停止
+            # Check for stop.
             if self._stop_event.is_set():
-                logger.info(f"[worker-{worker_id}] 已停止")
+                logger.info(f"[worker-{worker_id}] Stopped")
                 return
 
-            # 检查暂停
+            # Check for pause.
             if self._pause_event.is_set():
                 while self._pause_event.is_set() and not self._stop_event.is_set():
                     time.sleep(0.5)
                 if self._stop_event.is_set():
                     return
 
-            # 目标数量闸门：已成功 + 在跑的（复用 _worker_status 当在跑数）≥ 目标 → 本 worker 退出
-            # 不新增易泄漏的计数器；_worker_status 已在锁内正常维护，最大限度压低超额
+            # Successful plus active workers gates new claims at the target. Reuse
+            # locked _worker_status rather than adding a leak-prone counter.
             with self._lock:
                 if self._target_count and (
                     self._registered_ok + len(self._worker_status) >= self._target_count
                 ):
                     logger.info(
-                        f"[worker-{worker_id}] 目标 {self._target_count} 已锁定，退出"
+                        f"[worker-{worker_id}] Target {self._target_count} "
+                        "is fully allocated; exiting"
                     )
                     return
 
-            # claim 下一个号。要不要走号池由 provider 的 pooled 决定，
-            # 非池化的（CF 这类自己造地址的）用虚拟占位。
+            # Pooled providers claim the next account; non-pooled providers use a
+            # virtual placeholder while creating their own address.
             mail_source = db.get_setting("mail_source", "outlook")
             try:
                 pooled = get_provider_class(mail_source).pooled
             except MailProviderError as e:
-                logger.error(f"[worker-{worker_id}] {e}，停止")
+                logger.error(f"[worker-{worker_id}] {e}; stopping")
                 self._set_message(str(e))
                 return
             if pooled:
@@ -343,13 +349,16 @@ class AutoLoopController:
                 idle_round += 1
                 if idle_round == 1:
                     self._set_message(
-                        f"worker-{worker_id} 号池空，等待新号..."
+                        f"worker-{worker_id}: account pool is empty; "
+                        "waiting for new accounts..."
                     )
-                # 空 10 轮（约 30s）就停掉这个 worker
+                # Stop this worker after ten empty rounds (about 30 seconds).
                 if idle_round >= 10:
-                    logger.info(f"[worker-{worker_id}] 号池空 30s，停止")
+                    logger.info(
+                        f"[worker-{worker_id}] Account pool remained empty for 30s; stopping"
+                    )
                     return
-                # 等 3s 再试
+                # Wait three seconds before retrying.
                 for _ in range(30):
                     if self._stop_event.is_set() or self._pause_event.is_set():
                         break
@@ -357,16 +366,16 @@ class AutoLoopController:
                 continue
             idle_round = 0
 
-            # 给这个 run 注入 worker 自己的代理
+            # Inject this worker's proxy into the run.
             run_options = dict(self._options)
             if proxy:
                 run_options["proxy"] = proxy
 
-            # 启一个 run
+            # Start one run.
             try:
                 run_id = registrar.start_registration(account, run_options)
             except Exception as e:
-                logger.exception(f"[worker-{worker_id}] 启动注册失败: {e}")
+                logger.exception(f"[worker-{worker_id}] Failed to start registration: {e}")
                 if pooled:
                     db.release_unused(account["email"])
                 time.sleep(2)
@@ -387,7 +396,7 @@ class AutoLoopController:
                 "proxy": proxy,
             })
 
-            # 等当前 run 跑完
+            # Wait for the current run.
             ok, category = self._wait_run_finish(run_id)
 
             with self._lock:
@@ -402,7 +411,7 @@ class AutoLoopController:
                 "category": category,
             })
 
-            # 冷却（每个 worker 自己的节奏）
+            # Cool down independently per worker.
             cool_down = float(self._options.get("cool_down_seconds") or 3)
             if cool_down > 0:
                 for _ in range(int(cool_down * 10)):
@@ -411,7 +420,7 @@ class AutoLoopController:
                     time.sleep(0.1)
 
     def _wait_run_finish(self, run_id: str, timeout: int = 1800) -> tuple[bool, str]:
-        """轮询 runs 表，等 run 跑完。"""
+        """Poll the runs table until the run finishes."""
         deadline = time.time() + timeout
         while time.time() < deadline:
             if self._stop_event.is_set():
@@ -428,9 +437,9 @@ class AutoLoopController:
                 if st == "failed":
                     return False, (row["error_category"] or "")
             time.sleep(1)
-        logger.warning(f"run {run_id} 等了 {timeout}s 没结束，超时放弃")
+        logger.warning(f"run {run_id} did not finish within {timeout}s; giving up")
         return False, ""
 
 
-# 全局单例
+# Global singleton.
 CONTROLLER = AutoLoopController()

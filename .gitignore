@@ -1,12 +1,11 @@
-# ──────────────── 敏感数据（绝对不能提交！）────────────────
-# 注册后的账号凭证 / 接码号池 / OTP 日志
+# ---------------- Sensitive data (never commit) ----------------
+# Registered account credentials, mailbox pool, and OTP logs
 webui/webui.db
 webui/webui.db-shm
 webui/webui.db-wal
 webui/webui.db-journal
 webui/logs/
-# ⚠️ 2026-08-04 补：手动备份的 *.db.bak 之前没被拦住，
-#    `git add .` 会把整个号池（含已注册凭证）传上 GitHub。
+# Manual database backups can contain the entire account pool and credentials.
 *.db.bak
 *.db.backup
 *.sqlite
@@ -17,12 +16,12 @@ account_*.json
 *.session
 *.token
 
-# Outlook 4 段格式接码号（如果主人手动放过）
+# Manually saved Outlook account lists
 mail.txt
 accounts.txt
 outlook_accounts.txt
 
-# ──────────────── Python ────────────────
+# ---------------- Python ----------------
 __pycache__/
 *.py[cod]
 *$py.class
@@ -32,44 +31,44 @@ __pycache__/
 .installed.cfg
 *.egg
 
-# 虚拟环境
+# Virtual environments
 .venv/
 venv/
 env/
 ENV/
 
-# ──────────────── 测试 / 临时 ────────────────
+# ---------------- Tests and temporary files ----------------
 /tmp/
 .pytest_cache/
 .coverage
 htmlcov/
 .tox/
 
-# ──────────────── IDE ────────────────
+# ---------------- IDE ----------------
 .vscode/
 .idea/
 *.swp
 *.swo
 
-# ──────────────── OS ────────────────
+# ---------------- Operating system ----------------
 .DS_Store
 Thumbs.db
 desktop.ini
 
-# ──────────────── Camoufox / Playwright 缓存（如果主人保留浏览器路径残留）────────────────
+# Camoufox and Playwright caches
 .camoufox/
 .playwright/
 chatgpt_reg_*
 
-# ──────────────── 节点（QuickJS sentinel SDK 缓存）────────────────
+# Node.js and QuickJS Sentinel SDK caches
 node_modules/
 openai-sentinel-demo/
 
-# ──────────────── 工作流追踪文件（如果主人启过 AUTH_TRACE_DUMP=1）────────────────
+# Workflow trace files created by AUTH_TRACE_DUMP=1
 outputs/
 auth_trace_*.jsonl
 
-# ──────────────── 配置覆盖（用户本地配置不进 repo）────────────────
+# Local configuration overrides
 config.local.json
 .env
 .env.local

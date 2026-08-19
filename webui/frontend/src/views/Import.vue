@@ -1,11 +1,11 @@
 <script setup>
-// 导入邮箱号池。
+// Import accounts into the email pool.
 //
-// 来源下拉、格式提示、placeholder 全部来自后端 provider 声明，
-// 加一种邮箱这里不用改。
+// The provider selector, format hint, and placeholder all come from backend
+// provider declarations, so adding a provider requires no changes here.
 //
-// 校验策略是"全对才写"：只要有一行不合法，后端返 422 并列出每一行的
-// 行号和原因，一个号都不会写进库 —— 免得导进去一半对不上账。
+// Validation is atomic: if any line is invalid, the backend returns 422 with
+// every failing line number and reason, and writes no accounts.
 import { computed, onActivated, onMounted, ref } from 'vue'
 import { ElMessage } from 'element-plus'
 import { importAccounts } from '@/api/accounts'
@@ -33,10 +33,10 @@ const lineCount = computed(
 
 async function loadProviders() {
   try {
-    // pooled_only：只列能导号的，CF 这种自己造地址的没号可导
+    // pooled_only lists only importable providers; self-hosted providers generate their own addresses.
     const r = await getMailProviders(true)
     providers.value = r.providers || []
-    // 默认选当前正在用的；它要是不支持导入就退回第一个
+    // Prefer the active provider; fall back to the first provider when it does not support imports.
     const cur = r.current
     kind.value = providers.value.some((p) => p.kind === cur)
       ? cur
@@ -46,18 +46,18 @@ async function loadProviders() {
   }
 }
 
-// 页面在 keep-alive 里，首次挂载和每次切回来都要拉一次 ——
-// 否则主人在「邮箱配置」加了新来源，切过来下拉框还是旧的
+// The page uses keep-alive, so refresh providers on first mount and every
+// activation to reflect provider changes made on the settings page.
 onMounted(loadProviders)
 onActivated(loadProviders)
 
 async function doImport() {
   if (!text.value.trim()) {
-    ElMessage.warning('请输入要导入的号')
+    ElMessage.warning('Enter the accounts to import')
     return
   }
   if (!kind.value) {
-    ElMessage.warning('请先选择邮箱来源')
+    ElMessage.warning('Select an email provider first')
     return
   }
   loading.value = true
@@ -65,19 +65,19 @@ async function doImport() {
   errors.value = []
   try {
     const r = await importAccounts(text.value.trim(), kind.value)
-    result.value = `解析 ${r.parsed} 行，新增 ${r.inserted}，更新 ${r.updated}，跳过 ${r.skipped}`
-    ElMessage.success('导入完成')
+    result.value = `Parsed ${r.parsed} lines: ${r.inserted} added, ${r.updated} updated, ${r.skipped} skipped`
+    ElMessage.success('Import complete')
     text.value = ''
     statsStore.refresh()
     runtime.bumpData()
   } catch (e) {
-    // 422 带逐行详情；其他错误只有一句话
+    // A 422 response includes per-line details; other errors contain one summary message.
     if (e.status === 422 && e.data?.errors?.length) {
       errors.value = e.data.errors
-      result.value = `有 ${e.data.errors.length} 行不合法，已全部拒绝，一个都没导入`
-      ElMessage.error('导入被拒绝，请修正后重试')
+      result.value = `${e.data.errors.length} invalid lines. The entire batch was rejected and nothing was imported.`
+      ElMessage.error('Import rejected. Correct the errors and try again.')
     } else {
-      result.value = '导入失败: ' + e.message
+      result.value = 'Import failed: ' + e.message
       ElMessage.error(e.message)
     }
   } finally {
@@ -90,12 +90,12 @@ async function doImport() {
   <div class="page">
     <el-card shadow="never">
       <template #header>
-        <span class="section-title" style="margin: 0">导入邮箱</span>
+        <span class="section-title" style="margin: 0">Import Email Accounts</span>
       </template>
 
       <el-form label-position="top" style="margin-bottom: 4px">
-        <el-form-item label="邮箱来源">
-          <el-select v-model="kind" style="width: 260px" placeholder="请选择">
+        <el-form-item label="Email provider">
+          <el-select v-model="kind" style="width: 260px" placeholder="Select a provider">
             <el-option
               v-for="p in providers"
               :key="p.kind"
@@ -104,13 +104,13 @@ async function doImport() {
             />
           </el-select>
           <span class="hint" style="margin-left: 12px">
-            必须选对 —— 不同邮箱都是 {{ current?.line_segments || 4 }} 段格式，光看内容分不出来
+            Choose the correct provider. Different providers may use the same {{ current?.line_segments || 4 }}-field format and cannot be identified from the content alone.
           </span>
         </el-form-item>
       </el-form>
 
       <p class="hint" v-if="current">
-        每行一个，{{ current.line_segments }} 段（用 <code>----</code> 分隔）：<br />
+        One account per line with {{ current.line_segments }} fields separated by <code>----</code>:<br />
         <code>{{ current.import_hint || '' }}</code>
       </p>
 
@@ -123,24 +123,24 @@ async function doImport() {
       />
 
       <div style="margin-top: 12px; display: flex; align-items: center; gap: 12px">
-        <el-button type="primary" :loading="loading" @click="doImport">导入</el-button>
-        <span class="hint" v-if="lineCount">待导入 {{ lineCount }} 行</span>
+        <el-button type="primary" :loading="loading" @click="doImport">Import</el-button>
+        <span class="hint" v-if="lineCount">{{ lineCount }} lines ready to import</span>
         <span class="hint">{{ result }}</span>
       </div>
 
-      <!-- 逐行错误：告诉主人第几行错在哪，而不是笼统一句"导入失败" -->
+      <!-- Per-line errors identify exactly which lines need correction. -->
       <el-alert
         v-if="errors.length"
         type="error"
         :closable="true"
         show-icon
         style="margin-top: 12px"
-        title="以下行不合法，整批已拒绝（号池未被改动）"
+        title="The following lines are invalid. The entire batch was rejected and the account pool was not changed."
         @close="errors = []"
       >
         <ul class="err-list">
           <li v-for="e in errors" :key="e.line">
-            <b>第 {{ e.line }} 行</b>：{{ e.error }}
+            <b>Line {{ e.line }}</b>: {{ e.error }}
           </li>
         </ul>
       </el-alert>

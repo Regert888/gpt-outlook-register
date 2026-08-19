@@ -1,16 +1,18 @@
-"""Outlook 邮箱 provider（Graph API + IMAP 双通道）。
+"""Outlook email provider with Graph API and IMAP delivery channels.
 
-从 4 段接码格式（email----password----client_id----refresh_token）出发，
-按优先级尝试多种取件方式：
-  1. Graph API（HTTP REST，扫 inbox / junkemail / deleteditems）
-  2. IMAP XOAUTH2（双服务器轮询 outlook.live.com → outlook.office365.com）
-  3. IMAP 密码登录（兜底）
+Accounts use the four-field format
+email----password----client_id----refresh_token. Mail retrieval methods are
+attempted in priority order:
+  1. Graph API over HTTP REST, scanning inbox, junkemail, and deleteditems.
+  2. IMAP XOAUTH2, polling outlook.live.com and outlook.office365.com.
+  3. IMAP password authentication as a fallback.
 
-能力：pooled=True（号池 claim / 用完 mark_dead）
-      ephemeral=False（地址固定，OpenAI 可能当老号处理）
+Capabilities:
+  pooled=True: claim accounts from a pool and mark them dead after use.
+  ephemeral=False: addresses are fixed and may be treated as existing accounts by OpenAI.
 
-本文件由 mail_outlook.py 迁移而来，取件逻辑逐字保留未改。
-mail_outlook.py 现为转发壳，旧 import 路径继续可用。
+This module was migrated from mail_outlook.py without changing its retrieval
+logic. mail_outlook.py is now a compatibility shim for the legacy import path.
 """
 from __future__ import annotations
 
@@ -31,7 +33,7 @@ from .base import ConfigField, MailProvider, register, validate_email
 
 logger = logging.getLogger(__name__)
 
-# ──────────────────────── 常量 ────────────────────────
+# ──────────────────────── Constants ────────────────────────
 
 TOKEN_ENDPOINTS = [
     "https://login.microsoftonline.com/consumers/oauth2/v2.0/token",
@@ -49,7 +51,7 @@ IMAP_SERVERS = ["outlook.live.com", "outlook.office365.com"]
 
 _FROM_DOMAINS = ("openai.com", "auth.openai", "tm.openai", "chatgpt.com", "tm.open")
 
-# 旧常量保留（外部可能 import）
+# Retain legacy constants because external modules may import them.
 GRAPH_TOKEN_URL = TOKEN_ENDPOINTS[-1]
 IMAP_HOST = IMAP_SERVERS[-1]
 
@@ -77,7 +79,7 @@ def _is_fatal_imap_error(exc: Exception) -> bool:
 
 
 def _request_access_token(refresh_token: str, client_id: str, scope: str) -> dict:
-    """尝试多个 token endpoint 换 access_token，返回完整 JSON dict。"""
+    """Try multiple token endpoints and return the complete token response."""
     last_error = ""
     for endpoint in TOKEN_ENDPOINTS:
         try:
@@ -102,15 +104,15 @@ def _request_access_token(refresh_token: str, client_id: str, scope: str) -> dic
         except Exception as e:
             last_error = f"{endpoint}: {e}"
             continue
-    raise FatalOutlookMailError(f"token 获取失败 (scope={scope}): {last_error}")
+    raise FatalOutlookMailError(f"Failed to obtain token (scope={scope}): {last_error}")
 
 
 def get_outlook_access_token(refresh_token: str, client_id: str) -> dict:
-    """兼容旧调用：用 IMAP scope 换 token。"""
+    """Compatibility wrapper that requests a token with the IMAP scope."""
     return _request_access_token(refresh_token, client_id, IMAP_SCOPE)
 
 
-# ──────────────────────── OTP 抽取 ────────────────────────
+# ──────────────────────── OTP extraction ────────────────────────
 
 
 def _is_hex_color_context(haystack: str, idx: int) -> bool:
@@ -125,7 +127,7 @@ def _is_hex_color_context(haystack: str, idx: int) -> bool:
 
 def _extract_otp_from_html(body: str) -> Optional[str]:
     for pat in (
-        r"(?:code(?:\s*is)?|verification|one[-\s]*time|verify|kode|verifikasi|代码|验证码|驗證碼)[^\d<>]{0,80}(\d{6})\b",
+        r"(?:code(?:\s*is)?|verification|one[-\s]*time|verify|kode|verifikasi|\u4ee3\u7801|\u9a8c\u8bc1\u7801|\u9a57\u8b49\u78bc)[^\d<>]{0,80}(\d{6})\b",
         r"chatgpt[^\d<>]{0,80}(\d{6})",
         r"openai[^\d<>]{0,80}(\d{6})",
     ):
@@ -147,7 +149,7 @@ def _check_from_domain(from_str: str) -> bool:
     return True
 
 
-# ──────────────────────── Graph API 取件 ────────────────────────
+# ──────────────────────── Graph API retrieval ────────────────────────
 
 
 def fetch_otp_via_graph(
@@ -159,7 +161,7 @@ def fetch_otp_via_graph(
     deadline: float = 0,
     target_email: str = "",
 ) -> str:
-    """Graph API 轮询取 OTP。成功返回 6 位 OTP，认证失败抛 FatalOutlookMailError。"""
+    """Poll Graph API for a six-digit OTP; raise on fatal authentication errors."""
     if not deadline:
         deadline = time.time() + max(60, timeout)
     if not threshold_ts:
@@ -208,13 +210,13 @@ def fetch_otp_via_graph(
                         continue
                 elif e.code in (400, 401, 403):
                     raise FatalOutlookMailError(
-                        f"Graph API 无权限: HTTP {e.code}"
+                        f"Graph API permission denied: HTTP {e.code}"
                     )
                 else:
                     logger.debug(f"[outlook-graph] {folder} HTTP {e.code}")
                     continue
             except Exception as e:
-                logger.debug(f"[outlook-graph] {folder} 请求异常: {e}")
+                logger.debug(f"[outlook-graph] {folder} request failed: {e}")
                 continue
 
             for msg in messages:
@@ -283,7 +285,7 @@ def _graph_list_messages(access_token: str, folder: str, timeout: float = 15) ->
     return value if isinstance(value, list) else []
 
 
-# ──────────────────────── IMAP 取件 ────────────────────────
+# ──────────────────────── IMAP retrieval ────────────────────────
 
 
 def fetch_otp_via_imap(
@@ -296,7 +298,7 @@ def fetch_otp_via_imap(
     deadline: float = 0,
     target_email: str = "",
 ) -> str:
-    """IMAP 轮询取 OTP（XOAUTH2 优先 + 密码兜底，双服务器轮询）。"""
+    """Poll both IMAP servers for an OTP, preferring XOAUTH2 with password fallback."""
     if not deadline:
         deadline = time.time() + max(60, timeout)
     if not threshold_ts:
@@ -312,12 +314,12 @@ def fetch_otp_via_imap(
     found_folders: list[str] | None = None
 
     if not use_xoauth2 and not use_password:
-        raise FatalOutlookMailError("无可用 IMAP 凭据")
+        raise FatalOutlookMailError("No usable IMAP credentials")
 
     while time.time() < deadline:
         M = None
         try:
-            # ── 刷新 access_token ──
+            # ── Refresh the access token ──
             if use_xoauth2 and (not cached_token or time.time() - cached_at > 3000):
                 try:
                     data = _request_access_token(cached_refresh, client_id, IMAP_SCOPE)
@@ -326,19 +328,19 @@ def fetch_otp_via_imap(
                     if data.get("refresh_token"):
                         cached_refresh = data["refresh_token"]
                 except FatalOutlookMailError as e:
-                    logger.warning(f"[outlook-imap] XOAUTH2 token 获取失败: {e}，禁用")
+                    logger.warning(f"[outlook-imap] Failed to obtain XOAUTH2 token: {e}; disabling XOAUTH2")
                     use_xoauth2 = False
                     cached_token = ""
                     if not use_password:
                         raise
                 except Exception as e:
-                    logger.warning(f"[outlook-imap] XOAUTH2 token 获取异常: {e}，禁用")
+                    logger.warning(f"[outlook-imap] XOAUTH2 token request failed: {e}; disabling XOAUTH2")
                     use_xoauth2 = False
                     cached_token = ""
                     if not use_password:
                         raise
 
-            # ── 连接 IMAP（多服务器 + 多认证方式）──
+            # ── Connect using multiple IMAP servers and authentication methods ──
             last_err = None
             for host in IMAP_SERVERS:
                 if M:
@@ -361,7 +363,7 @@ def fetch_otp_via_imap(
                         if _is_fatal_imap_error(e):
                             logger.info(
                                 f"[outlook-imap] XOAUTH2 host={host} failed, "
-                                "继续尝试其它 IMAP host"
+                                "trying the next IMAP host"
                             )
 
                 if not M and use_password:
@@ -378,10 +380,10 @@ def fetch_otp_via_imap(
 
             if not M:
                 if last_err and _is_fatal_imap_error(last_err):
-                    raise FatalOutlookMailError(f"IMAP 登录失败: {last_err}")
-                raise RuntimeError(f"IMAP 连接失败: {last_err}")
+                    raise FatalOutlookMailError(f"IMAP login failed: {last_err}")
+                raise RuntimeError(f"IMAP connection failed: {last_err}")
 
-            # ── 探测文件夹（首次） ──
+            # ── Discover folders on the first pass ──
             if found_folders is None:
                 try:
                     typ, listing = M.list()
@@ -415,10 +417,10 @@ def fetch_otp_via_imap(
                         picked.insert(0, "INBOX")
                     found_folders = picked
                 except Exception as e:
-                    logger.warning(f"[outlook-imap] LIST 失败: {e}")
+                    logger.warning(f"[outlook-imap] LIST failed: {e}")
                     found_folders = list(folders_to_scan)
 
-            # ── 扫描邮件 ──
+            # ── Scan messages ──
             for folder in found_folders:
                 try:
                     sel_arg = f'"{folder}"' if " " in folder else folder
@@ -432,7 +434,7 @@ def fetch_otp_via_imap(
                     ids = data[0].split() if data and data[0] else []
                 except Exception as e:
                     logger.warning(
-                        f"[outlook-imap] SEARCH 失败 folder={folder}: {e}"
+                        f"[outlook-imap] SEARCH failed for folder={folder}: {e}"
                     )
                     continue
                 for mid in reversed(ids[-8:]):
@@ -490,9 +492,9 @@ def fetch_otp_via_imap(
         except Exception as e:
             if _is_fatal_imap_error(e):
                 raise FatalOutlookMailError(
-                    f"IMAP 不可用 {email_addr}: {e}"
+                    f"IMAP unavailable for {email_addr}: {e}"
                 ) from e
-            logger.warning(f"[outlook-imap] 异常 (重试): {e}")
+            logger.warning(f"[outlook-imap] Error; retrying: {e}")
             if M:
                 try:
                     M.logout()
@@ -502,28 +504,29 @@ def fetch_otp_via_imap(
     raise TimeoutError(f"outlook IMAP OTP timeout for {email_addr}")
 
 
-# ──────────────────────── MailProvider 适配 ────────────────────────
+# ──────────────────────── MailProvider adapter ────────────────────────
 
 
 @register
 class OutlookMailProvider(MailProvider):
-    """auth_flow / browser_register 通用的 MailProvider 实现。
+    """MailProvider implementation shared by auth_flow and browser_register.
 
-    构造时直接持有 4 段 outlook 凭证，无 DB / 池子。
-    pooled=True 让 auth_flow 在 OpenAI 反欺诈静默拒发 OTP 时 fast-fail，
-    外层 register() 自动 claim 下一个号。
+    Each instance holds one four-field Outlook credential set without direct
+    database or pool access. pooled=True lets auth_flow fail fast when OpenAI
+    silently withholds OTP delivery, so the outer register() call can claim the
+    next account.
     """
 
     kind = "outlook"
-    display_name = "Outlook 接码池"
-    pooled = True          # 号是买来的，用完/废了要换下一个
-    ephemeral = False      # 地址固定，OpenAI 可能识别为已有账号
+    display_name = "Outlook Account Pool"
+    pooled = True          # Replace purchased accounts after use or invalidation.
+    ephemeral = False      # Fixed addresses may be recognized as existing accounts.
 
     line_segments = 4
-    import_hint = "每行一个：email----password----client_id----refresh_token"
+    import_hint = "One account per line: email----password----client_id----refresh_token"
     import_placeholder = "xxx@hotmail.com----Pass123----9e5f94bc-xxxx----M.C5xx_xxx"
 
-    config_fields: list[ConfigField] = []   # 凭证来自号池，无全局配置
+    config_fields: list[ConfigField] = []   # Credentials come from the pool; no global settings.
 
     def __init__(self, email: str, password: str, client_id: str, refresh_token: str):
         self.email = email
@@ -534,12 +537,12 @@ class OutlookMailProvider(MailProvider):
         self.catch_all_domain = email.split("@", 1)[1]
         self._dead = False
 
-    # ── 构造入口 ─────────────────────────────────────────
+    # ── Construction entry point ─────────────────────────────
 
     @classmethod
     def from_config(cls, settings: dict, account: Optional[dict] = None):
         if not account:
-            raise ValueError("outlook provider 需要从号池 claim 到的 account")
+            raise ValueError("The Outlook provider requires an account claimed from the pool")
         return cls(
             email=account["email"],
             password=account.get("password", ""),
@@ -549,23 +552,23 @@ class OutlookMailProvider(MailProvider):
 
     @classmethod
     def parse_line(cls, line: str) -> dict:
-        """4 段格式：email----password----client_id----refresh_token
+        """Parse the four-field email----password----client_id----refresh_token format.
 
-        非法行抛 ValueError 说明原因（不返回 None），
-        调用方会把原因连同行号报给用户。
+        Invalid lines raise ValueError with a specific reason rather than
+        returning None, allowing callers to report the reason with its line number.
         """
         parts = line.split("----")
         if len(parts) != 4:
             raise ValueError(
-                f"需要 4 段（email----password----client_id----refresh_token），"
-                f"实际 {len(parts)} 段"
+                "Expected 4 fields (email----password----client_id----refresh_token); "
+                f"got {len(parts)}"
             )
         email, password, client_id, refresh = (p.strip() for p in parts)
         validate_email(email)
         if not client_id:
-            raise ValueError("client_id 为空")
+            raise ValueError("client_id is empty")
         if len(refresh) < 20:
-            raise ValueError(f"refresh_token 太短（{len(refresh)} 字符，至少 20）")
+            raise ValueError(f"refresh_token is too short ({len(refresh)} characters; minimum 20)")
         return {
             "email": email.lower(),
             "password": password,
@@ -574,7 +577,7 @@ class OutlookMailProvider(MailProvider):
             "kind": cls.kind,
         }
 
-    # ── 号池语义 ─────────────────────────────────────────
+    # ── Account-pool semantics ───────────────────────────────
 
     @property
     def exhausted(self) -> bool:
@@ -584,10 +587,10 @@ class OutlookMailProvider(MailProvider):
         logger.warning(f"[mail] outlook {self.email} mark dead: {reason}")
         self._dead = True
 
-    # ── 收发 ────────────────────────────────────────────
+    # ── Mail operations ──────────────────────────────────────
 
     def create_mailbox(self) -> str:
-        logger.info(f"[mail] 使用 outlook 账号: {self.email}")
+        logger.info(f"[mail] Using Outlook account: {self.email}")
         return self.email
 
     def wait_for_otp(
@@ -606,8 +609,8 @@ class OutlookMailProvider(MailProvider):
         if has_oauth:
             try:
                 logger.info(
-                    f"[mail] Graph API 取 OTP -> {email_addr} "
-                    f"(timeout={method_timeout}s, IMAP兜底=Y)"
+                    f"[mail] Fetching OTP through Graph API -> {email_addr} "
+                    f"(timeout={method_timeout}s, IMAP fallback=Y)"
                 )
                 return fetch_otp_via_graph(
                     self.email,
@@ -620,12 +623,12 @@ class OutlookMailProvider(MailProvider):
             except Exception as e:
                 graph_error = e
                 logger.warning(
-                    f"[mail] Graph 失败 ({type(e).__name__}: {e})，"
-                    f"切换 IMAP (timeout={method_timeout}s)"
+                    f"[mail] Graph failed ({type(e).__name__}: {e}); "
+                    f"switching to IMAP (timeout={method_timeout}s)"
                 )
 
         logger.info(
-            f"[mail] IMAP 取 OTP -> {email_addr} "
+            f"[mail] Fetching OTP through IMAP -> {email_addr} "
             f"(timeout={method_timeout}s, "
             f"xoauth2={'Y' if has_oauth else 'N'} "
             f"password={'Y' if has_password else 'N'})"
@@ -643,8 +646,8 @@ class OutlookMailProvider(MailProvider):
         except Exception as e:
             if graph_error is not None:
                 logger.warning(
-                    f"[mail] IMAP 也失败 ({type(e).__name__}: {e})；"
-                    f"Graph 先前错误: {type(graph_error).__name__}: {graph_error}"
+                    f"[mail] IMAP also failed ({type(e).__name__}: {e}); "
+                    f"previous Graph error: {type(graph_error).__name__}: {graph_error}"
                 )
             raise
 

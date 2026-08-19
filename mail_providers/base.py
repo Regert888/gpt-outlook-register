@@ -1,37 +1,34 @@
-"""邮箱 Provider 抽象层 —— 加新邮箱只改这一个目录。
+"""Abstract mail-provider layer: add new providers only in this directory.
 
-设计目标：
-    加一种新邮箱 = 新建 1 个文件 + 注册表加 1 行，核心库（auth_flow /
-    registrar / db / app / auto_loop）一行不动。
+Design goal:
+    Adding a provider requires one new file and one registry import, with no
+    changes to auth_flow, registrar, db, app, or auto_loop.
 
-对照参考：本项目 sms_provider.py 的 BaseSmsProvider + create_sms_provider
-    已经是这个模式，加接码平台只要 2 处改动。邮箱这块补齐同款。
+This mirrors BaseSmsProvider and create_sms_provider in sms_provider.py.
 
 ────────────────────────────────────────────────────────────
-两个正交的能力维度（务必分清，混用会踩坑）
+Two independent capability dimensions
 ────────────────────────────────────────────────────────────
 
-    pooled     号是"买来的、有限的、废了要换下一个"
-               → 决定 auth_flow 的 fast-fail / mark_dead 行为
-               → 决定 registrar 要不要 claim / mark_done / release
+    pooled     Accounts are purchased, finite resources that must be replaced
+               when unusable. This controls fast-fail, mark_dead, claim,
+               mark_done, and release behavior.
 
-    ephemeral  地址是不是"每次都新造一个"
-               → 决定 OpenAI 把它当新号还是老号
-               → ephemeral=False 的固定地址可能被路由到
-                 page_type='login_password'，需要密码才能过
+    ephemeral  Whether each run creates a fresh address. Fixed addresses may
+               be recognized as existing accounts and routed to
+               page_type='login_password', which requires a password.
 
-    这两个维度是独立的，四种组合都真实存在：
+    These dimensions are independent and all combinations are valid:
 
-        provider            pooled  ephemeral   说明
+        provider            pooled  ephemeral   description
         ─────────────────── ─────── ─────────  ──────────────────────
-        Outlook 接码池        True    False     导入一批固定号，用完换
-        CF catch-all         False   True      自己造随机地址，无限
-        Gmail / 通用 IMAP     True    False     同 Outlook
-        iCloud relay 中转     False   False     固定地址但无密码 ⚠️
+        Outlook pool         True    False     imported fixed accounts
+        CF catch-all         False   True      unlimited generated addresses
+        Gmail / IMAP         True    False     same model as Outlook
+        iCloud relay         False   False     fixed address without password
 
-    ⚠️ 最后一行是上次 iCloud 失败的根因：pooled=False 让它避开了号池逻辑，
-       但 ephemeral=False 意味着 OpenAI 会当老号处理 → 要密码 → 401。
-       只用单个 pooled 属性表达不了这个差异，所以拆成两个。
+    Keeping both flags prevents a fixed iCloud relay address from bypassing
+    pool logic while still being mistaken for a newly created account.
 """
 from __future__ import annotations
 
@@ -41,20 +38,16 @@ from typing import Any, Callable, Optional
 
 
 # ════════════════════════════════════════════════════════════
-#  异常类型
+#  Exception types
 # ════════════════════════════════════════════════════════════
 
 class MailProviderError(Exception):
-    """provider 统一异常。
+    """Common provider exception with structured severity.
 
-    带 fatal 标志，替代 registrar.classify_error 里按字符串嗅探
-    （"outlook imap account unusable" 之类硬编码文案，新 provider
-    永远命中不了，会被误判成 unknown → 号被错误标记为永久失败）。
-
-        fatal=True   号本身废了（凭证失效 / 被封 / 收件链路不可用）
-                     → registrar 应 mark_failed
-        fatal=False  环境/网络问题，号是无辜的
-                     → registrar 应 release_unused 放回池子
+    ``fatal=True`` means the account itself is unusable and registrar should
+    mark it failed. ``fatal=False`` indicates an environmental or network
+    problem, so registrar should release it back to the pool. This replaces
+    brittle message sniffing in registrar.classify_error.
     """
 
     def __init__(self, message: str, *, fatal: bool = False, kind: str = ""):
@@ -64,40 +57,33 @@ class MailProviderError(Exception):
 
 
 class ImportValidationError(Exception):
-    """导入文本有非法行。
+    """Import text contains invalid lines.
 
-    带上每一行的行号和原因，让 WebUI 能精确告诉用户"第 3 行错在哪"。
-
-    存在的理由：旧 db.parse_lines 用 `if len(parts) != 4: continue`
-    静默丢弃非法行，用户看到的是"导入成功"但列表里少了几个号，
-    完全无从排查。现在有一行错就整批拒绝，一个都不写库。
+    Includes each line number and reason so the WebUI can identify the exact
+    problem. Rejecting the entire batch prevents silent partial imports.
     """
 
     def __init__(self, errors: list[dict]):
         self.errors = errors
         head = "; ".join(
-            f"第 {e.get('line')} 行: {e.get('error')}" for e in errors[:5]
+            f"Line {e.get('line')}: {e.get('error')}" for e in errors[:5]
         )
         if len(errors) > 5:
-            head += f"; …另有 {len(errors) - 5} 行有问题"
-        super().__init__(head or "导入内容无效")
+            head += f"; …and {len(errors) - 5} more invalid lines"
+        super().__init__(head or "Invalid import content")
 
 
-# 单次导入上限（防止误粘贴整个文件把 UI 卡死）
+# Per-import limits prevent accidentally pasting a huge file into the UI.
 MAX_IMPORT_LINES = 5000
 MAX_IMPORT_BYTES = 2 * 1024 * 1024
 
 
 # ════════════════════════════════════════════════════════════
-#  配置字段自描述（供 WebUI 动态渲染表单）
+#  Self-describing configuration fields for dynamic WebUI forms
 # ════════════════════════════════════════════════════════════
 
 class ConfigField:
-    """一个配置项的元信息。
-
-    provider 声明自己需要哪些配置，WebUI 据此自动渲染表单 ——
-    加 provider 时前端一行都不用改。
-    """
+    """Metadata for one setting rendered dynamically by the WebUI."""
 
     def __init__(
         self,
@@ -128,7 +114,7 @@ class ConfigField:
 
 
 # ════════════════════════════════════════════════════════════
-#  共享工具：OTP 提取
+#  Shared OTP extraction utilities
 # ════════════════════════════════════════════════════════════
 
 _RE_SPAN_CODE = re.compile(r"<span[^>]*>\s*(\d{6})\s*</span>")
@@ -139,16 +125,11 @@ _RE_OTP6 = re.compile(r"(?<!#)(?<!\d)(\d{6})(?!\d)")
 
 
 def extract_otp(raw: str, code_pattern: Optional[str] = None) -> Optional[str]:
-    """从邮件原文提取 6 位 OTP。
+    """Extract a six-digit OTP while avoiding common false matches.
 
-    原本 mail_outlook.py 和 mail_cf.py 各写了一份，规则还不完全一样。
-    收敛到这里，所有 provider 共用同一套防误判逻辑：
-
-      1. 优先匹配 <span>XXXXXX</span>（HTML 标签包裹的验证码）
-      2. 跳过 MIME header（只搜 \\r\\n\\r\\n 之后的 body）
-      3. 剔除邮箱地址（避免 user123456@x.com 误判）
-      4. 剔除时间戳模式（m=+XXXXXX. 和 t=XXXXXXXXXX）
-      5. 剔除 hex 颜色（前缀 # 或紧跟其他数字的不算）
+    Prefer codes wrapped in ``<span>``; search after the MIME header; remove
+    email addresses and timestamp parameters; and reject hexadecimal colors
+    or digits embedded in longer numbers. All providers share these rules.
     """
     if not raw:
         return None
@@ -172,49 +153,43 @@ def extract_otp(raw: str, code_pattern: Optional[str] = None) -> Optional[str]:
 
 
 # ════════════════════════════════════════════════════════════
-#  抽象基类
+#  Abstract base class
 # ════════════════════════════════════════════════════════════
 
 class MailProvider(ABC):
-    """所有邮箱 provider 的基类。
+    """Base class for mail providers.
 
-    子类必须实现 create_mailbox() 和 wait_for_otp()，
-    其余全部有默认实现，按需覆盖。
+    Subclasses must implement create_mailbox() and wait_for_otp(); all other
+    behavior has defaults that may be overridden.
     """
 
-    # ── 身份 ──────────────────────────────────────────────
-    kind: str = "base"                   # 唯一标识，等于 db 里存的 mail_source
-    display_name: str = "未命名"          # WebUI 下拉框显示名
+    # -- Identity ------------------------------------------------------------
+    kind: str = "base"                   # Unique identifier stored as mail_source.
+    display_name: str = "Unnamed"         # Label shown in WebUI selectors.
 
-    # ── 能力声明（详见模块 docstring）─────────────────────
-    pooled: bool = False                 # 是否从号池 claim
-    ephemeral: bool = False              # 地址是否每次新建
+    # -- Capability declarations (see the module docstring) -----------------
+    pooled: bool = False                 # Claim accounts from a finite pool.
+    ephemeral: bool = False              # Create a fresh address for each run.
 
-    # "OpenAI 说这个邮箱已经注册过了" 算不算失败。
-    #   False（默认）想注册新号却撞上老号 → 这个号没用了，标记失败
-    #   True          本来就是买的老号，走 passwordless_login 拿 token
-    #                 才是正常流程，不该判失败
+    # Whether an "already registered" response is acceptable. Purchased
+    # accounts may use passwordless_login instead of being marked dead.
     accepts_existing_account: bool = False
 
-    # ── 导入格式 ─────────────────────────────────────────
-    line_segments: int = 0               # ---- 分隔的段数；0 = 不支持导入
-    import_hint: str = ""                # WebUI 导入页的格式提示
-    import_placeholder: str = ""         # 输入框 placeholder 示例
+    # -- Import format -------------------------------------------------------
+    line_segments: int = 0               # Number of ---- fields; 0 disables import.
+    import_hint: str = ""                # Format hint shown on the import page.
+    import_placeholder: str = ""         # Example textarea placeholder.
 
-    # ── 配置项声明（WebUI 动态表单）───────────────────────
+    # -- Configuration fields used by the dynamic WebUI form ----------------
     config_fields: list[ConfigField] = []
 
     # ────────────────────────────────────────────────────
-    #  必须实现
+    # Required implementations
     # ────────────────────────────────────────────────────
 
     @abstractmethod
     def create_mailbox(self) -> str:
-        """返回本次注册要用的邮箱地址。
-
-        ephemeral=True  → 每次调用造一个新地址
-        ephemeral=False → 返回已持有的固定地址
-        """
+        """Return a fresh address when ephemeral, otherwise the held address."""
         ...
 
     @abstractmethod
@@ -224,15 +199,15 @@ class MailProvider(ABC):
         timeout: int = 120,
         issued_after: Optional[float] = None,
     ) -> str:
-        """阻塞等待 OTP，拿到返回 6 位码，超时抛 TimeoutError。
+        """Block until a six-digit OTP arrives or raise TimeoutError.
 
-        issued_after 是防串号时间窗：只接受这个时间点之后到达的邮件，
-        避免读到上一轮遗留的旧验证码。务必尊重这个参数。
+        ``issued_after`` prevents cross-run code reuse by accepting only
+        messages delivered after that time.
         """
         ...
 
     # ────────────────────────────────────────────────────
-    #  选做：非破坏性预读（省掉多余的一封验证码）
+    # Optional non-destructive pre-read to avoid requesting an extra OTP
     # ────────────────────────────────────────────────────
 
     def peek_otp(
@@ -241,66 +216,48 @@ class MailProvider(ABC):
         issued_after: Optional[float] = None,
         wait: float = 0.0,
     ) -> Optional[str]:
-        """瞄一眼收件箱里【是不是已经有】本轮的码，没有就返回 None。
+        """Return this run's existing OTP without consuming its message.
 
-        为什么要有这个（2026-08-08 实测 <测试号>@<自建域>）：
-            get_auth_url 会带 login_hint=<邮箱>（auth_flow.py:1662），OpenAI
-            一看到就【抢跑发码】，比我们正式提交邮箱早整整 20 秒。之后每个
-            环节再各补一封，一轮 challenge 能收到 3 封【码完全一样】的信。
-            调用方先 peek 一下，命中就不用再喊服务端发第三封了。
-
-        和 wait_for_otp 的三点区别，缺一不可：
-            1. 不阻塞死等 —— wait_for_otp 有 `timeout=max(timeout,60)` 的下限，
-               拿它探路会白卡一分钟；这里 wait 默认 0（打一次就走）。
-            2. 拿不到不抛异常，返回 None 让调用方走原来的发码路径。
-            3. **非破坏性** —— 不得把看过的邮件记进 seen 集合。否则探一次
-               没探到，紧接着的 wait_for_otp 就再也看不见那几封信了。
-
-        默认实现返回 None（= 保持原有「先发再等」行为），
-        provider 想省这封信就覆盖它。
+        OpenAI may send a code as soon as it sees ``login_hint``, before the
+        explicit email submission. A pre-read avoids requesting a duplicate.
+        It must not block indefinitely, must return None rather than raise when
+        no code exists, and must not add messages to the seen set. The default
+        preserves request-then-wait behavior.
         """
         return None
 
     # ────────────────────────────────────────────────────
-    #  号池语义（默认非池化，pooled 子类按需覆盖）
+    #  Account-pool semantics; pooled subclasses may override
     # ────────────────────────────────────────────────────
 
     @property
     def exhausted(self) -> bool:
-        """本号是否已判定为不可用（收不到码 / 凭证失效）。
-
-        auth_flow 据此决定超时后要不要 retry —— 已 dead 的号
-        再等一轮也是浪费。
-        """
+        """Whether the account is unusable due to delivery or credentials."""
         return getattr(self, "_dead", False)
 
     def mark_dead(self, reason: str = "") -> None:
-        """标记本号废掉。非池化 provider 默认无操作。"""
+        """Mark a pooled account unusable; non-pooled providers do nothing."""
         if self.pooled:
             self._dead = True
 
     # ────────────────────────────────────────────────────
-    #  导入格式（pooled provider 覆盖）
+    #  Import format; pooled providers may override
     # ────────────────────────────────────────────────────
 
     @classmethod
     def parse_line(cls, line: str) -> dict:
-        """把一行导入文本解析成 account dict。
+        """Parse one import line into an account dictionary.
 
-        非法行必须 **抛 ValueError 并说明原因**，不要返回 None ——
-        调用方会把原因连同行号一起报给用户。
-
-        默认实现：按 line_segments 切分并做基础校验。
-        字段名固定为 seg1/seg2/...，子类通常要覆盖成有意义的名字。
-
-        返回的 dict 会被存进 db，再由 from_config() 还原成实例。
+        Invalid input must raise ValueError with a reason so callers can attach
+        the line number. The default splits by ``line_segments``, validates the
+        email, and stores remaining values as seg1, seg2, and so on.
         """
         if cls.line_segments <= 0:
-            raise ValueError(f"{cls.display_name} 不支持导入号池")
+            raise ValueError(f"{cls.display_name} does not support account-pool imports")
         parts = [p.strip() for p in line.split("----")]
         if len(parts) != cls.line_segments:
             raise ValueError(
-                f"需要 {cls.line_segments} 段（用 ---- 分隔），实际 {len(parts)} 段"
+                f"Expected {cls.line_segments} fields separated by ----; got {len(parts)}"
             )
         validate_email(parts[0])
         out: dict[str, Any] = {"email": parts[0].lower(), "kind": cls.kind}
@@ -309,7 +266,7 @@ class MailProvider(ABC):
         return out
 
     # ────────────────────────────────────────────────────
-    #  构造入口
+    #  Construction entry point
     # ────────────────────────────────────────────────────
 
     @classmethod
@@ -318,29 +275,24 @@ class MailProvider(ABC):
         settings: dict,
         account: Optional[dict] = None,
     ) -> "MailProvider":
-        """从「设置 + 号池记录」构造实例 —— registrar 的唯一入口。
+        """Build from global settings and an optional claimed pool account.
 
-            settings  db 里的全局配置（api_url / token / domain ...）
-            account   pooled provider 从号池 claim 到的那一行；
-                      非池化 provider 传 None
-
-        子类必须实现。默认抛错以免静默构造出错误实例。
+        This is registrar's sole construction entry point. Subclasses must
+        implement it; the default fails explicitly.
         """
         raise NotImplementedError(
-            f"{cls.__name__} 未实现 from_config()"
+            f"{cls.__name__} does not implement from_config()"
         )
 
     # ────────────────────────────────────────────────────
-    #  连通性自检（WebUI「测试」按钮）
+    #  Connectivity self-test used by the WebUI
     # ────────────────────────────────────────────────────
 
     def self_test(self) -> dict:
-        """返回 {"ok": bool, "message": str}。默认表示不支持测试。"""
-        return {"ok": True, "message": f"{self.display_name} 无需测试"}
+        """Return ``{"ok": bool, "message": str}``; default needs no test."""
+        return {"ok": True, "message": f"{self.display_name} does not require a connectivity test"}
 
-    # 各 provider 在 __init__ 里都设了实例属性，这里放个类级默认值，
-    # 防止将来新写的 provider 漏设时被 getattr 打成 AttributeError。
-    # （auth_flow 目前不读它，纯占位。）
+    # Class-level placeholder prevents AttributeError in future providers.
     last_persona = None
 
     def __repr__(self) -> str:
@@ -351,14 +303,14 @@ class MailProvider(ABC):
 
 
 # ════════════════════════════════════════════════════════════
-#  注册表 + 工厂
+#  Registry and factory
 # ════════════════════════════════════════════════════════════
 
 _PROVIDERS: dict[str, type[MailProvider]] = {}
 
 
 def register(provider_cls: type[MailProvider]) -> type[MailProvider]:
-    """注册一个 provider。可直接当装饰器用：
+    """Register a provider; may be used directly as a decorator::
 
         @register
         class MyMailProvider(MailProvider):
@@ -366,25 +318,24 @@ def register(provider_cls: type[MailProvider]) -> type[MailProvider]:
     """
     key = (provider_cls.kind or "").strip().lower()
     if not key or key == "base":
-        raise ValueError(f"{provider_cls.__name__} 必须定义唯一的 kind")
+        raise ValueError(f"{provider_cls.__name__} must define a unique kind")
     if key in _PROVIDERS and _PROVIDERS[key] is not provider_cls:
-        raise ValueError(f"kind='{key}' 已被 {_PROVIDERS[key].__name__} 占用")
+        raise ValueError(f"kind='{key}' is already registered by {_PROVIDERS[key].__name__}")
     _PROVIDERS[key] = provider_cls
     return provider_cls
 
 
 def get_provider_class(kind: str) -> type[MailProvider]:
-    """按 kind 拿 provider 类，未知 kind 抛错（不静默回退）。
+    """Return the provider class for kind and reject unknown values.
 
-    注意：db.save_mail_config 以前用白名单 ("outlook","cf_temp")
-    把未知值静默改写成 "outlook"，导致「选了新邮箱保存后跳回微软」。
-    这里明确抛错，让问题在第一时间暴露。
+    Explicit failure avoids the old behavior where db.save_mail_config silently
+    rewrote unknown providers to Outlook.
     """
     key = (kind or "").strip().lower()
     if key not in _PROVIDERS:
-        known = ", ".join(sorted(_PROVIDERS)) or "(空)"
+        known = ", ".join(sorted(_PROVIDERS)) or "(none)"
         raise MailProviderError(
-            f"未知邮箱来源: '{kind}'（已注册: {known}）", fatal=True
+            f"Unknown mail provider: '{kind}' (registered: {known})", fatal=True
         )
     return _PROVIDERS[key]
 
@@ -394,16 +345,12 @@ def create_mail_provider(
     settings: dict,
     account: Optional[dict] = None,
 ) -> MailProvider:
-    """registrar 的唯一构造入口，替代原来的 if/else 路由。"""
+    """Registrar's sole provider-construction entry point."""
     return get_provider_class(kind).from_config(settings, account)
 
 
 def list_providers() -> list[dict]:
-    """给 WebUI 用：列出所有已注册 provider 及其能力/配置项。
-
-    前端据此渲染「邮箱来源」下拉框和对应的动态表单，
-    加 provider 时前端零改动。
-    """
+    """List registered providers and their WebUI-rendered capabilities."""
     out = []
     for key in sorted(_PROVIDERS):
         c = _PROVIDERS[key]
@@ -421,15 +368,10 @@ def list_providers() -> list[dict]:
 
 
 def list_pooled_providers() -> list[dict]:
-    """只列出真正走号池的 provider（pooled 且声明了导入格式）。
+    """List providers that are pooled and declare an import format.
 
-    导入页的下拉框用这个，免得把 CF 这种"自己造地址"的也列出来
-    —— 它压根没有号可导。
-
-    ⚠️ 两个条件都要判，不能只看 line_segments：
-       iCloud 中转是 pooled=False（地址在配置页填死），但它把
-       parse_line 和 2 段格式先写好了给将来用 —— 只看段数会把它
-       误列进导入页，导进去的号永远不会被 claim。
+    Both conditions matter: address-generating providers have nothing to
+    import, while a non-pooled provider may still define a future parse format.
     """
     return [
         p for p in list_providers()
@@ -438,41 +380,31 @@ def list_pooled_providers() -> list[dict]:
 
 
 def validate_email(email: str) -> None:
-    """基础邮箱格式校验，不合法抛 ValueError。
-
-    只挡明显错的（没 @ / 多个 @ / 域名没点 / 带空格），
-    不做 RFC 全量校验 —— 真正能不能收信要跑起来才知道。
-    """
+    """Reject obvious email-format errors without full RFC validation."""
     em = (email or "").strip()
     if not em:
-        raise ValueError("邮箱为空")
+        raise ValueError("Email address is empty")
     if len(em) > 320:
-        raise ValueError("邮箱过长")
+        raise ValueError("Email address is too long")
     if em.count("@") != 1:
-        raise ValueError(f"邮箱格式错误: {em[:60]}")
+        raise ValueError(f"Invalid email address: {em[:60]}")
     local, domain = em.rsplit("@", 1)
     if not local or not domain or "." not in domain:
-        raise ValueError(f"邮箱格式错误: {em[:60]}")
+        raise ValueError(f"Invalid email address: {em[:60]}")
     if any(ch.isspace() for ch in em):
-        raise ValueError(f"邮箱含空格: {em[:60]}")
+        raise ValueError(f"Email address contains whitespace: {em[:60]}")
 
 
 def parse_import_line(line: str, kind: str = "") -> dict:
-    """解析一行导入文本，非法抛 ValueError（带原因）。
+    """Parse one import line or raise ValueError with a reason.
 
-        kind 指定 → 只用该 provider 解析（推荐，唯一可靠的方式）
-        kind 为空 → 按 line_segments 猜（仅当段数唯一时可判定）
-
-    ⚠️ 自动识别有天然局限：Outlook 和 Gmail 都是 4 段格式，
-       段数一样，猜不出来。所以 WebUI 必须让用户显式选来源，
-       自动识别只当兜底。
-
-    替代 db.parse_lines 里写死的 `if len(parts) != 4: continue`
-    —— 那行会把任何非 4 段格式静默丢掉，「导入成功但列表为空」就是它。
+    A supplied kind selects one provider. Without it, field count is used only
+    when it uniquely identifies a provider. The WebUI should request an
+    explicit kind for ambiguous formats such as Outlook and Gmail.
     """
     line = (line or "").strip()
     if not line:
-        raise ValueError("空行")
+        raise ValueError("Empty line")
 
     if kind:
         return get_provider_class(kind).parse_line(line)
@@ -487,49 +419,47 @@ def parse_import_line(line: str, kind: str = "") -> dict:
             c.line_segments for c in _PROVIDERS.values() if c.line_segments > 0
         })
         raise ValueError(
-            f"{seg_count} 段格式无法识别（已知的号池格式是 {known} 段）"
+            f"Unrecognized {seg_count}-field format (known account-pool formats use {known} fields)"
         )
     if len(candidates) > 1:
         names = "/".join(c.display_name for c in candidates)
         raise ValueError(
-            f"{seg_count} 段格式有多种可能（{names}），请在页面上指定邮箱来源"
+            f"The {seg_count}-field format matches multiple providers ({names}); select the mail provider in the UI"
         )
     return candidates[0].parse_line(line)
 
 
 def parse_import_text(text: str, kind: str = "") -> list[dict]:
-    """批量解析导入文本，**有一行错就整批拒绝**（抛 ImportValidationError）。
+    """Parse a batch atomically and reject it if any line is invalid.
 
-    这是"全对才写"策略：宁可让用户改完重来，也不要写进去一半
-    ——写一半的结果是号池里混着不知道哪几个号没进去，对不上账。
-
-    重复邮箱在这一步就查出来，不留给数据库主键冲突。
+    Duplicate addresses are detected here rather than left to a database-key
+    conflict.
     """
-    # kind 非法是整体性错误，不是某一行的问题 —— 先抛，
-    # 免得每一行都报一遍同样的"未知邮箱来源"
+    # Invalid kind is a batch-level error, so validate it before each line.
     if kind:
         cls = get_provider_class(kind)
         if cls.line_segments <= 0:
             raise MailProviderError(
-                f"{cls.display_name} 不支持导入号池（它自己造地址）", fatal=True
+                f"{cls.display_name} does not support account-pool imports because it creates its own addresses",
+                fatal=True,
             )
 
     if not isinstance(text, str) or not text.strip():
-        raise ImportValidationError([{"line": 0, "error": "导入内容为空"}])
+        raise ImportValidationError([{"line": 0, "error": "Import content is empty"}])
     if len(text.encode("utf-8")) > MAX_IMPORT_BYTES:
-        raise ImportValidationError([{"line": 0, "error": "导入内容超过 2 MiB"}])
+        raise ImportValidationError([{"line": 0, "error": "Import content exceeds 2 MiB"}])
 
-    # 去 BOM，跳过空行和 # 注释行，但保留原始行号用于报错
+    # Strip BOM and skip blank/comment lines while preserving source line numbers.
     numbered = [
         (n, raw.strip())
         for n, raw in enumerate(text.replace("﻿", "", 1).splitlines(), 1)
         if raw.strip() and not raw.strip().startswith("#")
     ]
     if not numbered:
-        raise ImportValidationError([{"line": 0, "error": "没有可导入的内容"}])
+        raise ImportValidationError([{"line": 0, "error": "No importable content found"}])
     if len(numbered) > MAX_IMPORT_LINES:
         raise ImportValidationError(
-            [{"line": 0, "error": f"单次最多导入 {MAX_IMPORT_LINES} 行"}]
+            [{"line": 0, "error": f"A single import is limited to {MAX_IMPORT_LINES} lines"}]
         )
 
     errors: list[dict] = []
@@ -540,7 +470,7 @@ def parse_import_text(text: str, kind: str = "") -> list[dict]:
             row = parse_import_line(line, kind)
             em = (row.get("email") or "").lower()
             if em in seen:
-                raise ValueError(f"邮箱重复: {em}")
+                raise ValueError(f"Duplicate email address: {em}")
             seen.add(em)
             rows.append(row)
         except (ValueError, MailProviderError) as e:

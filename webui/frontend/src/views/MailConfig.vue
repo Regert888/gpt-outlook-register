@@ -1,9 +1,9 @@
 <script setup>
-// 邮箱来源配置。
+// Email provider configuration.
 //
-// 这个页面不认识任何具体邮箱 —— 单选项和下面的表单字段全部来自
-// GET /api/mail/providers 的声明（provider 类里的 config_fields）。
-// 后端加一种邮箱，这个文件一行都不用改。
+// This page has no provider-specific knowledge. Radio options and form fields
+// come from GET /api/mail/providers and each provider's config_fields declaration,
+// so adding a backend provider requires no changes here.
 import { computed, onActivated, ref } from 'vue'
 import { ElMessage } from 'element-plus'
 import { getMailConfig, getMailProviders, saveMailConfig, testMail } from '@/api/settings'
@@ -11,8 +11,8 @@ import FooterToolbar from '@/components/FooterToolbar.vue'
 
 const providers = ref([])
 const source = ref('outlook')
-const form = ref({})          // { 字段 key: 用户填的值 }
-const saved = ref({})         // 后端返回的原值，密码类是 '***'
+const form = ref({})          // { field key: user-entered value }
+const saved = ref({})         // Values returned by the backend; secret fields are masked as '***'.
 const loading = ref(true)
 const saving = ref(false)
 const testing = ref(false)
@@ -22,14 +22,14 @@ const current = computed(
 )
 const fields = computed(() => current.value?.config_fields || [])
 
-// 池化 provider（Outlook 这类导号进来的）连通性绑在具体某个号上，
-// 没号可测；测试按钮只对非池化的显示。
+// Pooled providers such as Outlook are tested through individual accounts.
+// Show the connection test only for non-pooled providers.
 const canTest = computed(() => !!current.value && !current.value.pooled)
 
-/** 密码类字段已存过 → 输入框留空表示"不修改"，提示语要说清楚 */
+/** For saved secret fields, leaving the input blank preserves the existing value. */
 function phFor(f) {
   if (f.type === 'password' && saved.value[f.key] === '***') {
-    return '已设置（留空则不修改）'
+    return 'Already configured (leave blank to keep it)'
   }
   return f.placeholder || ''
 }
@@ -42,7 +42,7 @@ async function load() {
     saved.value = cfg.config || {}
     source.value = saved.value.mail_source || pr.current || 'outlook'
 
-    // 回填：密码类一律留空（后端存的是 '***'，填进去会把真值覆盖掉）
+    // Leave secret inputs blank. Filling the backend mask would overwrite the real value.
     const next = {}
     for (const p of providers.value) {
       for (const f of p.config_fields) {
@@ -62,7 +62,7 @@ async function save() {
   for (const f of fields.value) {
     const v = (form.value[f.key] ?? '').trim()
     if (f.type === 'password' && !v) {
-      // 留空 = 不修改。后端见到 '***' 会跳过，不覆盖已存的真 token
+      // Blank means unchanged. The backend skips '***' and preserves the stored token.
       if (saved.value[f.key] === '***') continue
     }
     payload[f.key] = v
@@ -75,14 +75,14 @@ async function save() {
       return !v && !(f.type === 'password' && saved.value[f.key] === '***')
     })
   if (missing.length) {
-    ElMessage.warning('还没填：' + missing.map((f) => f.label).join('、'))
+    ElMessage.warning('Complete the following fields: ' + missing.map((f) => f.label).join(', '))
     return
   }
 
   saving.value = true
   try {
     await saveMailConfig(payload)
-    ElMessage.success('保存成功')
+    ElMessage.success('Configuration saved')
     await load()
   } catch (e) {
     ElMessage.error(e.message)
@@ -95,7 +95,7 @@ async function test() {
   testing.value = true
   try {
     const r = await testMail()
-    ElMessage.success(r.message || '连通正常')
+    ElMessage.success(r.message || 'Connection successful')
   } catch (e) {
     ElMessage.error(e.message)
   } finally {
@@ -111,14 +111,14 @@ load()
   <div class="page" v-loading="loading">
     <el-card shadow="never" style="max-width: 720px">
       <template #header>
-        <span class="section-title" style="margin: 0">邮箱来源配置</span>
+        <span class="section-title" style="margin: 0">Email Provider Configuration</span>
       </template>
       <p class="hint">
-        OpenAI 注册需要邮箱收 OTP。下面的选项由后端已注册的 provider 自动生成。
+        OpenAI registration requires an email address that can receive OTP codes. The options below are generated from providers registered by the backend.
       </p>
 
       <el-form label-position="top">
-        <el-form-item label="邮箱来源">
+        <el-form-item label="Email provider">
           <el-radio-group v-model="source">
             <el-radio v-for="p in providers" :key="p.kind" :value="p.kind">
               {{ p.display_name }}
@@ -126,22 +126,22 @@ load()
           </el-radio-group>
         </el-form-item>
 
-        <!-- 能力说明：让主人一眼看出这种邮箱是怎么工作的 -->
+        <!-- Capability summary describing how the selected provider works. -->
         <el-form-item v-if="current">
           <div class="caps">
             <el-tag size="small" :type="current.pooled ? 'warning' : 'success'">
-              {{ current.pooled ? '号池型：需先导入号，用完要补' : '自建型：自动生成地址，无限量' }}
+              {{ current.pooled ? 'Account pool: import accounts and replenish them as needed' : 'Self-hosted: generates addresses automatically' }}
             </el-tag>
             <el-tag size="small" :type="current.ephemeral ? 'success' : 'info'">
-              {{ current.ephemeral ? '每次新地址' : '固定地址' }}
+              {{ current.ephemeral ? 'New address each time' : 'Fixed address' }}
             </el-tag>
             <el-tag v-if="current.line_segments > 0" size="small" type="info">
-              导入格式 {{ current.line_segments }} 段
+              {{ current.line_segments }}-field import format
             </el-tag>
           </div>
         </el-form-item>
 
-        <!-- 配置项：完全由 provider 声明驱动 -->
+        <!-- Configuration fields are entirely driven by the provider declaration. -->
         <el-form-item v-for="f in fields" :key="f.key" :label="f.label">
           <el-input
             v-model="form[f.key]"
@@ -155,23 +155,23 @@ load()
         <el-alert
           v-if="current && !current.pooled && fields.length"
           type="warning" :closable="false" show-icon
-          title="自建邮箱需要把域名的 catch-all 收件正确转发到服务端，否则收不到验证码。"
+          title="For self-hosted email, configure the domain's catch-all inbox to forward mail to the server. Otherwise, verification codes will not arrive."
         />
 
         <el-alert
           v-if="current && current.pooled"
           type="info" :closable="false" show-icon
-          :title="`${current.display_name} 不需要在这里配置，去「导入邮箱」页把号导进来即可。`"
+          :title="`${current.display_name} does not require configuration here. Add accounts from the Import Email Accounts page.`"
         />
       </el-form>
     </el-card>
 
     <FooterToolbar>
       <template #left>
-        邮箱来源：{{ current?.display_name || source }}
+        Email provider: {{ current?.display_name || source }}
       </template>
-      <el-button v-if="canTest" :loading="testing" @click="test">测试连通性</el-button>
-      <el-button type="primary" :loading="saving" @click="save">保存配置</el-button>
+      <el-button v-if="canTest" :loading="testing" @click="test">Test Connection</el-button>
+      <el-button type="primary" :loading="saving" @click="save">Save Configuration</el-button>
     </FooterToolbar>
   </div>
 </template>

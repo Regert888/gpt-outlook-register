@@ -1,10 +1,10 @@
-# ChatGPT 纯协议注册（Outlook 邮箱版）依赖
+# Dependencies for HTTP-only ChatGPT registration with Outlook
 
-# HTTP 客户端 + TLS 指纹模拟（Cloudflare 绕过的关键）
+# HTTP client with TLS fingerprint impersonation (required for Cloudflare)
 curl-cffi>=0.7.0
 requests>=2.31.0
 
-# WebUI（可选；只跑 register_outlook.py 命令行不需要）
+# Optional WebUI dependencies; not required for register_outlook.py alone
 fastapi>=0.110.0
 uvicorn[standard]>=0.27.0
 pydantic>=2.5.0

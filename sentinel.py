@@ -1,12 +1,11 @@
-"""
-OpenAI Sentinel Token 生成入口。
+"""OpenAI Sentinel token generation entry point.
 
-唯一有效路径：QuickJS（Node 子进程跑 OpenAI 真实 sdk.js），
-同时返回主 token 和 SO token。
+The only supported path runs OpenAI's real sdk.js through QuickJS in a Node
+subprocess and returns both the main token and the SO token.
 
-公开 API：
+Public API:
   get_sentinel_token(session, device_id, flow, ...) -> (sentinel_token, so_token)
-  失败时抛 RuntimeError，调用方应终止当前注册流程。
+  Raises RuntimeError on failure; callers should stop the current registration.
 """
 
 from __future__ import annotations
@@ -47,7 +46,7 @@ def get_sentinel_token(
     device_pixel_ratio: float = 0.0,
     timezone: str = "",
 ) -> tuple[str, str]:
-    """返回 (sentinel_token, so_token) 元组。失败抛 RuntimeError。"""
+    """Return ``(sentinel_token, so_token)`` or raise RuntimeError."""
     try:
         from sentinel_quickjs import get_sentinel_token_via_quickjs
         qresult = get_sentinel_token_via_quickjs(
@@ -75,20 +74,23 @@ def get_sentinel_token(
         )
         if qresult:
             return qresult
-        # 注意：SO token 为空**不一定**是失败 —— 服务端在 challenge 里没下发 so 块的
-        # flow（如 username_password_create）本来就没有 SO token，那种情况
-        # sentinel_quickjs 会正常返回 (token, "")，不会走到这里。
-        raise RuntimeError("Sentinel QuickJS 失败（主 token 缺失或服务端要求的 SO token 未算出），中止注册以避免封号")
+        # An empty SO token is not necessarily a failure. Flows whose
+        # challenge omits the SO block (such as username_password_create)
+        # legitimately return (token, "") from sentinel_quickjs.
+        raise RuntimeError(
+            "Sentinel QuickJS failed (main token missing or the required SO token "
+            "could not be generated); registration was stopped to protect the account"
+        )
     except ImportError as e:
-        raise RuntimeError(f"Sentinel QuickJS 模块缺失: {e}")
+        raise RuntimeError(f"Sentinel QuickJS module is missing: {e}")
     except RuntimeError:
         raise
     except Exception as e:
-        # 网络类异常原样上抛：包成 RuntimeError("QuickJS 异常") 会让日志看起来像
-        # PoW 算不出来，实际是链路 TLS 瞬断（见 sentinel_quickjs 同处注释）。
-        # 保留原异常类型，registrar 的 classify_error 也才能稳定判成 network。
+        # Propagate network errors unchanged. Wrapping them as QuickJS errors
+        # would make transient TLS failures look like PoW failures and would
+        # prevent registrar.classify_error from classifying them as network.
         from http_client import _is_tls_handshake_error
 
         if _is_tls_handshake_error(e):
             raise
-        raise RuntimeError(f"Sentinel QuickJS 异常: {e}")
+        raise RuntimeError(f"Sentinel QuickJS error: {e}")

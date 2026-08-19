@@ -1,12 +1,13 @@
 import http from './request'
+import { gcashProbeRequestConfig } from '../eligibility.js'
 
-// ──────────────── 单个注册 ────────────────
+// ──────────────── Single registration ────────────────
 export const startRegister = (payload) => http.post('/api/register', payload)
 
-// ──────────────── 运行记录 ────────────────
+// ──────────────── Registration runs ────────────────
 export const listRuns = (limit = 50) => http.get('/api/runs', { params: { limit } })
 
-// ──────────────── 注册结果 registered ────────────────
+// ──────────────── Registered account results ────────────────
 export const listRegistered = (params) =>
   http.get('/api/registered', { params }) // { limit, offset, filter }
 
@@ -16,28 +17,35 @@ export const getRegistered = (email) =>
 export const deleteRegistered = (email) =>
   http.delete(`/api/registered/${encodeURIComponent(email)}`)
 
-// 手填凭证：不传的字段后端不动，传空串才是清空
+// Manually entered credentials: omitted fields remain unchanged; an empty string clears a field.
 export const updateCredentials = (payload) =>
   http.post('/api/registered/update_credentials', payload)
 
 export const bulkDeleteRegistered = (payload) =>
-  http.post('/api/registered/bulk_delete', payload) // { emails } 或 { all: true }
+  http.post('/api/registered/bulk_delete', payload) // { emails } or { all: true }
 
-// 导出后清理用：把号池那一行也删掉。
-// 从 accounts.js 转出来一份，省得 Registered.vue 同时 import 两个 api 模块。
+// Post-export cleanup also removes the matching account-pool row.
+// Re-exported here so Registered.vue does not need to import two API modules.
 export { bulkDeleteAccounts } from './accounts'
 
-// 批量导出：格式清单由后端 export_formats.py 提供，加格式前端不用改
+// Bulk export formats come from backend export_formats.py, so new formats require no frontend changes.
 export const listExportFormats = () => http.get('/api/registered/export/formats')
 export const exportRegistered = (payload) => http.post('/api/registered/export', payload)
 
 export const checkPlus = (emails, proxy = '') =>
   http.post('/api/registered/check_plus', { emails, proxy })
 
+export const checkGCash = (emails, proxy = '') =>
+  http.post(
+    '/api/registered/check_gcash',
+    { emails, proxy },
+    gcashProbeRequestConfig(),
+  )
+
 export const exportToPanel = (email, targets) =>
   http.post('/api/registered/export_to_panel', { email, targets })
 
-// ──────────────── 自动跑号 auto-loop ────────────────
+// ──────────────── Automatic registration loop ────────────────
 export const autoStart = (payload) => http.post('/api/auto/start', payload)
 export const autoPause = () => http.post('/api/auto/pause')
 export const autoResume = () => http.post('/api/auto/resume')
