@@ -1,19 +1,17 @@
-"""SQLite 号池 + 注册结果存储。
+"""SQLite account-pool and registration-result storage.
 
-表结构：
-  outlook_accounts: 接码号池（多种邮箱混放，kind 列区分 + 状态机）
-  registered:       注册成功结果（凭证 JSON）
+Tables:
+  outlook_accounts: mixed-provider account pool, distinguished by kind and state
+  registered:       successful registration results and credentials
 
-关于 outlook_accounts 这个表名：
-    它现在装的不止 outlook（还有 gmail / icloud / qq ...），名字已经不准，
-    但改表名要动迁移和一堆 SQL，收益只是好看一点，风险不值。
-    真正区分类型的是 kind 列。
+The historical outlook_accounts name now covers Outlook, Gmail, iCloud, and
+other providers. Renaming it would require a risky migration for no behavioral
+benefit; the kind column is authoritative.
 
-凭证字段用「并集列」而不是 extra_json：
-    outlook/gmail 用 password+client_id+refresh_token，
-    icloud 这类中转只用 relay_url，各自把不用的列留空。
-    几种邮箱的规模下，并集列比 JSON 好 —— 能建索引、能加约束、
-    SQL 里直接看得见。加新邮箱时如果要新字段，就再 ALTER 加一列。
+Provider credentials use a union of typed columns rather than extra_json.
+Outlook/Gmail use password, client_id, and refresh_token; relay providers use
+relay_url and leave unrelated columns empty. Typed columns remain indexable,
+constrainable, and visible to SQL; add a column when a provider needs new data.
 """
 from __future__ import annotations
 
@@ -32,7 +30,7 @@ if str(_ROOT) not in sys.path:
 
 DB_PATH = Path(__file__).resolve().parent / "webui.db"
 
-_lock = threading.Lock()  # SQLite 写入串行化
+_lock = threading.Lock()  # Serialize SQLite writes.
 
 
 def _conn() -> sqlite3.Connection:
@@ -50,9 +48,9 @@ def init_db():
             password        TEXT,
             client_id       TEXT,
             refresh_token   TEXT,
-            relay_url       TEXT,       -- 中转取码 URL（icloud 类用，其余留空）
+            relay_url       TEXT,       -- Relay inbox URL; blank for other providers
             kind            TEXT NOT NULL DEFAULT 'outlook',
-                            -- 邮箱类型，对应 mail_providers 注册表的 kind
+                            -- Provider type matching the mail_providers registry kind
             status          TEXT NOT NULL DEFAULT 'available',
                             -- available / in_use / done / failed
             imported_at     REAL,
@@ -62,8 +60,7 @@ def init_db():
         );
 
         CREATE INDEX IF NOT EXISTS idx_outlook_status ON outlook_accounts(status);
-        -- idx_outlook_kind 不在这里建：老库此刻还没有 kind 列，
-        -- 建索引会当场报错。放到下面补完列之后再建。
+        -- Create idx_outlook_kind only after old databases receive the kind column.
 
         CREATE TABLE IF NOT EXISTS settings (
             key     TEXT PRIMARY KEY,
@@ -98,16 +95,16 @@ def init_db():
         );
     """)
     con.commit()
-    # 老 DB migrate：error_category 在后期才加，对已建表补列
+    # Old-database migration: error_category was added after the original schema.
     cur = con.execute("PRAGMA table_info(runs)")
     cols = {r[1] for r in cur.fetchall()}
     if "error_category" not in cols:
         con.execute("ALTER TABLE runs ADD COLUMN error_category TEXT")
         con.commit()
 
-    # 老 DB migrate：号池多邮箱混放（kind / relay_url 在后期才加）
-    # 存量行全部是 outlook 时代导进去的，DEFAULT 'outlook' 正好把它们
-    # 归位，不需要额外 UPDATE。重复执行无副作用。
+    # Old-database migration: kind and relay_url were added for mixed providers.
+    # Existing rows predate that change and are Outlook, so the default is correct.
+    # The migration is idempotent and needs no follow-up UPDATE.
     cur = con.execute("PRAGMA table_info(outlook_accounts)")
     acc_cols = {r[1] for r in cur.fetchall()}
     if "kind" not in acc_cols:
@@ -118,14 +115,14 @@ def init_db():
     if "relay_url" not in acc_cols:
         con.execute("ALTER TABLE outlook_accounts ADD COLUMN relay_url TEXT")
         con.commit()
-    # 索引建在补列之后，否则老库上 CREATE INDEX 会因为没有 kind 列而失败
+    # Create the index after adding kind so old databases do not fail.
     con.execute(
         "CREATE INDEX IF NOT EXISTS idx_outlook_kind ON outlook_accounts(kind, status)"
     )
     con.commit()
 
-    # 老 DB migrate：registered 的 2FA 两列（totp_secret / totp_factor_id）后期才加。
-    # secret 一次性下发、服务端取不回，务必单独补列持久化。重复执行无副作用。
+    # Old-database migration: registered gained TOTP secret/factor columns later.
+    # Persist the one-time secret explicitly; repeated migration is harmless.
     cur = con.execute("PRAGMA table_info(registered)")
     reg_cols = {r[1] for r in cur.fetchall()}
     if "totp_secret" not in reg_cols:
@@ -134,20 +131,20 @@ def init_db():
     if "totp_factor_id" not in reg_cols:
         con.execute("ALTER TABLE registered ADD COLUMN totp_factor_id TEXT")
         con.commit()
+    con.close()
 
 
-# ──────────────────────── outlook 号池 ────────────────────────
+# ------------------------------- Outlook account pool -------------------------------
 
 
 def parse_lines(text: str, kind: str = "") -> list[dict]:
-    """解析导入文本，委托给 mail_providers 注册表。
+    """Parse import text through the mail-provider registry.
 
-    kind 指定 → 用该 provider 的格式解析（推荐）
-    kind 为空 → 按段数猜（段数唯一时才行，Outlook/Gmail 都是 4 段会猜不出）
+    An explicit kind selects that provider's parser. Otherwise infer only when
+    the field count is unique; Outlook and Gmail both use four fields.
 
-    非法行抛 ImportValidationError（带行号和原因），**不再静默跳过**。
-    以前这里是 `if len(parts) != 4: continue`，用户看到"导入成功"
-    但号少了几个，完全没法排查。
+    Invalid lines raise ImportValidationError with line numbers and reasons;
+    silently skipping them would make a reported successful batch incomplete.
     """
     from mail_providers import parse_import_text
 
@@ -155,10 +152,10 @@ def parse_lines(text: str, kind: str = "") -> list[dict]:
 
 
 def import_accounts(text: str, kind: str = "") -> dict:
-    """批量入库。已存在的 email 仅在凭证变化时更新。
+    """Import a batch, updating existing emails only when credentials change.
 
-    解析阶段全对才写：有一行非法就整批拒绝（抛 ImportValidationError），
-    不会出现"写进去一半"对不上账的情况。
+    Parse the entire batch before writing. Any invalid line rejects the whole
+    import, preventing partially written batches.
     """
     rows = parse_lines(text, kind)
     now = time.time()
@@ -167,7 +164,7 @@ def import_accounts(text: str, kind: str = "") -> dict:
         con = _conn()
         for r in rows:
             row_kind = r.get("kind") or kind or "outlook"
-            # 凭证并集：不同 provider 用不同子集，没有的留空字符串
+            # Providers use different subsets of the credential union; others stay blank.
             password = r.get("password", "") or ""
             client_id = r.get("client_id", "") or ""
             refresh = r.get("refresh_token", "") or ""
@@ -191,7 +188,7 @@ def import_accounts(text: str, kind: str = "") -> dict:
                 or (existing["relay_url"] or "") != relay
                 or (existing["kind"] or "") != row_kind
             ):
-                # 凭证或类型变了 → 覆盖并重置为可用
+                # Credential or provider changes reset the account to available.
                 con.execute(
                     "UPDATE outlook_accounts SET refresh_token=?, password=?, client_id=?, "
                     "relay_url=?, kind=?, status='available', imported_at=?, fail_reason=NULL "
@@ -240,7 +237,7 @@ def list_accounts(
 
 
 def stats_by_kind() -> dict:
-    """按邮箱类型分组统计，给 WebUI 顶部展示"每种邮箱各有多少号"。"""
+    """Return account counts by provider kind for the WebUI summary."""
     con = _conn()
     cur = con.execute(
         "SELECT kind, status, COUNT(*) AS n FROM outlook_accounts GROUP BY kind, status"
@@ -264,13 +261,12 @@ def get_account(email: str) -> Optional[dict]:
 
 
 def claim_account(email: str) -> Optional[dict]:
-    """原子 claim 指定邮箱（available / failed -> in_use）。
+    """Atomically claim a specified available or failed account.
 
-    failed 也允许重试 claim：之前 OpenAI 风控误判 / 网络抖动等导致 fail 的号
-    应允许用户手动重试，已 done 的号才禁止重 claim（防误覆盖凭证）。
+    Failed accounts remain manually retryable after transient risk-control or
+    network errors. Done accounts cannot be reclaimed to protect credentials.
 
-    按 email 指定时不过滤 kind —— 用户点名要这个号，它是什么类型
-    由记录自己的 kind 列说了算，调用方读 account["kind"] 即可。
+    A direct email claim does not filter by kind; callers inspect account["kind"].
     """
     email = (email or "").strip().lower()
     if not email:
@@ -296,18 +292,17 @@ def claim_account(email: str) -> Optional[dict]:
 
 
 def claim_next(kind: str = "") -> Optional[dict]:
-    """原子 claim 任一 available 号。
+    """Atomically claim the next available account.
 
-    kind 指定 → 只从该类型里挑（"选了 gmail 就只跑 gmail 号"）
-    kind 为空 → 全池子里挑最早导入的
+    With kind, select only that provider. Without it, select the oldest import
+    across the full pool.
 
-    多类型混放的关键就在这里：号池里 outlook 和 gmail 并存，
-    但当前配置选了哪种，就只 claim 哪种，不会串。
+    Provider filtering prevents mixed Outlook/Gmail pools from crossing sources.
     """
     k = (kind or "").strip().lower()
     with _lock:
         con = _conn()
-        for _ in range(50):  # 有限重试，避免并发抢号时无限递归爆栈
+        for _ in range(50):  # Bounded retries avoid recursion during contention.
             if k:
                 cur = con.execute(
                     "SELECT * FROM outlook_accounts WHERE status='available' AND kind=? "
@@ -330,7 +325,7 @@ def claim_next(kind: str = "") -> Optional[dict]:
             con.commit()
             if rc.rowcount == 1:
                 return dict(row)
-            # 被别的线程抢走了，换下一个再试
+            # Another thread won the claim; try the next account.
         return None
 
 
@@ -355,7 +350,7 @@ def mark_failed(email: str, reason: str = "") -> None:
 
 
 def release_unused(email: str) -> None:
-    """claim 后没真注册（异常 / 用户取消）→ 还回 available。"""
+    """Return an unregistered claim to available after cancellation or error."""
     with _lock:
         con = _conn()
         con.execute(
@@ -367,9 +362,10 @@ def release_unused(email: str) -> None:
 
 
 def reset_to_available(email: str) -> bool:
-    """手动重置单个号：done / failed → available，清空时间戳和失败原因。
+    """Reset one done/failed account to available and clear outcome metadata.
 
-    场景：注册成功但 refresh_token 没拿到，主人想重新跑一遍这个号。
+    This supports rerunning an account whose registration completed without a
+    refresh token.
     """
     with _lock:
         con = _conn()
@@ -384,7 +380,7 @@ def reset_to_available(email: str) -> bool:
 
 
 def bulk_reset_to_available(emails: list[str]) -> int:
-    """批量重置多个号。返回实际被改的行数。"""
+    """Reset multiple accounts and return the number of changed rows."""
     if not emails:
         return 0
     with _lock:
@@ -400,9 +396,9 @@ def bulk_reset_to_available(emails: list[str]) -> int:
 
 
 def reset_failed_to_available() -> int:
-    """把所有 failed 号一次性重置为 available（清掉 fail_reason）。返回受影响行数。
+    """Reset all failed accounts to available and clear fail_reason.
 
-    场景：代理短暂抽风导致一波号被冤枉标 failed，主人想给它们一次机会。
+    Useful when a transient proxy outage incorrectly marks a batch failed.
     """
     with _lock:
         con = _conn()
@@ -415,9 +411,9 @@ def reset_failed_to_available() -> int:
 
 
 def release_stale_in_use(stale_seconds: float = 1800) -> int:
-    """把 claimed_at 超过 N 秒还在 in_use 的号释放回 available。
+    """Release accounts left in_use beyond the configured age.
 
-    场景：上次 webui 强退/进程崩溃，号卡在 in_use 永远不释放。默认 30 分钟。
+    This recovers claims stranded by a crashed or forcibly stopped WebUI process.
     """
     with _lock:
         con = _conn()
@@ -440,8 +436,7 @@ def delete_account(email: str) -> bool:
 
 
 def delete_accounts_by_status(status: str) -> int:
-    """按状态批量删除。status 必须是 available/in_use/done/failed 之一；
-    传 'all' 删全部。返回受影响行数。"""
+    """Delete by state (available/in_use/done/failed), or all; return row count."""
     valid = {"available", "in_use", "done", "failed", "all"}
     s = (status or "").strip().lower()
     if s not in valid:
@@ -457,7 +452,7 @@ def delete_accounts_by_status(status: str) -> int:
 
 
 def delete_accounts_by_emails(emails: list[str]) -> int:
-    """按 email 列表批量删除。返回受影响行数。"""
+    """Delete the listed emails and return the number of changed rows."""
     cleaned = [e.strip().lower() for e in (emails or []) if e and e.strip()]
     if not cleaned:
         return 0
@@ -484,14 +479,14 @@ def stats() -> dict:
     return out
 
 
-# ──────────────────────── 注册结果存储 ────────────────────────
+# ----------------------------- Registration-result storage -----------------------------
 
 
 def save_registered(d: dict) -> None:
-    """保存注册成功（或部分成功）的凭证。覆盖同邮箱旧记录。
+    """Save complete or partial credentials, replacing the same email's record.
 
-    凭证三件套（access_token / session_token / refresh_token）单独存列；
-    其余字段（如 device_id / cookie_header / id_token / 自定义元数据）打包进 extra_json。
+    Store the three main tokens in dedicated columns and pack remaining fields,
+    such as device_id, cookie_header, id_token, and custom metadata, into extra_json.
     """
     email = (d.get("email") or "").lower()
     if not email:
@@ -504,18 +499,11 @@ def save_registered(d: dict) -> None:
     }}
     with _lock:
         con = _conn()
-        # ⚠️ INSERT OR REPLACE 是**整行替换**，不是按字段合并 —— 没写的列会被清空。
-        #    重跑同一个邮箱时这会咬人：第一轮 register_password 设了密码但 OTP 超时，
-        #    save_password_early 把密码存下了；第二轮 OpenAI 已经认识这个邮箱了，
-        #    走 passwordless_login 分支根本不调 register_password，
-        #    这一轮的 d["password"] 是空的 —— 直接 REPLACE 就把上一轮的密码冲没了。
-        #    密码是 OpenAI 侧的**持久状态**，"这一轮没设" ≠ "这个号没有密码"，
-        #    所以空值不覆盖非空旧值。
-        #    token 三件套正相反：每轮跑都是全新的，旧的可能已失效，照常整列覆盖。
-        # totp_secret 和密码同理，甚至更严：secret【一次性下发、服务端取不回】，
-        #    丢了 = 该号 2FA 永久锁死。重跑同邮箱（已绑过 2FA）时这一轮不会再绑，
-        #    d 里没有 secret —— 绝不能拿空值把库里已存的 secret 冲没。
-        #    与密码合成一次 SELECT，顺带把两列旧值一起兜住。
+        # INSERT OR REPLACE replaces the whole row, so preserve durable values that
+        # a rerun may omit. A password set before an OTP timeout still exists even
+        # when a later passwordless login returns no password. Likewise, a one-time
+        # TOTP secret cannot be recovered and must never be overwritten with blank.
+        # Tokens are intentionally replaced because each run may issue fresh values.
         totp_secret = (d.get("totp_secret") or "").strip()
         totp_factor_id = (d.get("totp_factor_id") or "").strip()
         if not password or not totp_secret:
@@ -528,7 +516,7 @@ def save_registered(d: dict) -> None:
                     password = row["password"]
                 if not totp_secret and (row["totp_secret"] or "").strip():
                     totp_secret = row["totp_secret"]
-                    # factor_id 跟着 secret 走：本轮没绑就沿用旧的
+                    # Preserve factor_id with its secret when this run did not enroll.
                     totp_factor_id = totp_factor_id or (row["totp_factor_id"] or "")
         con.execute(
             "INSERT OR REPLACE INTO registered "
@@ -553,22 +541,20 @@ def save_registered(d: dict) -> None:
             ),
         )
         con.commit()
+        con.close()
 
 
 def save_password_early(email: str, password: str) -> None:
-    """密码一在 OpenAI 侧生效就落盘，不等整个注册流程跑完。
+    """Persist a password as soon as OpenAI accepts it.
 
-    由 AuthFlow 的 on_password 回调触发（register_password 里 POST 200 之后）。
-    此刻账号+密码在 OpenAI 那边已经建好，但本地还要过发码/验证/建账户三关，
-    挂在任何一关都走不到 save_registered ——
-    密码只活在内存里，进程一退号就成了谁也登不进去的孤儿。
+    AuthFlow invokes this callback immediately after register_password returns
+    HTTP 200. Later delivery, verification, or account-creation failures must not
+    leave a valid remote password only in process memory.
 
-    只写 email + password；token 三件套留空，等流程跑通后 save_registered
-    用同一个 email 主键覆盖同一行补上。extra_json 打 pending 标记，
-    方便一眼认出"有密码没凭证"的半成品行（跑通后会被 save_registered 清掉）。
+    Initially write only email and password with a pending marker. A successful
+    save_registered call fills the same primary-key row and clears pending state.
 
-    ⚠️ 行已存在时**只 UPDATE password**，绝不动已有的 token：
-       重跑一个之前跑通过的邮箱时，不能把人家的凭证清空。
+    For existing rows, update only password so reruns do not erase tokens.
     """
     email = (email or "").strip().lower()
     password = (password or "").strip()
@@ -593,20 +579,14 @@ def save_password_early(email: str, password: str) -> None:
 
 
 def save_totp_early(email: str, secret: str, factor_id: str = "") -> None:
-    """2FA secret 一从 enroll 响应拿到就落盘，不等整个注册流程跑完。
+    """Persist a TOTP secret as soon as enrollment returns it.
 
-    由 registrar 的 _bind_2fa_hook 触发（钩子在「拿到 session」和「Codex 授权 /
-    绑手机号接码」之间调 bind_totp_2fa_inline，成功即拿到 secret）。
+    registrar invokes this between session creation and later Codex/SMS steps.
 
-    ⚠️ 早落盘的理由和 save_password_early 一模一样、甚至更急：
-       secret 绑成之后，流程还要走 Codex 授权 + add-phone 接码（可能好几分钟），
-       这段时间 secret 只活在 registrar 内存的 _tfa_box 里。接码太久用户一关进程，
-       secret 就永久蒸发 —— 而它【一次性下发、服务端取不回】，丢了该号 2FA 锁死。
-       所以一拿到手就先写库，后面接码怎么中断都不怕。
+    The secret is issued once and cannot be recovered. Persist it before later
+    authorization or SMS work so process termination cannot permanently lose it.
 
-    只写 totp 两列；token / 密码留给后续 save_registered 用同一 email 主键补齐。
-    ⚠️ 行已存在时**只 UPDATE totp 两列**，绝不动已有的密码 / token
-       —— 重跑老号时不能把人家已存的凭证清空。
+    Update only the two TOTP columns for existing rows; preserve passwords/tokens.
     """
     email = (email or "").strip().lower()
     secret = (secret or "").strip()
@@ -636,60 +616,62 @@ def save_totp_early(email: str, secret: str, factor_id: str = "") -> None:
 
 
 def normalize_totp_secret(raw: str) -> str:
-    """把用户手填的 TOTP secret 规范化成可用的 base32，非法值抛 ValueError。
+    """Normalize a user-entered TOTP secret to valid base32.
 
-    登录侧（auth_flow._totp_now）拿到 secret 直接 b32decode，**不做任何校验** ——
-    脏值存进去要等到真登录时才炸，那时只看到一句 base32 解码异常，
-    根本看不出是手填填错了。所以校验必须挡在写库这一关。
+    The login path decodes without validation, so reject bad values before they
+    enter storage and fail later with an opaque decoding error.
 
-    接受的输入：
-      - 裸 base32:  JBSWY3DPEHPK3PXP / jbswy3dp ehpk 3pxp / JBSW-Y3DP-EHPK
+    Accepted input:
+      - Raw base32: JBSWY3DPEHPK3PXP / jbswy3dp ehpk 3pxp / JBSW-Y3DP-EHPK
       - otpauth URI: otpauth://totp/ChatGPT:a@b.com?secret=JBSWY3DP&issuer=...
-        （从手机 App 导出/二维码解码出来的就是这个格式，直接粘进来很常见）
+        (commonly pasted from an authenticator export or decoded QR code)
     """
     s = (raw or "").strip()
     if not s:
         return ""
-    # otpauth:// URI 抽 secret 参数
+    # Extract the secret parameter from an otpauth URI.
     if s.lower().startswith("otpauth://"):
         try:
             from urllib.parse import urlparse, parse_qs
             qs = parse_qs(urlparse(s).query)
             s = (qs.get("secret") or [""])[0]
         except Exception:
-            raise ValueError("otpauth 链接解析失败，请直接填 secret")
+            raise ValueError(
+                "Could not parse the otpauth URL; enter the secret directly"
+            )
         if not s:
-            raise ValueError("otpauth 链接里没有 secret 参数")
-    # 去掉分隔符（手机 App 展示时常带空格/连字符）并统一大写
+            raise ValueError("The otpauth URL does not contain a secret parameter")
+    # Remove display separators and normalize to uppercase.
     s = s.replace(" ", "").replace("-", "").replace("_", "").upper()
-    # base32 只有 A-Z 和 2-7，先挡掉明显非法字符再解码，报错更好懂
+    # Reject invalid base32 characters before decoding for a clearer error.
     if not s or any(c not in "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567=" for c in s):
-        raise ValueError("TOTP secret 含非法字符（base32 只允许 A-Z 和 2-7）")
+        raise ValueError(
+            "TOTP secret contains invalid characters (base32 allows only A-Z and 2-7)"
+        )
     try:
-        # 补 padding 后试解，解得开才算合法。auth_flow 那边也是这么补的。
+        # Add padding exactly as auth_flow does and validate by decoding.
         decoded = base64.b32decode(s + "=" * (-len(s) % 8))
     except Exception:
-        raise ValueError("TOTP secret 不是合法的 base32")
+        raise ValueError("TOTP secret is not valid base32")
     if len(decoded) < 10:
-        raise ValueError(f"TOTP secret 太短（解出 {len(decoded)} 字节，通常应为 20 字节）")
+        raise ValueError(
+            f"TOTP secret is too short ({len(decoded)} decoded bytes; usually 20 are expected)"
+        )
     return s
 
 
 def update_registered_manual(email: str, password: Optional[str] = None,
                              totp_secret: Optional[str] = None) -> bool:
-    """手动修正某个已注册账号的密码 / TOTP secret。
+    """Correct a registered account's locally stored password or TOTP secret.
 
-    ⚠️ 只改**本地库**，不会同步到 OpenAI —— 这里改密码不等于改了账号密码。
-       用途是把外部已知的凭证补进来，或修正记录错误。
+    This changes only the local database, not the remote OpenAI credential. It
+    records an externally known value or corrects a local record.
 
-    传 None = 该字段不动（不是清空）。用 None 而不是空串做"不修改"的标记，
-    是为了留出"主人真想清空某字段"的余地（传空串即清空）。
+    None leaves a field unchanged; an empty string explicitly clears it.
 
-    totp_secret 会先过 normalize_totp_secret 校验，非法直接抛 ValueError；
-    宁可这里报错，也不能让脏值躺进库里等登录时才炸。
+    Validate totp_secret before writing so bad values do not fail during login.
 
-    返回 False 表示该邮箱不存在（不会凭空插入新行 —— 手填是"修正已有记录"，
-    真要新增外部账号是另一件事，走单独的导入功能）。
+    Return False when the email does not exist; this correction path never inserts.
     """
     email = (email or "").strip().lower()
     if not email:
@@ -699,7 +681,7 @@ def update_registered_manual(email: str, password: Optional[str] = None,
         sets.append("password=?")
         vals.append(password)
     if totp_secret is not None:
-        # 空串 = 主人主动清空；非空则必须过校验
+        # Empty explicitly clears; non-empty values must validate.
         sets.append("totp_secret=?")
         vals.append(normalize_totp_secret(totp_secret) if totp_secret.strip() else "")
     if not sets:
@@ -715,27 +697,70 @@ def update_registered_manual(email: str, password: Optional[str] = None,
         return True
 
 
-def update_plus_check(email: str, plus_info: dict) -> None:
-    """把 Plus 检查结果写入 extra_json.plus_check。"""
-    email = email.lower()
-    con = _conn()
-    cur = con.execute("SELECT extra_json FROM registered WHERE email=?", (email,))
-    row = cur.fetchone()
-    if not row:
-        return
-    extra = {}
-    if row["extra_json"]:
-        try:
-            extra = json.loads(row["extra_json"])
-        except Exception:
-            extra = {}
-    extra["plus_check"] = plus_info
+_ELIGIBILITY_KEYS = frozenset({"plus_check", "gcash_check"})
+_SAFE_ELIGIBILITY_FIELDS = frozenset({
+    "operation", "classification", "eligible", "decision", "conclusive",
+    "retryable", "status", "label", "checked_at", "current_plan_type",
+    "subscription_plan", "has_active_subscription", "campaign_id",
+    "campaign_title", "discount_percentage", "duration_periods",
+    "duration_unit", "method_available", "custom_method_id_discovered",
+    "amount_minor", "currency",
+})
+
+
+def _safe_eligibility_result(value: dict) -> dict:
+    if not isinstance(value, dict):
+        raise ValueError("eligibility result must be an object")
+    return {
+        key: item for key, item in value.items()
+        if key in _SAFE_ELIGIBILITY_FIELDS
+        and isinstance(item, (str, int, float, bool, type(None)))
+    }
+
+
+def update_eligibility_check(email: str, key: str, result: dict) -> None:
+    """Persist a sanitized eligibility result while retaining the last verdict."""
+    if key not in _ELIGIBILITY_KEYS:
+        raise ValueError("unsupported eligibility result key")
+    email = email.strip().lower()
+    safe = _safe_eligibility_result(result)
     with _lock:
-        con.execute(
-            "UPDATE registered SET extra_json=? WHERE email=?",
-            (json.dumps(extra, ensure_ascii=False), email),
-        )
-        con.commit()
+        con = _conn()
+        try:
+            row = con.execute(
+                "SELECT extra_json FROM registered WHERE email=?", (email,)
+            ).fetchone()
+            if not row:
+                return
+            extra = {}
+            if row["extra_json"]:
+                try:
+                    extra = json.loads(row["extra_json"])
+                except Exception:
+                    extra = {}
+            previous = extra.get(key) if isinstance(extra.get(key), dict) else {}
+            last_conclusive = None
+            if safe.get("conclusive"):
+                last_conclusive = dict(safe)
+            elif previous.get("conclusive"):
+                last_conclusive = _safe_eligibility_result(previous)
+            elif isinstance(previous.get("last_conclusive"), dict):
+                last_conclusive = _safe_eligibility_result(previous["last_conclusive"])
+            if last_conclusive:
+                safe["last_conclusive"] = last_conclusive
+            extra[key] = safe
+            con.execute(
+                "UPDATE registered SET extra_json=? WHERE email=?",
+                (json.dumps(extra, ensure_ascii=False), email),
+            )
+            con.commit()
+        finally:
+            con.close()
+
+
+def update_plus_check(email: str, plus_info: dict) -> None:
+    """Backward-compatible wrapper for existing Plus-check callers."""
+    update_eligibility_check(email, "plus_check", plus_info)
 
 
 def _registered_where(filt: str) -> str:
@@ -752,8 +777,8 @@ def _registered_where(filt: str) -> str:
     if filt == "banned":
         return "WHERE extra_json LIKE '%\"banned\"%'"
     if filt == "token_invalid":
-        # token_invalid 从 2026-08-10 起会写库，得能筛出来，否则等于埋了：
-        # 它既不在 unchecked 里（已有结论），又不在 free/plus/banned 里。
+        # token_invalid is conclusive and needs its own filter; it belongs neither
+        # to unchecked nor to free/plus/banned.
         return "WHERE extra_json LIKE '%\"token_invalid\"%'"
     return ""
 
@@ -774,30 +799,33 @@ def list_registered(limit: int = 20, offset: int = 0, filter_rt: str = "all") ->
         f"{where} ORDER BY created_at DESC LIMIT ? OFFSET ?",
         (limit, offset),
     )
+    fetched = cur.fetchall()
+    con.close()
     rows = []
-    for r in cur.fetchall():
+    for r in fetched:
         d = dict(r)
         plus = None
+        gcash = None
         if d.get("extra_json"):
             try:
                 extra = json.loads(d["extra_json"])
                 plus = extra.get("plus_check")
+                gcash = extra.get("gcash_check")
             except Exception:
                 pass
         d["plus_check"] = plus
+        d["gcash_check"] = gcash
         d.pop("extra_json", None)
         rows.append(d)
     return rows
 
 
 def list_registered_full(limit: int = 5000) -> list[dict]:
-    """返回完整凭证（用于批量导出）。每行同 get_registered 的格式，外加 relay_url。
+    """Return full credentials for batch export, including relay_url.
 
-    ⚠️ relay_url（中转取件链接）**不在 registered 表里**，它跟着号池那一行走
-       （outlook_accounts.relay_url，icloud_relay 这类号一号一条 token）。
-       导出格式「邮箱----密码----2FA----取件url」要用它，所以这里 LEFT JOIN 带出来。
-       用 JOIN 而不是给 registered 加列的原因：不用迁移、**已经注册完的老号也能导**
-       （只要号池那行还在）；号池行被删掉就是空串，照约定留空、分隔符保留。
+    relay_url lives on outlook_accounts because relay providers assign one
+    tokenized inbox URL per pooled account. LEFT JOIN avoids migration, supports
+    old registered rows while their pool row exists, and yields blank otherwise.
     """
     con = _conn()
     cur = con.execute(
@@ -820,12 +848,10 @@ def list_registered_full(limit: int = 5000) -> list[dict]:
 
 
 def list_registered_by_emails(emails: list[str]) -> list[dict]:
-    """按 email 列表返回完整凭证（批量导出勾选的号用）。
+    """Return full credentials for selected emails during batch export.
 
-    - 行序 = created_at 倒序，和「注册结果」表格里看到的一致，方便核对。
-    - 查不到的 email 直接不出现（号已被删掉的情况），不报错。
-    - SQLite 单条语句变量数有上限（默认 999），所以分批查。
-    - relay_url 从号池表 LEFT JOIN 带出（原因见 list_registered_full）。
+    Results use descending created_at order, omit missing emails, batch below
+    SQLite's variable limit, and LEFT JOIN relay_url as described above.
     """
     cleaned = [e.strip().lower() for e in (emails or []) if e and e.strip()]
     if not cleaned:
@@ -904,7 +930,7 @@ def delete_all_registered() -> int:
         return rc.rowcount
 
 
-# ──────────────────────── 运行记录 ────────────────────────
+# ----------------------------------- Run records -----------------------------------
 
 
 def create_run(run_id: str, email: str, log_path: str) -> None:
@@ -957,14 +983,13 @@ def set_setting(key: str, value) -> None:
         con.commit()
 
 
-# ──────────────────────── 邮箱来源配置 ────────────────────────
+# ---------------------------- Email source configuration ----------------------------
 
 
 def get_mail_config() -> dict:
-    """返回邮箱来源配置（密码类字段隐藏明文）。
+    """Return email-source settings with secret fields masked.
 
-    provider 声明的配置项自动带出来 —— 加新邮箱时这里不用改，
-    新 provider 的 config_fields 会自动出现在返回值里。
+    Provider-declared config_fields appear automatically for new providers.
     """
     from mail_providers import list_providers
 
@@ -980,21 +1005,19 @@ def get_mail_config() -> dict:
 
 
 def save_mail_config(data: dict) -> None:
-    """保存邮箱配置。password 类字段传 '***' 表示不修改。
+    """Save email settings; '***' leaves password-like fields unchanged.
 
-    mail_source 校验改成查 mail_providers 注册表：
-        以前是写死的白名单 ("outlook", "cf_temp")，选了别的会被
-        **静默改回 outlook** —— 用户看到的是"保存成功但选择没生效"。
-        现在未知来源直接抛错，问题当场暴露。
+    Validate mail_source against the provider registry so unknown values fail
+    explicitly instead of silently reverting to Outlook.
     """
     from mail_providers import get_provider_class, list_providers
 
     if "mail_source" in data:
         src = str(data["mail_source"]).strip().lower()
-        get_provider_class(src)  # 未注册的 kind 会抛 MailProviderError
+        get_provider_class(src)  # Unregistered kinds raise MailProviderError.
         set_setting("mail_source", src)
 
-    # 按 provider 声明的字段保存，加新邮箱时这里零改动
+    # Save provider-declared fields so new providers need no changes here.
     for p in list_providers():
         for f in p["config_fields"]:
             key = f["key"]
@@ -1003,20 +1026,19 @@ def save_mail_config(data: dict) -> None:
             val = data[key]
             if f.get("type") == "password":
                 if not val or val == "***":
-                    continue  # 没填 / 是掩码 → 保持原值
+                    continue  # Missing or masked: keep the current value.
             set_setting(key, str(val).strip())
 
 
 def get_secret_setting(key: str) -> str:
-    """内部用：拿密码类配置的明文。"""
+    """Return an unmasked secret setting for internal use."""
     return get_setting(key, "")
 
 
 def get_mail_settings() -> dict:
-    """内部用：给 create_mail_provider 的 settings（含明文密钥）。
+    """Return unmasked settings for create_mail_provider.
 
-    跟 get_mail_config 的区别：这个不打码，只在服务端构造 provider 时用，
-    绝不能直接返回给前端。
+    Unlike get_mail_config, this is server-only and must never be returned directly.
     """
     from mail_providers import list_providers
 
@@ -1028,26 +1050,26 @@ def get_mail_settings() -> dict:
 
 
 def get_cf_admin_token() -> str:
-    """内部用：拿明文 admin_token。"""
+    """Return the unmasked admin_token for internal use."""
     return get_setting("cf_admin_token", "")
 
 
-# ──────────────────────── SMS 接码配置 ────────────────────────
+# ----------------------------- SMS verification settings -----------------------------
 
 
 def get_sms_config() -> dict:
-    """返回 SMS 接码配置（api_key 隐藏明文）。
+    """Return SMS verification settings with api_key masked.
 
-    sms_enabled:        '0'/'1' 是否启用接码（命中 add-phone 时才会用）
+    sms_enabled:        '0'/'1'; used only when the flow reaches add-phone
     sms_provider:       smsbower
-    sms_country:        国家代码或 ID（推荐 '52' = Thailand，OpenAI 走 SMS 的唯一稳定国家）
-    sms_service:        服务代码（OpenAI = 'dr'）
-    sms_max_price:      号码最高单价（SmsBower / SmsBower 用，单位平台货币；空 / -1 = 不限）
-    sms_reuse_phone:    '0'/'1' 同号复用（SmsBower / SmsBower 支持，省钱）
-    sms_phone_success_max: 同号最多复用几次（默认 3）
-    sms_auto_country:   '0'/'1' 自动选最优国家（按价格 + 库存）
-    sms_auto_min_stock: 自动选国家最低库存（默认 20）
-    sms_auto_max_price: 自动选国家最高单价（默认 0 = 不限）
+    sms_country:        country code or provider ID ('52' = Thailand)
+    sms_service:        service code (OpenAI = 'dr')
+    sms_max_price:      maximum unit price; blank/-1 means unlimited
+    sms_reuse_phone:    '0'/'1' number reuse
+    sms_phone_success_max: maximum successful reuse count (default 3)
+    sms_auto_country:   '0'/'1' choose by price and inventory
+    sms_auto_min_stock: minimum inventory for automatic choice (default 20)
+    sms_auto_max_price: maximum automatic-choice price (0 means unlimited)
     """
     return {
         "sms_enabled":             get_setting("sms_enabled", "0"),
@@ -1070,15 +1092,15 @@ def get_sms_config() -> dict:
 
 
 def save_sms_config(data: dict) -> None:
-    """保存 SMS 配置。sms_api_key 传 '***' 表示不修改。"""
-    # 校验 provider
+    """Save SMS settings; '***' leaves sms_api_key unchanged."""
+    # Validate provider.
     valid_providers = {"smsbower", "herosms"}
     if "sms_provider" in data:
         p = str(data["sms_provider"]).strip().lower()
         if p not in valid_providers:
             p = "smsbower"
         set_setting("sms_provider", p)
-    # 字符串字段直接落
+    # Store string fields directly.
     for key in (
         "sms_country", "sms_service", "sms_max_price", "sms_fixed_price",
         "sms_phone_success_max", "sms_auto_min_stock", "sms_auto_max_price",
@@ -1087,7 +1109,7 @@ def save_sms_config(data: dict) -> None:
     ):
         if key in data:
             set_setting(key, str(data[key]).strip())
-    # 布尔字段（前端传 '0'/'1' 或 bool）
+    # Boolean fields accept frontend '0'/'1' strings or bool values.
     for key in ("sms_enabled", "sms_reuse_phone", "sms_auto_country", "sms_strict_whitelist"):
         if key in data:
             v = data[key]
@@ -1096,13 +1118,13 @@ def save_sms_config(data: dict) -> None:
             else:
                 s = str(v).strip().lower()
                 set_setting(key, "1" if s in ("1", "true", "yes", "on") else "0")
-    # API key（'***' 不修改）
+    # '***' preserves the existing API key.
     if data.get("sms_api_key") and data["sms_api_key"] != "***":
         set_setting("sms_api_key", str(data["sms_api_key"]).strip())
 
 
 def get_sms_internal_config() -> dict:
-    """内部用：拿明文 sms_api_key,供 sms_provider 实例化使用。"""
+    """Return unmasked SMS settings for internal provider construction."""
     return {
         "sms_enabled":             get_setting("sms_enabled", "0") in ("1", "true"),
         "sms_provider":            get_setting("sms_provider", "smsbower"),
@@ -1123,15 +1145,14 @@ def get_sms_internal_config() -> dict:
     }
 
 
-# ──────────────────────── 自动导出配置 (CPA / SUB2API) ────────────────────────
+# -------------------------- Automatic export configuration --------------------------
 
 
 def get_export_config() -> dict:
-    """返回导出配置（敏感字段做明文/'***' 占位）。
+    """Return export settings with configured secrets represented by '***'.
 
-    给前端展示用：
-      cpa_mgmt_key / sub2api_api_key 已设置时返回 '***'，未设置返回 ''。
-      保存时传 '***' 代表不修改。
+    The frontend receives '***' for configured keys and '' otherwise; sending
+    '***' when saving leaves a key unchanged.
     """
     return {
         # CPA
@@ -1149,8 +1170,8 @@ def get_export_config() -> dict:
 
 
 def save_export_config(data: dict) -> None:
-    """保存导出配置。密文字段传 '***' 表示不修改。"""
-    # 布尔开关
+    """Save export settings; '***' leaves secret fields unchanged."""
+    # Boolean switches.
     for key_in, key_out in (
         ("cpa_enabled",     "export_cpa_enabled"),
         ("sub2api_enabled", "export_sub2api_enabled"),
@@ -1162,7 +1183,7 @@ def save_export_config(data: dict) -> None:
             else:
                 s = str(v).strip().lower()
                 set_setting(key_out, "1" if s in ("1", "true", "yes", "on") else "0")
-    # 字符串字段（明文）
+    # Plaintext string fields.
     for key_in, key_out in (
         ("cpa_url",            "export_cpa_url"),
         ("cpa_timeout",        "export_cpa_timeout"),
@@ -1172,7 +1193,7 @@ def save_export_config(data: dict) -> None:
     ):
         if key_in in data:
             set_setting(key_out, str(data[key_in] or "").strip())
-    # 密文字段（'***' 不修改）
+    # Secret fields preserve their values when masked.
     if data.get("cpa_mgmt_key") and data["cpa_mgmt_key"] != "***":
         set_setting("export_cpa_mgmt_key", str(data["cpa_mgmt_key"]).strip())
     if data.get("sub2api_api_key") and data["sub2api_api_key"] != "***":
@@ -1180,9 +1201,9 @@ def save_export_config(data: dict) -> None:
 
 
 def get_export_internal_config() -> dict:
-    """内部用：拿明文密钥 + 解析后的 enabled 布尔。供 registrar / app.test 调用。
+    """Return unmasked keys and parsed enabled flags for internal callers.
 
-    返回两个子配置 dict，可分别传给 exporter.export_to_cpa / export_to_sub2api。
+    The two child dictionaries can be passed to the respective exporter functions.
     """
     cpa = {
         "enabled":      get_setting("export_cpa_enabled", "0") in ("1", "true"),
@@ -1200,5 +1221,5 @@ def get_export_internal_config() -> dict:
     return {"cpa": cpa, "sub2api": sub2api}
 
 
-# 模块加载时自动建表
+# Initialize tables when the module loads.
 init_db()

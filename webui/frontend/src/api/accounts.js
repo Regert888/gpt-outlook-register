@@ -1,11 +1,11 @@
 import http from './request'
 
-// ──────────────── 统计 ────────────────
+// ──────────────── Statistics ────────────────
 export const getStats = () => http.get('/api/stats')
 
-// ──────────────── 号池 accounts ────────────────
-// kind = 邮箱来源（outlook / ...）。留空后端会按段数猜，
-// 但 Outlook 和 Gmail 都是 4 段猜不出来，所以页面上必选。
+// ──────────────── Account pool ────────────────
+// kind identifies the email provider (outlook, etc.). If omitted, the backend
+// guesses from the field count, but Outlook and Gmail both use four fields, so the UI requires it.
 export const importAccounts = (text, kind = '') =>
   http.post('/api/import', { text, kind })
 
@@ -16,7 +16,7 @@ export const deleteAccount = (email) =>
   http.delete(`/api/accounts/${encodeURIComponent(email)}`)
 
 export const bulkDeleteAccounts = (payload) =>
-  http.post('/api/accounts/bulk_delete', payload) // { status } 或 { emails }
+  http.post('/api/accounts/bulk_delete', payload) // { status } or { emails }
 
 export const resetFailed = () => http.post('/api/accounts/reset_failed')
 

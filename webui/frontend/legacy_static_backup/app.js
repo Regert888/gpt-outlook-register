@@ -1,9 +1,9 @@
-// 团子喵的 WebUI 交互逻辑 ~
+// Legacy WebUI interaction logic.
 
 const $ = (s) => document.querySelector(s);
 const $$ = (s) => document.querySelectorAll(s);
 
-// ──────────────────────── 工具 ────────────────────────
+// ──────────────────────── Utilities ────────────────────────
 
 async function api(path, opts = {}) {
   const resp = await fetch(path, {
@@ -17,7 +17,7 @@ async function api(path, opts = {}) {
 
 function fmtTime(ts) {
   if (!ts) return "-";
-  return new Date(ts * 1000).toLocaleString("zh-CN", { hour12: false });
+  return new Date(ts * 1000).toLocaleString("en-US", { hour12: false });
 }
 
 function logLine(text, kind = "") {
@@ -31,13 +31,13 @@ function logLine(text, kind = "") {
 
 function classifyLog(line) {
   const l = line.toLowerCase();
-  if (l.includes("error") || l.includes("失败") || l.includes("拒绝")) return "err";
+  if (l.includes("error") || l.includes("\u5931\u8d25") || l.includes("\u62d2\u7edd")) return "err";
   if (l.includes("warning") || l.includes("warn")) return "warn";
-  if (l.includes("成功") || l.includes("完成") || l.includes("命中") || l.includes("ok")) return "ok";
+  if (l.includes("\u6210\u529f") || l.includes("\u5b8c\u6210") || l.includes("\u547d\u4e2d") || l.includes("ok")) return "ok";
   return "";
 }
 
-// ──────────────────────── 统计栏 ────────────────────────
+// ──────────────────────── Statistics bar ────────────────────────
 
 async function refreshStats() {
   try {
@@ -57,23 +57,23 @@ async function refreshStats() {
   }
 }
 
-// ──────────────────────── 导入 ────────────────────────
+// ──────────────────────── Import ────────────────────────
 
 $("#btnImport").addEventListener("click", async () => {
   const text = $("#importText").value.trim();
   if (!text) {
-    $("#importResult").textContent = "请输入要导入的接码号";
+    $("#importResult").textContent = "Enter the accounts to import";
     return;
   }
   $("#btnImport").disabled = true;
-  $("#importResult").textContent = "导入中...";
+  $("#importResult").textContent = "Importing...";
   try {
     const r = await api("/api/import", {
       method: "POST",
       body: JSON.stringify({ text }),
     });
     $("#importResult").textContent =
-      `✅ 解析 ${r.parsed} 行，新增 ${r.inserted}，更新 ${r.updated}，跳过 ${r.skipped}`;
+      `✅ Parsed ${r.parsed} lines: ${r.inserted} added, ${r.updated} updated, ${r.skipped} skipped`;
     $("#importResult").className = "result ok";
     $("#importText").value = "";
     refreshStats();
@@ -86,7 +86,7 @@ $("#btnImport").addEventListener("click", async () => {
   }
 });
 
-// ──────────────────────── 触发注册 ────────────────────────
+// ──────────────────────── Start registration ────────────────────────
 
 let currentEs = null;
 
@@ -101,7 +101,7 @@ $("#btnRun").addEventListener("click", async () => {
     want_refresh_token: true,
   };
   $("#btnRun").disabled = true;
-  $("#runStatus").textContent = "启动中...";
+  $("#runStatus").textContent = "Starting...";
   $("#runStatus").className = "result";
   $("#logBox").innerHTML = "";
 
@@ -110,8 +110,8 @@ $("#btnRun").addEventListener("click", async () => {
       method: "POST",
       body: JSON.stringify(opts),
     });
-    $("#runStatus").textContent = `🚀 已启动 run_id=${r.run_id} email=${r.email}`;
-    logLine(`[client] 启动注册 run_id=${r.run_id} email=${r.email}`, "evt");
+    $("#runStatus").textContent = `🚀 Started run_id=${r.run_id} email=${r.email}`;
+    logLine(`[client] Registration started run_id=${r.run_id} email=${r.email}`, "evt");
     streamRun(r.run_id);
   } catch (e) {
     $("#runStatus").textContent = "❌ " + e.message;
@@ -137,9 +137,9 @@ function streamRun(runId) {
     try {
       const d = JSON.parse(e.data);
       if (d.kind === "done") {
-        const s = `✅ 注册完成: access_token=${d.access_token_len}${d.partial ? "  (部分凭证)" : ""}`;
+        const s = `✅ Registration complete: access_token=${d.access_token_len}${d.partial ? "  (partial credentials)" : ""}`;
         const buttons = [];
-        if (d.access_token_len > 0)  buttons.push(`<button class="quick-copy" data-email="${d.email}" data-field="access_token">📋 复制 access_token</button>`);
+        if (d.access_token_len > 0)  buttons.push(`<button class="quick-copy" data-email="${d.email}" data-field="access_token">📋 Copy access_token</button>`);
         $("#runStatus").innerHTML = `<span class="ok">${s}</span>${buttons.length ? "<br>" + buttons.join(" ") : ""}`;
         logLine("[client] " + s, "evt");
       } else if (d.kind === "error") {
@@ -169,7 +169,7 @@ function streamRun(runId) {
   };
 }
 
-// 状态栏快捷复制按钮（注册完成后直接显示在这里，不用切 Tab）
+// Show quick-copy buttons in the status bar after registration without requiring a tab change.
 $("#runStatus").addEventListener("click", async (e) => {
   const copyBtn = e.target.closest("button.quick-copy");
   if (copyBtn) {
@@ -178,9 +178,9 @@ $("#runStatus").addEventListener("click", async (e) => {
     try {
       const cred = await _loadCred(email);
       const val = cred[field] || "";
-      if (!val) { alert(`${field} 为空`); return; }
+      if (!val) { alert(`${field} is empty`); return; }
       await _copyText(val, copyBtn);
-    } catch (err) { alert("加载凭证失败: " + err.message); }
+    } catch (err) { alert("Failed to load credentials: " + err.message); }
   }
 });
 
@@ -200,7 +200,7 @@ $$(".tab").forEach((t) => {
   });
 });
 
-// ──────────────────────── 号池列表 ────────────────────────
+// ──────────────────────── Account-pool list ────────────────────────
 
 const POOL_PAGE_SIZE = 20;
 let _poolPage = 1;
@@ -210,7 +210,7 @@ function _poolTotalPages() { return Math.max(1, Math.ceil(_poolTotal / POOL_PAGE
 
 function _updatePoolPagination() {
   const pages = _poolTotalPages();
-  $("#poolPageInfo").textContent = `第 ${_poolPage} 页 / 共 ${pages} 页（${_poolTotal} 条）`;
+  $("#poolPageInfo").textContent = `Page ${_poolPage} of ${pages} (${_poolTotal} items)`;
   $("#poolPrevPage").disabled = _poolPage <= 1;
   $("#poolNextPage").disabled = _poolPage >= pages;
 }
@@ -233,9 +233,9 @@ async function refreshPool(resetPage) {
       <td><span class="status ${r.status}">${r.status}</span></td>
       <td title="${r.fail_reason || ''}">${(r.fail_reason || '').slice(0, 50)}</td>
       <td>
-        <button data-act="use" data-email="${r.email}">使用</button>
-        ${canReset ? `<button data-act="reset" data-email="${r.email}" title="改回 available 重新注册">🔄 重置</button>` : ""}
-        <button data-act="del" data-email="${r.email}">删除</button>
+        <button data-act="use" data-email="${r.email}">Use</button>
+        ${canReset ? `<button data-act="reset" data-email="${r.email}" title="Reset to available for another registration">🔄 Reset</button>` : ""}
+        <button data-act="del" data-email="${r.email}">Delete</button>
       </td>
     `;
     tb.appendChild(tr);
@@ -250,12 +250,12 @@ $("#poolNextPage").addEventListener("click", () => { if (_poolPage < _poolTotalP
 $("#poolFilter").addEventListener("change", () => refreshPool(true));
 
 $("#btnResetFailed").addEventListener("click", async () => {
-  if (!confirm("把所有 failed 号重置为 available？")) return;
-  $("#poolActionResult").textContent = "处理中...";
+  if (!confirm("Reset all failed accounts to available?")) return;
+  $("#poolActionResult").textContent = "Processing...";
   $("#poolActionResult").className = "result";
   try {
     const r = await api("/api/accounts/reset_failed", { method: "POST" });
-    $("#poolActionResult").textContent = `✅ 重置 ${r.reset} 个号为 available`;
+    $("#poolActionResult").textContent = `✅ Reset ${r.reset} accounts to available`;
     $("#poolActionResult").className = "result ok";
     refreshPool(); refreshStats();
   } catch (e) {
@@ -265,11 +265,11 @@ $("#btnResetFailed").addEventListener("click", async () => {
 });
 
 $("#btnReleaseStale").addEventListener("click", async () => {
-  $("#poolActionResult").textContent = "处理中...";
+  $("#poolActionResult").textContent = "Processing...";
   $("#poolActionResult").className = "result";
   try {
     const r = await api("/api/accounts/release_stale", { method: "POST" });
-    $("#poolActionResult").textContent = `✅ 释放 ${r.released} 个卡死号`;
+    $("#poolActionResult").textContent = `✅ Released ${r.released} stalled accounts`;
     $("#poolActionResult").className = "result ok";
     refreshPool(); refreshStats();
   } catch (e) {
@@ -278,7 +278,7 @@ $("#btnReleaseStale").addEventListener("click", async () => {
   }
 });
 
-// ── 号池：复选框选择 + 批量删除 ──
+// ── Account pool: checkbox selection and bulk deletion ──
 
 function _selectedEmails() {
   return Array.from(document.querySelectorAll(".pool-check:checked"))
@@ -302,15 +302,15 @@ $("#poolSelectAll").addEventListener("change", (e) => {
 $("#btnResetSelected").addEventListener("click", async () => {
   const emails = _selectedEmails();
   if (!emails.length) return;
-  if (!confirm(`重置选中的 ${emails.length} 个号为 available？\n（号会重新可用，已保存的凭证不变）`)) return;
-  $("#poolActionResult").textContent = "重置中...";
+  if (!confirm(`Reset ${emails.length} selected accounts to available?\nSaved credentials will not change.`)) return;
+  $("#poolActionResult").textContent = "Resetting...";
   $("#poolActionResult").className = "result";
   try {
     const r = await api("/api/accounts/bulk_reset", {
       method: "POST",
       body: JSON.stringify({ emails }),
     });
-    $("#poolActionResult").textContent = `✅ 已重置 ${r.reset} 个号`;
+    $("#poolActionResult").textContent = `✅ Reset ${r.reset} accounts`;
     $("#poolActionResult").className = "result ok";
     refreshPool(); refreshStats();
   } catch (e) {
@@ -322,15 +322,15 @@ $("#btnResetSelected").addEventListener("click", async () => {
 $("#btnDeleteSelected").addEventListener("click", async () => {
   const emails = _selectedEmails();
   if (!emails.length) return;
-  if (!confirm(`确定删除选中的 ${emails.length} 个号？(不可恢复)`)) return;
-  $("#poolActionResult").textContent = "删除中...";
+  if (!confirm(`Delete ${emails.length} selected accounts? This cannot be undone.`)) return;
+  $("#poolActionResult").textContent = "Deleting...";
   $("#poolActionResult").className = "result";
   try {
     const r = await api("/api/accounts/bulk_delete", {
       method: "POST",
       body: JSON.stringify({ emails }),
     });
-    $("#poolActionResult").textContent = `✅ 已删除 ${r.deleted} 个号`;
+    $("#poolActionResult").textContent = `✅ Deleted ${r.deleted} accounts`;
     $("#poolActionResult").className = "result ok";
     refreshPool(); refreshStats();
   } catch (e) {
@@ -342,22 +342,22 @@ $("#btnDeleteSelected").addEventListener("click", async () => {
 $("#btnBulkDelStatus").addEventListener("click", async () => {
   const status = $("#bulkDelStatus").value;
   if (!status) {
-    $("#poolActionResult").textContent = "请先选择要删除的状态";
+    $("#poolActionResult").textContent = "Select a status to delete first";
     $("#poolActionResult").className = "result bad";
     return;
   }
   const tip = status === "all"
-    ? "⚠️ 这会删除号池里所有号（含未注册的），确定？"
-    : `确定删除全部 ${status} 状态的号？`;
+    ? "⚠️ Delete every account in the pool, including unregistered accounts?"
+    : `Delete all accounts with status ${status}?`;
   if (!confirm(tip)) return;
-  $("#poolActionResult").textContent = "删除中...";
+  $("#poolActionResult").textContent = "Deleting...";
   $("#poolActionResult").className = "result";
   try {
     const r = await api("/api/accounts/bulk_delete", {
       method: "POST",
       body: JSON.stringify({ status }),
     });
-    $("#poolActionResult").textContent = `✅ 已删除 ${r.deleted} 个 ${status} 号`;
+    $("#poolActionResult").textContent = `✅ Deleted ${r.deleted} ${status} accounts`;
     $("#poolActionResult").className = "result ok";
     $("#bulkDelStatus").value = "";
     refreshPool(); refreshStats();
@@ -375,23 +375,23 @@ $("#poolTable").addEventListener("click", async (e) => {
     $("#regEmail").value = email;
     window.scrollTo({ top: 0, behavior: "smooth" });
   } else if (btn.dataset.act === "reset") {
-    if (!confirm(`重置 ${email} 为 available？\n（号会重新可用，但已保存的凭证不变）`)) return;
+    if (!confirm(`Reset ${email} to available?\nSaved credentials will not change.`)) return;
     try {
       await api(`/api/accounts/reset/${encodeURIComponent(email)}`, { method: "POST" });
       refreshPool();
       refreshStats();
     } catch (err) {
-      alert("重置失败: " + err.message);
+      alert("Reset failed: " + err.message);
     }
   } else if (btn.dataset.act === "del") {
-    if (!confirm(`删除 ${email}？`)) return;
+    if (!confirm(`Delete ${email}?`)) return;
     await api(`/api/accounts/${encodeURIComponent(email)}`, { method: "DELETE" });
     refreshPool();
     refreshStats();
   }
 });
 
-// ──────────────────────── 注册结果列表（分页） ────────────────────────
+// ──────────────────────── Paginated registration results ────────────────────────
 
 const _plusCache = {};
 
@@ -403,7 +403,7 @@ function _regTotalPages() { return Math.max(1, Math.ceil(_regTotal / REG_PAGE_SI
 
 function _updateRegPagination() {
   const pages = _regTotalPages();
-  $("#regPageInfo").textContent = `第 ${_regPage} 页 / 共 ${pages} 页（${_regTotal} 条）`;
+  $("#regPageInfo").textContent = `Page ${_regPage} of ${pages} (${_regTotal} items)`;
   $("#regPrevPage").disabled = _regPage <= 1;
   $("#regNextPage").disabled = _regPage >= pages;
 }
@@ -428,13 +428,13 @@ async function refreshRegistered(resetPage) {
       <td><input type="checkbox" class="reg-check" data-email="${r.email}"></td>
       <td>${r.email}</td>
       <td data-plus-email="${r.email}">${plusCell}</td>
-      <td>${r.at_len > 0 ? `<button class="copy-cell" data-email="${r.email}" data-field="access_token" title="点击复制 access_token">✅ ${r.at_len} 📋</button>` : "—"}</td>
-      <td>${r.st_len > 0 ? `<button class="copy-cell" data-email="${r.email}" data-field="session_token" title="点击复制 session_token">✅ ${r.st_len} 📋</button>` : "—"}</td>
-      <td>${r.rt_len > 0 ? `<button class="copy-cell" data-email="${r.email}" data-field="refresh_token" title="点击复制 refresh_token">✅ ${r.rt_len} 📋</button>` : "—"}</td>
+      <td>${r.at_len > 0 ? `<button class="copy-cell" data-email="${r.email}" data-field="access_token" title="Click to copy access_token">✅ ${r.at_len} 📋</button>` : "—"}</td>
+      <td>${r.st_len > 0 ? `<button class="copy-cell" data-email="${r.email}" data-field="session_token" title="Click to copy session_token">✅ ${r.st_len} 📋</button>` : "—"}</td>
+      <td>${r.rt_len > 0 ? `<button class="copy-cell" data-email="${r.email}" data-field="refresh_token" title="Click to copy refresh_token">✅ ${r.rt_len} 📋</button>` : "—"}</td>
       <td>${fmtTime(r.created_at)}</td>
       <td>
-        <button data-act="view" data-email="${r.email}">查看凭证</button>
-        <button data-act="del" data-email="${r.email}">删除</button>
+        <button data-act="view" data-email="${r.email}">View Credentials</button>
+        <button data-act="del" data-email="${r.email}">Delete</button>
       </td>
     `;
     tb.appendChild(tr);
@@ -448,10 +448,10 @@ $("#btnRefreshReg").addEventListener("click", () => refreshRegistered(false));
 $("#regPrevPage").addEventListener("click", () => { if (_regPage > 1) { _regPage--; refreshRegistered(); } });
 $("#regNextPage").addEventListener("click", () => { if (_regPage < _regTotalPages()) { _regPage++; refreshRegistered(); } });
 
-// 筛选切换时重置到第一页
+// Return to the first page when the filter changes.
 $("#regFilter").addEventListener("change", () => refreshRegistered(true));
 
-// ── Plus 试用检查 ──
+// ── Plus trial eligibility checks ──
 
 function _collectPlusEmails(uncheckedOnly) {
   const tds = Array.from(document.querySelectorAll("[data-plus-email]"));
@@ -467,14 +467,14 @@ function _collectPlusEmails(uncheckedOnly) {
 async function _doCheckPlus(uncheckedOnly) {
   const emails = _collectPlusEmails(uncheckedOnly);
   if (!emails.length) {
-    $("#checkPlusResult").textContent = uncheckedOnly ? "当前页没有未检测的号" : "当前页无数据";
+    $("#checkPlusResult").textContent = uncheckedOnly ? "No unchecked accounts on this page" : "No accounts on this page";
     $("#checkPlusResult").className = "result";
     return;
   }
   const proxy = $("#regProxy").value.trim();
   $("#btnCheckPlus").disabled = true;
   $("#btnRecheckPlus").disabled = true;
-  $("#checkPlusResult").textContent = `检查中... (${emails.length} 个号)`;
+  $("#checkPlusResult").textContent = `Checking ${emails.length} accounts...`;
   try {
     const { results } = await api("/api/registered/check_plus", {
       method: "POST",
@@ -490,10 +490,10 @@ async function _doCheckPlus(uncheckedOnly) {
       else if (info.status === "banned") bannedCount++;
       else if (info.status === "free") freeCount++;
     }
-    $("#checkPlusResult").textContent = `完成: ${plusCount} 可用Plus, ${freeCount} Free, ${bannedCount} 封号`;
+    $("#checkPlusResult").textContent = `Complete: ${plusCount} Plus eligible, ${freeCount} Free, ${bannedCount} banned`;
     $("#checkPlusResult").className = "result ok";
   } catch (e) {
-    $("#checkPlusResult").textContent = "检查失败: " + e.message;
+    $("#checkPlusResult").textContent = "Check failed: " + e.message;
     $("#checkPlusResult").className = "result bad";
   } finally {
     $("#btnCheckPlus").disabled = false;
@@ -505,7 +505,7 @@ $("#btnCheckPlus").addEventListener("click", () => _doCheckPlus(true));
 $("#btnRecheckPlus").addEventListener("click", () => _doCheckPlus(false));
 $("#btnCheckSelected").addEventListener("click", () => _doCheckPlusSelected());
 
-// ── 检测选中的号 ──
+// ── Check selected accounts ──
 async function _doCheckPlusSelected() {
   const emails = _selectedRegEmails();
   if (!emails.length) return;
@@ -513,7 +513,7 @@ async function _doCheckPlusSelected() {
   $("#btnCheckSelected").disabled = true;
   $("#btnCheckPlus").disabled = true;
   $("#btnRecheckPlus").disabled = true;
-  $("#checkPlusResult").textContent = `检查中... (${emails.length} 个号)`;
+  $("#checkPlusResult").textContent = `Checking ${emails.length} accounts...`;
   try {
     const { results } = await api("/api/registered/check_plus", {
       method: "POST",
@@ -529,10 +529,10 @@ async function _doCheckPlusSelected() {
       else if (info.status === "banned") bannedCount++;
       else if (info.status === "free") freeCount++;
     }
-    $("#checkPlusResult").textContent = `完成: ${plusCount} 可用Plus, ${freeCount} Free, ${bannedCount} 封号`;
+    $("#checkPlusResult").textContent = `Complete: ${plusCount} Plus eligible, ${freeCount} Free, ${bannedCount} banned`;
     $("#checkPlusResult").className = "result ok";
   } catch (e) {
-    $("#checkPlusResult").textContent = "检查失败: " + e.message;
+    $("#checkPlusResult").textContent = "Check failed: " + e.message;
     $("#checkPlusResult").className = "result bad";
   } finally {
     $("#btnCheckSelected").disabled = false;
@@ -541,7 +541,7 @@ async function _doCheckPlusSelected() {
   }
 }
 
-// ── 注册结果：复选框 + 批量删 + 单行删 ──
+// ── Registration results: checkbox, bulk, and single-row deletion ──
 
 function _selectedRegEmails() {
   return Array.from(document.querySelectorAll(".reg-check:checked")).map(c => c.dataset.email);
@@ -564,15 +564,15 @@ $("#regSelectAll").addEventListener("change", (e) => {
 $("#btnDeleteSelectedReg").addEventListener("click", async () => {
   const emails = _selectedRegEmails();
   if (!emails.length) return;
-  if (!confirm(`确定删除选中的 ${emails.length} 条凭证？(不可恢复)`)) return;
-  $("#exportResult").textContent = "删除中...";
+  if (!confirm(`Delete ${emails.length} selected credentials? This cannot be undone.`)) return;
+  $("#exportResult").textContent = "Deleting...";
   $("#exportResult").className = "result";
   try {
     const r = await api("/api/registered/bulk_delete", {
       method: "POST",
       body: JSON.stringify({ emails }),
     });
-    $("#exportResult").textContent = `✅ 已删除 ${r.deleted} 条凭证`;
+    $("#exportResult").textContent = `✅ Deleted ${r.deleted} credentials`;
     $("#exportResult").className = "result ok";
     refreshRegistered();
   } catch (e) {
@@ -582,16 +582,16 @@ $("#btnDeleteSelectedReg").addEventListener("click", async () => {
 });
 
 $("#btnDeleteAllReg").addEventListener("click", async () => {
-  if (!confirm("⚠️ 这会清空注册结果表里的所有凭证！\n确定继续？（号池不受影响）")) return;
-  if (!confirm("再次确认：真的要删除全部凭证吗？此操作不可恢复！")) return;
-  $("#exportResult").textContent = "清空中...";
+  if (!confirm("⚠️ This deletes every credential in the registration results table.\nContinue? The account pool is not affected.")) return;
+  if (!confirm("Confirm again: delete every credential? This action cannot be undone.")) return;
+  $("#exportResult").textContent = "Clearing...";
   $("#exportResult").className = "result";
   try {
     const r = await api("/api/registered/bulk_delete", {
       method: "POST",
       body: JSON.stringify({ all: true }),
     });
-    $("#exportResult").textContent = `✅ 已清空 ${r.deleted} 条凭证`;
+    $("#exportResult").textContent = `✅ Cleared ${r.deleted} credentials`;
     $("#exportResult").className = "result ok";
     refreshRegistered();
   } catch (e) {
@@ -600,7 +600,7 @@ $("#btnDeleteAllReg").addEventListener("click", async () => {
   }
 });
 
-// 缓存最近查看的凭证（用于"复制全部 JSON"按钮和单字段复制）
+// Cache the most recently viewed credentials for Copy All JSON and per-field copying.
 let _credCache = null;
 
 async function _loadCred(email) {
@@ -626,12 +626,12 @@ async function _copyText(text, btn) {
     if (btn) {
       const orig = btn.textContent;
       const cls = btn.className;
-      btn.textContent = "✅ 已复制";
+      btn.textContent = "✅ Copied";
       btn.className = cls + " copied";
       setTimeout(() => { btn.textContent = orig; btn.className = cls; }, 1200);
     }
   } catch (e) {
-    alert("复制失败: " + e.message);
+    alert("Copy failed: " + e.message);
   }
 }
 
@@ -641,33 +641,33 @@ $("#regTable").addEventListener("click", async (e) => {
   const email = btn.dataset.email;
   if (!email) return;
 
-  // 行内快捷复制（access/session/refresh 列直接点）
+  // Inline copy for access, session, and refresh-token columns.
   if (btn.classList.contains("copy-cell")) {
     const field = btn.dataset.field;
     try {
       const cred = await _loadCred(email);
       const val = cred[field] || "";
-      if (!val) { alert(`${field} 为空`); return; }
+      if (!val) { alert(`${field} is empty`); return; }
       await _copyText(val, btn);
-    } catch (err) { alert("加载凭证失败: " + err.message); }
+    } catch (err) { alert("Failed to load credentials: " + err.message); }
     return;
   }
 
-  // 「查看凭证」打开模态框
+  // View Credentials opens the modal.
   if (btn.dataset.act === "view") {
     try {
       const cred = await _loadCred(email);
       _renderCredModal(email, cred);
-    } catch (err) { alert("加载凭证失败: " + err.message); }
+    } catch (err) { alert("Failed to load credentials: " + err.message); }
   }
 
-  // 「删除」单行删
+  // Delete one credential row.
   if (btn.dataset.act === "del") {
-    if (!confirm(`删除 ${email} 的凭证？`)) return;
+    if (!confirm(`Delete credentials for ${email}?`)) return;
     try {
       await api(`/api/registered/${encodeURIComponent(email)}`, { method: "DELETE" });
       refreshRegistered();
-    } catch (err) { alert("删除失败: " + err.message); }
+    } catch (err) { alert("Delete failed: " + err.message); }
   }
 });
 
@@ -677,7 +677,7 @@ function _renderCredModal(email, cred) {
   const box = $("#credFields");
   box.innerHTML = "";
 
-  // 主要凭证按顺序展示，每项独立复制按钮
+  // Display primary credentials in order, with a copy button for each field.
   const KEYS = [
     ["access_token",  "access_token"],
     ["session_token", "session_token"],
@@ -697,14 +697,14 @@ function _renderCredModal(email, cred) {
       <div class="cred-row-head">
         <span class="cred-label">${label}</span>
         <span class="cred-meta">len=${val.length}</span>
-        <button class="cred-copy" data-val-key="${key}">📋 复制</button>
+        <button class="cred-copy" data-val-key="${key}">📋 Copy</button>
       </div>
       <pre class="cred-val">${escapeHtml(val)}</pre>
     `;
     box.appendChild(row);
   }
 
-  // extra（含 cookie 同步等其他元数据）
+  // Extra metadata, including synchronized cookies.
   if (cred.extra && Object.keys(cred.extra).length > 0) {
     const row = document.createElement("div");
     row.className = "cred-row";
@@ -712,7 +712,7 @@ function _renderCredModal(email, cred) {
       <div class="cred-row-head">
         <span class="cred-label">extra</span>
         <span class="cred-meta">${Object.keys(cred.extra).length} keys</span>
-        <button class="cred-copy" data-val-key="__extra__">📋 复制 JSON</button>
+        <button class="cred-copy" data-val-key="__extra__">📋 Copy JSON</button>
       </div>
       <pre class="cred-val">${escapeHtml(JSON.stringify(cred.extra, null, 2))}</pre>
     `;
@@ -728,7 +728,7 @@ function escapeHtml(s) {
   }[c]));
 }
 
-// 模态框内单字段复制
+// Copy a single field from the modal.
 $("#credFields").addEventListener("click", async (e) => {
   const btn = e.target.closest("button.cred-copy");
   if (!btn) return;
@@ -747,7 +747,7 @@ $("#credCopyJson").addEventListener("click", async (e) => {
   await _copyText(JSON.stringify(_credCache, null, 2), e.currentTarget);
 });
 
-// ──────────────────────── 运行记录 ────────────────────────
+// ──────────────────────── Registration runs ────────────────────────
 
 async function refreshRuns() {
   const { items } = await api("/api/runs");
@@ -767,7 +767,7 @@ async function refreshRuns() {
 }
 $("#btnRefreshRuns").addEventListener("click", refreshRuns);
 
-// ──────────────────────── 🤖 Auto-Loop 全自动批量 ────────────────────────
+// ──────────────────────── 🤖 Automatic batch loop ────────────────────────
 
 const AUTO_BTNS = {
   start:  $("#btnAutoStart"),
@@ -793,11 +793,11 @@ function _autoOptions() {
 async function autoStart() {
   try {
     await api("/api/auto/start", { method: "POST", body: JSON.stringify(_autoOptions()) });
-  } catch (e) { alert("启动失败: " + e.message); }
+  } catch (e) { alert("Failed to start: " + e.message); }
 }
 async function autoCall(path) {
   try { await api(path, { method: "POST" }); }
-  catch (e) { alert(`${path} 失败: ${e.message}`); }
+  catch (e) { alert(`${path} failed: ${e.message}`); }
 }
 AUTO_BTNS.start.addEventListener("click", autoStart);
 AUTO_BTNS.pause.addEventListener("click", () => autoCall("/api/auto/pause"));
@@ -806,9 +806,9 @@ AUTO_BTNS.stop.addEventListener("click", () => autoCall("/api/auto/stop"));
 
 function _renderAutoStatus(s) {
   const stateLabel = {
-    "stopped": "⚪ 未运行",
-    "running": "🟢 运行中",
-    "paused":  "⏸ 已暂停",
+    "stopped": "⚪ Stopped",
+    "running": "🟢 Running",
+    "paused":  "⏸ Paused",
   }[s.state] || s.state;
   const elapsed = s.elapsed ? Math.round(s.elapsed) + "s" : "—";
   const workers = Array.isArray(s.workers) ? s.workers : [];
@@ -819,23 +819,23 @@ function _renderAutoStatus(s) {
         return `<div class="auto-worker">worker-${w.id} ▶ <code>${escapeHtml(w.email)}</code> ${dur}${px}</div>`;
       }).join("")
     : "";
-  const meta = `并发=${s.concurrency || 1}`
-    + (s.proxy_pool_size ? ` 代理池=${s.proxy_pool_size}` : "")
-    + (s.target_count ? ` 目标=${s.target_count}` : "");
-  // 有目标时显示 "成功 37 / 100（剩 63）"，否则显示纯成功数
+  const meta = `Concurrency=${s.concurrency || 1}`
+    + (s.proxy_pool_size ? ` Proxy pool=${s.proxy_pool_size}` : "")
+    + (s.target_count ? ` Target=${s.target_count}` : "");
+  // Show progress toward a target and its remaining count, or just the success count when unlimited.
   const okDisplay = s.target_count
     ? `<b class="ok">${s.registered_ok}</b> / ${s.target_count}`
-      + (s.remaining != null ? ` <span class="auto-meta">(剩 ${s.remaining})</span>` : "")
-    : `<b class="ok">${s.registered_ok}</b> 成功`;
+      + (s.remaining != null ? ` <span class="auto-meta">(${s.remaining} remaining)</span>` : "")
+    : `<b class="ok">${s.registered_ok}</b> successful`;
   $("#autoStatus").innerHTML = `
     <b>${stateLabel}</b>
-    &nbsp;|&nbsp; 已完成: ${okDisplay} / <b class="bad">${s.registered_fail}</b> 失败
-    &nbsp;|&nbsp; 运行: ${elapsed}
+    &nbsp;|&nbsp; Completed: ${okDisplay} / <b class="bad">${s.registered_fail}</b> failed
+    &nbsp;|&nbsp; Elapsed: ${elapsed}
     &nbsp;|&nbsp; <span class="auto-meta">${meta}</span>
     ${workerRows ? "<br>" + workerRows : ""}
     <br><span class="auto-msg">${escapeHtml(s.last_message || "")}</span>
   `;
-  // 按钮可用性
+  // Button availability.
   const st = s.state;
   AUTO_BTNS.start.disabled  = (st === "running" || st === "paused");
   AUTO_BTNS.pause.disabled  = (st !== "running");
@@ -854,34 +854,34 @@ function _connectAutoStream() {
   es.addEventListener("run_started", (e) => {
     try {
       const d = JSON.parse(e.data);
-      logLine(`[auto] ▶ 开始注册 ${d.email} (run=${d.run_id})`, "evt");
-      // 复用单跑的 SSE 流，自动接管日志框 + 状态栏复制按钮
+      logLine(`[auto] ▶ Registration started for ${d.email} (run=${d.run_id})`, "evt");
+      // Reuse the single-run SSE for logs and status-bar copy buttons.
       streamRun(d.run_id);
     } catch (_) {}
   });
   es.addEventListener("run_finished", (e) => {
     try {
       const d = JSON.parse(e.data);
-      const tag = d.ok ? "✅" : (d.category === "network" ? "🌐 网络错误（号已 release）" : "❌");
-      logLine(`[auto] ${tag} ${d.email} 完成`, d.ok ? "ok" : "err");
+      const tag = d.ok ? "✅" : (d.category === "network" ? "🌐 Network error (account released)" : "❌");
+      logLine(`[auto] ${tag} ${d.email} finished`, d.ok ? "ok" : "err");
     } catch (_) {}
   });
   es.addEventListener("circuit_break", (e) => {
     try {
       const d = JSON.parse(e.data);
-      logLine(`[auto] ⚠️ 熔断: ${d.reason}`, "err");
+      logLine(`[auto] ⚠️ Circuit breaker: ${d.reason}`, "err");
       _showBanner(d.reason);
     } catch (_) {}
   });
   es.onerror = () => {
-    // 自动重连
+    // Reconnect automatically.
     try { es.close(); } catch (_) {}
     _autoEs = null;
     setTimeout(_connectAutoStream, 2000);
   };
 }
 
-// 顶部红色告警横幅
+// Red alert banner at the top of the page.
 function _showBanner(msg) {
   const b = $("#alertBanner");
   $("#alertBannerMsg").textContent = msg;
@@ -891,11 +891,11 @@ $("#alertBannerClose").addEventListener("click", () => {
   $("#alertBanner").classList.add("hidden");
 });
 
-// ──────────────────────── 表单持久化（localStorage 自动保存/恢复）────────────────────────
+// ──────────────────────── Form persistence with localStorage autosave and restore ────────────────────────
 
 const FORM_KEY = "gpt_outlook_register_form_v1";
 
-// id -> 类型（默认 text；checkbox 走 .checked）
+// Element ID to value type; text is the default, while checkboxes use .checked.
 const PERSIST_FIELDS = {
   regProxy:        "text",
   regOtpTimeout:   "text",
@@ -927,7 +927,7 @@ function _loadForm() {
   }
 }
 
-// 绑定 input/change 自动保存
+// Autosave on input and change events.
 function _bindAutoSave() {
   for (const id of Object.keys(PERSIST_FIELDS)) {
     const el = document.getElementById(id);
@@ -937,7 +937,7 @@ function _bindAutoSave() {
   }
 }
 
-// ──────────────────────── 📧 邮箱配置 ────────────────────────
+// ──────────────────────── 📧 Email configuration ────────────────────────
 
 function _syncCfFields(source) {
   $("#cfTempCfg").classList.toggle("hidden", source !== "cf_temp");
@@ -954,16 +954,16 @@ async function loadMailConfig() {
     $("#cfDomain").value = config.cf_domain || "";
     $("#cfAdminToken").value = "";
     if (config.cf_admin_token === "***") {
-      $("#cfAdminToken").placeholder = "已设置（留空不修改）";
+      $("#cfAdminToken").placeholder = "Already configured (leave blank to keep it)";
     } else {
-      $("#cfAdminToken").placeholder = "Worker 配置的 ADMIN_PASSWORDS";
+      $("#cfAdminToken").placeholder = "ADMIN_PASSWORDS configured on the Worker";
     }
   } catch (e) {
     console.error("loadMailConfig:", e);
   }
 }
 
-// radio 切换显隐
+// Show or hide provider fields when the radio selection changes.
 document.querySelectorAll("input[name='mailSource']").forEach(r => {
   r.addEventListener("change", () => _syncCfFields(r.value));
 });
@@ -979,7 +979,7 @@ $("#btnSaveMailCfg").addEventListener("click", async () => {
   };
   try {
     await api("/api/settings/mail", { method: "POST", body: JSON.stringify(body) });
-    $("#mailCfgResult").textContent = "✅ 保存成功";
+    $("#mailCfgResult").textContent = "✅ Configuration saved";
     $("#mailCfgResult").className = "result ok";
   } catch (e) {
     $("#mailCfgResult").textContent = "❌ " + e.message;
@@ -991,7 +991,7 @@ $("#btnSaveMailCfg").addEventListener("click", async () => {
 $("#btnTestMail").addEventListener("click", async (e) => {
   const btn = e.currentTarget;
   btn.disabled = true;
-  btn.textContent = "⏳ 测试中...";
+  btn.textContent = "⏳ Testing...";
   $("#mailCfgResult").textContent = "";
   try {
     const r = await api("/api/settings/mail/test", { method: "POST" });
@@ -1002,13 +1002,13 @@ $("#btnTestMail").addEventListener("click", async (e) => {
     $("#mailCfgResult").className = "result bad";
   } finally {
     btn.disabled = false;
-    btn.textContent = "🔌 测试 CF 连通性";
+    btn.textContent = "🔌 Test CF Connection";
   }
 });
 
-// ──────────────────────── 📱 SMS 接码配置 ────────────────────────
+// ──────────────────────── 📱 SMS verification configuration ────────────────────────
 
-// 全量国家列表（id → name_cn + openai_sms_safe）；按 provider 动态加载
+// Full country list loaded dynamically by provider, including OpenAI SMS compatibility.
 let _smsAllCountries = [];
 let _smsSafeCountrySet = new Set();
 let _smsCountriesProvider = "";
@@ -1022,7 +1022,7 @@ async function _loadSmsAllCountries(provider) {
     _smsSafeCountrySet = new Set(r.openai_sms_safe || []);
     _smsCountriesProvider = provider;
   } catch (e) {
-    console.error("加载国家列表失败:", e);
+    console.error("Failed to load country list:", e);
   }
   return _smsAllCountries;
 }
@@ -1032,7 +1032,7 @@ function _renderSmsCountrySelect(selectEl, currentValue) {
   for (const c of _smsAllCountries) {
     const opt = document.createElement("option");
     opt.value = c.id;
-    opt.textContent = `${c.id} - ${c.name_cn}`;
+    opt.textContent = `${c.id} - ${c.name || c.name_en || `Country ${c.id}`}`;
     selectEl.appendChild(opt);
   }
   if (currentValue) selectEl.value = currentValue;
@@ -1043,7 +1043,7 @@ function _renderSmsAllowedCountriesBox(checkedIds) {
   box.innerHTML = "";
   const checkedSet = new Set((checkedIds || "").split(",").map(s => s.trim()).filter(Boolean));
 
-  // 先渲染所有国家（带 data 属性用于搜索）
+  // Render every country first and retain data attributes for search.
   for (const c of _smsAllCountries) {
     const lab = document.createElement("label");
     lab.className = "check country-item";
@@ -1051,13 +1051,14 @@ function _renderSmsAllowedCountriesBox(checkedIds) {
     lab.style.padding = "4px 6px";
     lab.style.lineHeight = "1.4";
     lab.dataset.countryId = c.id;
-    lab.dataset.countryName = c.name_cn.toLowerCase();
+    const countryName = c.name || c.name_en || `Country ${c.id}`;
+    lab.dataset.countryName = countryName.toLowerCase();
 
-    // 显示：ID·国家名 (价格/库存)
+    // Display ID, country name, and optional price/stock.
     const priceInfo = c.price != null && c.count != null
       ? ` <span style="color:#999;font-size:11px">(${c.price}/${c.count})</span>`
       : "";
-    lab.innerHTML = `<input type="checkbox" value="${c.id}" ${checkedSet.has(c.id) ? "checked" : ""}>${c.id}·${c.name_cn}${priceInfo}`;
+    lab.innerHTML = `<input type="checkbox" value="${c.id}" ${checkedSet.has(c.id) ? "checked" : ""}>${c.id}·${countryName}${priceInfo}`;
     box.appendChild(lab);
   }
 
@@ -1066,7 +1067,7 @@ function _renderSmsAllowedCountriesBox(checkedIds) {
     cb.addEventListener("change", _updateAllowedCountryCount);
   });
 
-  // 绑定搜索框
+  // Bind the search box once.
   const searchInput = $("#smsCountrySearch");
   if (searchInput && !searchInput.dataset.bound) {
     searchInput.dataset.bound = "1";
@@ -1084,7 +1085,7 @@ function _renderSmsAllowedCountriesBox(checkedIds) {
 
 function _updateAllowedCountryCount() {
   const checked = $("#smsAllowedCountriesBox").querySelectorAll("input[type=checkbox]:checked");
-  $("#smsAllowedCountryCount").textContent = `已选 ${checked.length} 个国家`;
+  $("#smsAllowedCountryCount").textContent = `${checked.length} countries selected`;
 }
 
 function _getAllowedCountriesValue() {
@@ -1102,8 +1103,8 @@ async function loadSmsConfig() {
     if (radio) radio.checked = true;
     $("#smsApiKey").value = "";
     $("#smsApiKey").placeholder = (config.sms_api_key === "***")
-      ? "已设置（留空不修改）"
-      : "粘贴接码平台 API Key";
+      ? "Already configured (leave blank to keep it)"
+      : "Paste the SMS provider API key";
     _renderSmsCountrySelect($("#smsCountry"), config.sms_country || "150");
     $("#smsService").value = config.sms_service || "dr";
     $("#smsMaxPrice").value = config.sms_max_price || "";
@@ -1120,14 +1121,14 @@ async function loadSmsConfig() {
   }
 }
 
-// 切换接码平台时重新加载国家列表
+// Reload countries when the SMS provider changes.
 document.querySelectorAll("input[name='smsProvider']").forEach(radio => {
   radio.addEventListener("change", async (e) => {
     const newProvider = e.target.value;
     _smsAllCountries = [];
     _smsCountriesProvider = "";
     const box = $("#smsAllowedCountriesBox");
-    if (box) box.innerHTML = '<em style="grid-column:1/-1;color:#aaa;font-size:12px">加载中...</em>';
+    if (box) box.innerHTML = '<em style="grid-column:1/-1;color:#aaa;font-size:12px">Loading...</em>';
     await _loadSmsAllCountries(newProvider);
     _renderSmsCountrySelect($("#smsCountry"), $("#smsCountry").value);
     _renderSmsAllowedCountriesBox(_getAllowedCountriesValue());
@@ -1161,7 +1162,7 @@ $("#btnSaveSmsCfg").addEventListener("click", async () => {
   };
   try {
     await api("/api/settings/sms", { method: "POST", body: JSON.stringify(body) });
-    $("#smsCfgResult").textContent = "✅ 保存成功";
+    $("#smsCfgResult").textContent = "✅ Configuration saved";
     $("#smsCfgResult").className = "result ok";
     setTimeout(loadSmsConfig, 300);
   } catch (e) {
@@ -1174,7 +1175,7 @@ $("#btnSaveSmsCfg").addEventListener("click", async () => {
 $("#btnTestSms").addEventListener("click", async (e) => {
   const btn = e.currentTarget;
   btn.disabled = true;
-  btn.textContent = "⏳ 测试中...";
+  btn.textContent = "⏳ Testing...";
   $("#smsCfgResult").textContent = "";
   try {
     const r = await api("/api/settings/sms/test", { method: "POST" });
@@ -1185,11 +1186,11 @@ $("#btnTestSms").addEventListener("click", async (e) => {
     $("#smsCfgResult").className = "result bad";
   } finally {
     btn.disabled = false;
-    btn.textContent = "🔌 测试余额";
+    btn.textContent = "🔌 Test Balance";
   }
 });
 
-// ──────────────────────── 📤 自动导出配置 (CPA / SUB2API) ────────────────────────
+// ──────────────────────── 📤 Automatic export configuration (CPA / SUB2API) ────────────────────────
 
 async function loadExportConfig() {
   try {
@@ -1199,16 +1200,16 @@ async function loadExportConfig() {
     $("#cpaUrl").value = config.cpa_url || "";
     $("#cpaMgmtKey").value = "";
     $("#cpaMgmtKey").placeholder = config.cpa_mgmt_key === "***"
-      ? "已设置（留空不修改）"
-      : "粘贴 CPA 管理密钥";
+      ? "Already configured (leave blank to keep it)"
+      : "Paste the CPA management key";
     $("#cpaTimeout").value = config.cpa_timeout || "30";
     // SUB2API
     $("#sub2apiEnabled").checked = config.sub2api_enabled === "1";
     $("#sub2apiUrl").value = config.sub2api_url || "";
     $("#sub2apiApiKey").value = "";
     $("#sub2apiApiKey").placeholder = config.sub2api_api_key === "***"
-      ? "已设置（留空不修改）"
-      : "粘贴面板里生成的 x-api-key";
+      ? "Already configured (leave blank to keep it)"
+      : "Paste the x-api-key generated by the dashboard";
     $("#sub2apiGroupIds").value = config.sub2api_group_ids || "2";
     $("#sub2apiTimeout").value = config.sub2api_timeout || "30";
   } catch (e) {
@@ -1234,7 +1235,7 @@ $("#btnSaveExportCfg").addEventListener("click", async () => {
   };
   try {
     await api("/api/settings/export", { method: "POST", body: JSON.stringify(body) });
-    $("#exportCfgResult").textContent = "✅ 保存成功";
+    $("#exportCfgResult").textContent = "✅ Configuration saved";
     $("#exportCfgResult").className = "result ok";
     setTimeout(loadExportConfig, 300);
   } catch (e) {
@@ -1246,14 +1247,14 @@ $("#btnSaveExportCfg").addEventListener("click", async () => {
 
 async function _testExportTarget(target, btn, resultEl, origText) {
   btn.disabled = true;
-  btn.textContent = "⏳ 测试中...";
+  btn.textContent = "⏳ Testing...";
   resultEl.textContent = "";
   try {
     const r = await api("/api/settings/export/test", {
       method: "POST",
       body: JSON.stringify({ target }),
     });
-    resultEl.textContent = "✅ " + (r.message || "连通正常");
+    resultEl.textContent = "✅ " + (r.message || "Connection successful");
     resultEl.className = "result ok";
   } catch (e) {
     resultEl.textContent = "❌ " + e.message;
@@ -1265,13 +1266,13 @@ async function _testExportTarget(target, btn, resultEl, origText) {
 }
 
 $("#btnTestCpa").addEventListener("click", (e) => {
-  _testExportTarget("cpa", e.currentTarget, $("#cpaTestResult"), "🔌 测试 CPA 连通性");
+  _testExportTarget("cpa", e.currentTarget, $("#cpaTestResult"), "🔌 Test CPA Connection");
 });
 $("#btnTestSub2api").addEventListener("click", (e) => {
-  _testExportTarget("sub2api", e.currentTarget, $("#sub2apiTestResult"), "🔌 测试 SUB2API 连通性");
+  _testExportTarget("sub2api", e.currentTarget, $("#sub2apiTestResult"), "🔌 Test SUB2API Connection");
 });
 
-// ──────────────────────── 启动 ────────────────────────
+// ──────────────────────── Startup ────────────────────────
 
 _loadForm();
 _bindAutoSave();

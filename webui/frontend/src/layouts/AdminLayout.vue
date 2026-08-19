@@ -17,12 +17,12 @@ const { banner } = storeToRefs(runtime)
 const collapse = ref(false)
 const adDismissed = ref(false)
 
-const GROUP_ORDER = ['概览', '注册', '数据', '配置']
+const GROUP_ORDER = ['Overview', 'Registration', 'Data', 'Settings']
 const groups = computed(() => {
   const map = {}
   for (const r of router.getRoutes()) {
     if (!r.meta?.title) continue
-    const g = r.meta.group || '其他'
+    const g = r.meta.group || 'Other'
     ;(map[g] ||= []).push(r)
   }
   return GROUP_ORDER.filter((g) => map[g]).map((g) => ({ name: g, items: map[g] }))
@@ -43,11 +43,11 @@ function onSearch(path) {
 }
 
 const statPills = computed(() => [
-  { label: '总计', value: stats.value.total, type: 'info' },
-  { label: '可用', value: stats.value.available, type: 'success' },
-  { label: '进行中', value: stats.value.in_use, type: 'warning' },
-  { label: '完成', value: stats.value.done, type: 'primary' },
-  { label: '失败', value: stats.value.failed, type: 'danger' },
+  { label: 'Total', value: stats.value.total, type: 'info' },
+  { label: 'Available', value: stats.value.available, type: 'success' },
+  { label: 'In progress', value: stats.value.in_use, type: 'warning' },
+  { label: 'Completed', value: stats.value.done, type: 'primary' },
+  { label: 'Failed', value: stats.value.failed, type: 'danger' },
 ])
 
 onMounted(() => {
@@ -87,7 +87,7 @@ onMounted(() => {
         </div>
         <div class="right">
           <el-select
-            v-model="search" filterable clearable placeholder="搜索功能"
+            v-model="search" filterable clearable placeholder="Search features"
             size="small" class="search-box" @change="onSearch"
           >
             <el-option v-for="o in menuOptions" :key="o.value" :label="o.label" :value="o.value" />
@@ -97,7 +97,7 @@ onMounted(() => {
               {{ p.label }} <b>{{ p.value }}</b>
             </el-tag>
           </div>
-          <el-tooltip :content="theme.dark ? '浅色模式' : '深色模式'">
+          <el-tooltip :content="theme.dark ? 'Light mode' : 'Dark mode'">
             <el-button circle text @click="theme.toggle">
               <el-icon :size="18"><Moon v-if="!theme.dark" /><Sunny v-else /></el-icon>
             </el-button>
@@ -105,13 +105,13 @@ onMounted(() => {
           <el-dropdown>
             <span class="avatar">
               <el-avatar :size="28" class="avatar-img"><el-icon><User /></el-icon></el-avatar>
-              <span class="avatar-name">管理员</span>
+              <span class="avatar-name">Administrator</span>
               <el-icon :size="12"><ArrowDown /></el-icon>
             </span>
             <template #dropdown>
               <el-dropdown-menu>
                 <el-dropdown-item @click="theme.toggle">
-                  {{ theme.dark ? '浅色模式' : '深色模式' }}
+                  {{ theme.dark ? 'Light mode' : 'Dark mode' }}
                 </el-dropdown-item>
               </el-dropdown-menu>
             </template>
@@ -123,9 +123,9 @@ onMounted(() => {
         <div v-if="!adDismissed" class="ad-banner">
           <div class="ad-content">
             <el-icon :size="16" style="color: #e6a23c; flex-shrink: 0"><Bell /></el-icon>
-            <span>交流QQ群：<b>259844673</b></span>
+            <span>Community QQ group: <b>259844673</b></span>
             <span class="ad-sep">|</span>
-            <span>推荐服务器：<a href="http://www.ransuyun.com" target="_blank" rel="noopener">燃速云</a></span>
+            <span>Recommended hosting: <a href="http://www.ransuyun.com" target="_blank" rel="noopener">Ransuyun</a></span>
           </div>
           <el-button text size="small" class="ad-close" @click="adDismissed = true">
             <el-icon :size="14"><Close /></el-icon>

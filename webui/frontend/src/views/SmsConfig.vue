@@ -7,14 +7,14 @@ import FooterToolbar from '@/components/FooterToolbar.vue'
 const enabled = ref(false)
 const provider = ref('smsbower')
 const apiKey = ref('')
-const apiKeyPh = ref('粘贴接码平台 API Key')
+const apiKeyPh = ref('Paste the SMS provider API key')
 const service = ref('dr')
 const maxPrice = ref('')
 const fixedPrice = ref('')
 const phoneSuccessMax = ref('3')
 const reusePhone = ref(false)
 const autoMinStock = ref('20')
-const allowed = ref([]) // 允许国家 id 数组
+const allowed = ref([]) // Allowed country IDs.
 const maxPhoneAttempts = ref('')
 const perPhoneTimeout = ref('80')
 
@@ -26,7 +26,7 @@ const testing = ref(false)
 const countryOptions = computed(() =>
   allCountries.value.map((c) => ({
     value: c.id,
-    label: `${c.id}·${c.name_cn}${c.price != null ? ` (${c.price}/${c.count})` : ''}`,
+    label: `${c.id}·${c.name || c.name_en || `Country ${c.id}`}${c.price != null ? ` (${c.price}/${c.count})` : ''}`,
     safe: c.openai_sms_safe,
   })),
 )
@@ -37,7 +37,7 @@ async function loadCountries(p) {
     const r = await getSmsAllCountries(p || provider.value)
     allCountries.value = r.countries || []
   } catch (e) {
-    console.error('加载国家列表失败:', e)
+    console.error('Failed to load country list:', e)
   } finally { countriesLoading.value = false }
 }
 
@@ -48,7 +48,7 @@ async function load() {
     await loadCountries(provider.value)
     enabled.value = config.sms_enabled === '1'
     apiKey.value = ''
-    apiKeyPh.value = config.sms_api_key === '***' ? '已设置（留空不修改）' : '粘贴接码平台 API Key'
+    apiKeyPh.value = config.sms_api_key === '***' ? 'Already configured (leave blank to keep it)' : 'Paste the SMS provider API key'
     service.value = config.sms_service || 'dr'
     maxPrice.value = config.sms_max_price || ''
     fixedPrice.value = config.sms_fixed_price || ''
@@ -69,7 +69,7 @@ async function onProviderChange() {
 async function save() {
   saving.value = true
   try {
-    // 单价只暴露一个输入框：既是租号时的价格上限，也是自动挑国家时的筛选条件。
+    // One price input serves as both the rental ceiling and the automatic country filter.
     const price = maxPrice.value.trim()
     await saveSmsConfig({
       sms_enabled: enabled.value ? '1' : '0',
@@ -81,14 +81,14 @@ async function save() {
       sms_fixed_price: fixedPrice.value.trim(),
       sms_phone_success_max: phoneSuccessMax.value.trim() || '3',
       sms_reuse_phone: reusePhone.value ? '1' : '0',
-      // 自动选号已改为常驻能力，不再有开关；锁死单一国家请在”允许使用的国家”里只勾一个。
+      // Automatic country selection is always enabled. Select one allowed country to lock selection to it.
       sms_auto_country: '1',
       sms_allowed_countries: allowed.value.join(','),
       sms_auto_min_stock: autoMinStock.value.trim() || '20',
       sms_max_phone_attempts: maxPhoneAttempts.value.trim(),
       sms_per_phone_timeout: perPhoneTimeout.value.trim() || '80',
     })
-    ElMessage.success('保存成功')
+    ElMessage.success('Configuration saved')
     setTimeout(load, 300)
   } catch (e) { ElMessage.error(e.message) }
   finally { saving.value = false }
@@ -96,7 +96,7 @@ async function save() {
 
 async function test() {
   testing.value = true
-  try { const r = await testSms(); ElMessage.success(r.message || '连通正常') }
+  try { const r = await testSms(); ElMessage.success(r.message || 'Connection successful') }
   catch (e) { ElMessage.error(e.message) }
   finally { testing.value = false }
 }
@@ -106,24 +106,24 @@ onActivated(() => load())
 <template>
   <div class="page">
     <el-card shadow="never" style="max-width: 820px">
-      <template #header><span class="section-title" style="margin: 0">SMS 接码配置</span></template>
+      <template #header><span class="section-title" style="margin: 0">SMS Verification Configuration</span></template>
 
       <el-form label-position="top">
         <el-form-item>
           <el-checkbox v-model="enabled">
-            <b>启用 SMS 接码</b>（命中 add-phone 时自动租号，否则回退到环境变量路径）
+            <b>Enable SMS verification</b> (automatically rent a number when the add-phone step appears; otherwise use the environment-variable fallback)
           </el-checkbox>
         </el-form-item>
 
-        <el-form-item label="接码平台">
+        <el-form-item label="SMS provider">
           <el-radio-group v-model="provider" @change="onProviderChange">
             <el-radio value="smsbower">
-              <span>SmsBower（立即取消就退款）</span>
-              <a :href="'https://smsbower.app/cn?ref=499410'" target="_blank" class="sms-reg-link" @click.stop>前往注册 ↗</a>
+              <span>SmsBower (immediate refund after cancellation)</span>
+              <a :href="'https://smsbower.app/en?ref=499410'" target="_blank" class="sms-reg-link" @click.stop>Register ↗</a>
             </el-radio>
             <el-radio value="herosms">
-              <span>HeroSMS（取消后 20 分钟自动退款）</span>
-              <a :href="'https://hero-sms.com/?ref=738021'" target="_blank" class="sms-reg-link" @click.stop>前往注册 ↗</a>
+              <span>HeroSMS (automatic refund 20 minutes after cancellation)</span>
+              <a :href="'https://hero-sms.com/?ref=738021'" target="_blank" class="sms-reg-link" @click.stop>Register ↗</a>
             </el-radio>
           </el-radio-group>
         </el-form-item>
@@ -135,68 +135,68 @@ onActivated(() => load())
             </el-form-item>
           </el-col>
           <el-col :span="8">
-            <el-form-item label="Service 代码（OpenAI = dr）">
+            <el-form-item label="Service code (OpenAI = dr)">
               <el-input v-model="service" placeholder="dr" />
             </el-form-item>
           </el-col>
         </el-row>
 
-        <el-divider content-position="left">选号策略（按价格 + 库存自动挑国家）</el-divider>
-        <el-form-item label="允许使用的国家（多选，可搜索）">
+        <el-divider content-position="left">Number Selection (automatic by price and stock)</el-divider>
+        <el-form-item label="Allowed countries (multi-select, searchable)">
           <el-select
             v-model="allowed" multiple filterable clearable collapse-tags collapse-tags-tooltip
-            :loading="countriesLoading" placeholder="搜索国家名称或 ID…" style="width: 100%"
+            :loading="countriesLoading" placeholder="Search by country name or ID…" style="width: 100%"
           >
             <el-option v-for="o in countryOptions" :key="o.value" :label="o.label" :value="o.value">
               <span>{{ o.label }}</span>
-              <el-tag v-if="o.safe" size="small" type="success" style="margin-left: 6px">安全</el-tag>
+              <el-tag v-if="o.safe" size="small" type="success" style="margin-left: 6px">OpenAI-compatible</el-tag>
             </el-option>
           </el-select>
           <div class="hint" style="margin-top: 4px">
-            已选 {{ allowed.length }} 个国家 · 留空 = 全平台自动挑最便宜的；只勾 1 个 = 锁死用这个国家
+            {{ allowed.length }} countries selected · Leave blank to automatically choose the cheapest option across the platform; select one country to restrict selection to it.
           </div>
         </el-form-item>
         <el-row :gutter="16">
           <el-col :span="12">
-            <el-form-item label="最低库存（低于这个数的国家不选）">
+            <el-form-item label="Minimum stock (countries below this level are excluded)">
               <el-input v-model="autoMinStock" type="number" placeholder="20" />
             </el-form-item>
           </el-col>
         </el-row>
 
-        <el-divider content-position="left">号码与费用</el-divider>
+        <el-divider content-position="left">Numbers and Pricing</el-divider>
         <el-row :gutter="16">
           <el-col :span="12">
-            <el-form-item label="号码最高单价（空=不限，同时用于筛选国家）">
+            <el-form-item label="Maximum price per number (blank = unlimited; also filters countries)">
               <el-input v-model="maxPrice" placeholder="0.5" />
             </el-form-item>
           </el-col>
           <el-col :span="12">
-            <el-form-item label="号码固定单价（空=不限，优先级高于最高单价）">
+            <el-form-item label="Fixed price per number (blank = unlimited; takes priority over maximum price)">
               <el-input v-model="fixedPrice" placeholder="0.3" />
             </el-form-item>
           </el-col>
         </el-row>
         <el-row :gutter="16">
           <el-col :span="12">
-            <el-form-item label="同号成功复用上限（默认 3）">
+            <el-form-item label="Successful reuse limit per number (default: 3)">
               <el-input v-model="phoneSuccessMax" type="number" />
             </el-form-item>
           </el-col>
         </el-row>
         <el-form-item>
-          <el-checkbox v-model="reusePhone"><b>启用号码复用</b>（gpt风控，号码短时间无法复用）</el-checkbox>
+          <el-checkbox v-model="reusePhone"><b>Enable number reuse</b> (OpenAI risk controls may prevent immediate reuse)</el-checkbox>
         </el-form-item>
 
-        <el-divider content-position="left">失败重试策略</el-divider>
+        <el-divider content-position="left">Retry Policy</el-divider>
         <el-row :gutter="16">
           <el-col :span="12">
-            <el-form-item label="最多换号次数（空=平台默认，一般 3）">
-              <el-input v-model="maxPhoneAttempts" type="number" placeholder="留空使用平台默认" />
+            <el-form-item label="Maximum replacement attempts (blank = provider default, usually 3)">
+              <el-input v-model="maxPhoneAttempts" type="number" placeholder="Leave blank to use the provider default" />
             </el-form-item>
           </el-col>
           <el-col :span="12">
-            <el-form-item label="单号等待秒数（默认 80）">
+            <el-form-item label="Timeout per number in seconds (default: 80)">
               <el-input v-model="perPhoneTimeout" type="number" placeholder="80" />
             </el-form-item>
           </el-col>
@@ -206,9 +206,9 @@ onActivated(() => load())
     </el-card>
 
     <FooterToolbar>
-      <template #left>接码平台：{{ provider === 'herosms' ? 'HeroSMS' : 'SmsBower' }}{{ allowed.length ? ` · 允许国家 ${allowed.length} 个` : ' · 全平台自动选号' }}</template>
-      <el-button :loading="testing" @click="test">测试余额</el-button>
-      <el-button type="primary" :loading="saving" @click="save">保存配置</el-button>
+      <template #left>SMS provider: {{ provider === 'herosms' ? 'HeroSMS' : 'SmsBower' }}{{ allowed.length ? ` · ${allowed.length} allowed countries` : ' · automatic platform-wide selection' }}</template>
+      <el-button :loading="testing" @click="test">Test Balance</el-button>
+      <el-button type="primary" :loading="saving" @click="save">Save Configuration</el-button>
     </FooterToolbar>
   </div>
 </template>

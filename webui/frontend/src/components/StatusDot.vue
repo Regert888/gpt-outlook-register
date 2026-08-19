@@ -1,5 +1,5 @@
 <script setup>
-// Ant 风状态：圆点 + 文字，比纯色块 tag 更克制专业。
+// Ant-style status indicator: a compact dot and label instead of a solid tag.
 defineProps({
   type: { type: String, default: 'info' }, // success/warning/danger/primary/info
   text: { type: [String, Number], default: '' },

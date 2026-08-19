@@ -1,5 +1,5 @@
 <script setup>
-// 内容区底部悬浮操作条（Ant Pro FooterToolbar 风格）：滚到哪都能保存。
+// Sticky Ant Pro-style action bar that keeps save controls visible while scrolling.
 </script>
 
 <template>

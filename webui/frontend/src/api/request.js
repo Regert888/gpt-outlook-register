@@ -2,9 +2,9 @@ import axios from 'axios'
 import { ElMessage } from 'element-plus'
 
 // ────────────────────────────────────────────────────────────
-// ⭐ 后端地址统一入口
-// 换 Go 后端时，只改这一处（或设置 VITE_API_BASE 环境变量）即可。
-// 留空 = 与前端同源（当前 FastAPI / 未来 Gin 都伺服在同一端口）。
+// ⭐ Single source of truth for the backend address.
+// When switching to a Go backend, change only this value (or set VITE_API_BASE).
+// Blank means same-origin; both the current FastAPI server and a future Gin server use the frontend port.
 // ────────────────────────────────────────────────────────────
 export const API_BASE = import.meta.env.VITE_API_BASE || ''
 
@@ -14,12 +14,13 @@ const http = axios.create({
   timeout: 60000,
 })
 
-// 统一解包 + 错误提示。后端约定：
-//   - 一般错误：非 2xx，body 里有 detail 字段
-//   - 校验类错误（如导入逐行报错）：422，body 是 { message, errors: [{line, error}] }
+// Normalize response bodies and error messages. Backend contract:
+//   - General errors: non-2xx response with a detail field in the body.
+//   - Validation errors (such as per-line import errors): 422 with
+//     { message, errors: [{line, error}] } in the body.
 //
-// 抛出的 Error 会挂上 .status 和 .data，调用方需要逐行详情时读 err.data.errors，
-// 只想弹个提示的话照旧读 err.message —— 老代码不用改。
+// Rejected Error objects include .status and .data. Callers that need per-line
+// details can read err.data.errors; existing callers can continue using err.message.
 http.interceptors.response.use(
   (resp) => resp.data,
   (error) => {
@@ -29,7 +30,7 @@ http.interceptors.response.use(
       data?.message ||
       error?.response?.statusText ||
       error?.message ||
-      '请求失败'
+      'Request failed'
     const err = new Error(detail)
     err.status = error?.response?.status
     err.data = data
@@ -40,10 +41,10 @@ http.interceptors.response.use(
 export default http
 
 /**
- * 建立一个 SSE 连接。
- * @param {string} path  相对路径，如 `/api/auto/stream`
- * @param {Object<string, (ev: MessageEvent)=>void>} handlers 事件名 -> 回调
- * @param {(err: Event)=>void} [onError] 出错回调（默认自动关闭）
+ * Open an SSE connection.
+ * @param {string} path Relative path, such as `/api/auto/stream`.
+ * @param {Object<string, (ev: MessageEvent)=>void>} handlers Event-name-to-callback map.
+ * @param {(err: Event)=>void} [onError] Error callback; the connection closes by default.
  * @returns {EventSource}
  */
 export function createSSE(path, handlers = {}, onError) {
@@ -60,7 +61,7 @@ export function createSSE(path, handlers = {}, onError) {
   return es
 }
 
-/** 复制文本到剪贴板（带降级） */
+/** Copy text to the clipboard, with a legacy fallback. */
 export async function copyText(text) {
   try {
     if (navigator.clipboard?.writeText) {
@@ -74,16 +75,16 @@ export async function copyText(text) {
       document.execCommand('copy')
       document.body.removeChild(ta)
     }
-    ElMessage.success('已复制到剪贴板')
+    ElMessage.success('Copied to clipboard')
     return true
   } catch (e) {
-    ElMessage.error('复制失败: ' + e.message)
+    ElMessage.error('Copy failed: ' + e.message)
     return false
   }
 }
 
-/** 时间戳(秒) -> 本地时间字符串 */
+/** Convert a timestamp in seconds to a localized English date and time. */
 export function fmtTime(ts) {
   if (!ts) return '-'
-  return new Date(ts * 1000).toLocaleString('zh-CN', { hour12: false })
+  return new Date(ts * 1000).toLocaleString('en-US', { hour12: false })
 }

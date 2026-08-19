@@ -1,13 +1,14 @@
-"""Outlook 邮箱 OTP 取码 —— 转发壳。
+"""Compatibility wrapper for Outlook OTP retrieval.
 
-实现已迁至 mail_providers/outlook.py（继承统一的 MailProvider 基类）。
-本文件仅保留原有的公开名字，让以下旧 import 路径继续可用：
+The implementation moved to mail_providers/outlook.py and now inherits the
+shared MailProvider base class. This module retains the old public names so
+these legacy imports continue to work:
 
     auth_flow.py:25         from mail_outlook import OutlookMailProvider as MailProvider
     webui/registrar.py:23   from mail_outlook import OutlookMailProvider
     register_outlook.py:33  from mail_outlook import OutlookMailProvider
 
-新代码请直接用：
+New code should use::
 
     from mail_providers import create_mail_provider
     mail = create_mail_provider("outlook", settings, account)
@@ -66,7 +67,7 @@ if __name__ == "__main__":
         _sys.exit(2)
     parts = _sys.argv[1].split("----")
     if len(parts) != 4:
-        print(f"4 段格式错: 拿到 {len(parts)} 段")
+        print(f"Invalid 4-field format: got {len(parts)} fields")
         _sys.exit(2)
     e, p, c, r = parts
     prov = OutlookMailProvider(e, p, c, r)

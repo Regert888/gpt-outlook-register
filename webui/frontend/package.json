@@ -3,10 +3,11 @@
   "version": "2.0.0",
   "private": true,
   "type": "module",
-  "description": "团子喵 · GPT Outlook Register WebUI (Vue3 + Element Plus)",
+  "description": "GPT Auto Register WebUI (Vue 3 + Element Plus)",
   "scripts": {
     "dev": "vite",
     "build": "vite build",
+    "test": "node --test tests/*.test.mjs",
     "preview": "vite preview"
   },
   "dependencies": {

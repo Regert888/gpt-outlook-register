@@ -82,10 +82,10 @@ def _ensure_sdk_file(session: Any, timeout_ms: int) -> Path:
         timeout=max(10, int(timeout_ms / 1000)),
     )
     if getattr(resp, "status_code", 0) != 200:
-        raise RuntimeError(f"下载 sdk.js 失败: HTTP {resp.status_code}")
+        raise RuntimeError(f"Failed to download sdk.js: HTTP {resp.status_code}")
     content = getattr(resp, "content", b"") or (resp.text or "").encode()
     if not content:
-        raise RuntimeError("下载 sdk.js 失败: 响应为空")
+        raise RuntimeError("Failed to download sdk.js: empty response")
     sdk_file.write_bytes(content)
     _sdk_file_cache = sdk_file
     return sdk_file
@@ -113,13 +113,13 @@ def _run_quickjs_action(
         },
     )
     if proc.returncode != 0:
-        raise RuntimeError(f"QuickJS 执行失败: {(proc.stderr or proc.stdout or 'unknown').strip()[:300]}")
+        raise RuntimeError(f"QuickJS execution failed: {(proc.stderr or proc.stdout or 'unknown').strip()[:300]}")
     out = (proc.stdout or "").strip()
     if not out:
-        raise RuntimeError("QuickJS 返回空输出")
+        raise RuntimeError("QuickJS returned empty output")
     data = json.loads(out)
     if not isinstance(data, dict):
-        raise RuntimeError("QuickJS 输出不是 JSON 对象")
+        raise RuntimeError("QuickJS output is not a JSON object")
     return data
 
 
@@ -152,7 +152,7 @@ def _fetch_sentinel_challenge(
         raise RuntimeError(f"/sentinel/req HTTP {resp.status_code}")
     payload = resp.json()
     if not isinstance(payload, dict):
-        raise RuntimeError("Sentinel challenge 响应不是 JSON 对象")
+        raise RuntimeError("Sentinel challenge response is not a JSON object")
     return payload
 
 
@@ -174,8 +174,9 @@ def get_sentinel_token_via_quickjs(
     device_memory: Optional[int] = None,
     max_touch_points: int = 0,
     device_pixel_ratio: float = 0.0,
-    timezone: str = "",  # IANA 时区名（如 Asia/Tokyo）
-    # Client Hints 全套（QuickJS 路径不直接用，但为了签名统一接收）
+    timezone: str = "",  # IANA time-zone name, e.g. Asia/Tokyo
+    # Accept the full Client Hints set to keep call signatures consistent,
+    # even though the QuickJS path does not consume all of it directly.
     sec_ch_ua_full_version_list: str = "",
     sec_ch_ua_arch: str = "",
     sec_ch_ua_bitness: str = "",
@@ -186,14 +187,16 @@ def get_sentinel_token_via_quickjs(
 
     Caller is expected to fall back to pure-Python sentinel on None.
 
-    指纹一致性：``platform`` / ``vendor`` / ``hardware_concurrency`` 等按调用方
-    传入的浏览器家族画像喂给 sdk.js 的 navigator，避免 UA 说 Windows Chrome 但
-    navigator 报 MacIntel/Apple 的硬伤。未传时按 UA 推断合理默认值。
+    Fingerprint consistency matters: feed ``platform``, ``vendor``,
+    ``hardware_concurrency``, and related caller-supplied browser-family data
+    into sdk.js navigator. This avoids contradictions such as a Windows Chrome
+    UA paired with MacIntel/Apple navigator values. Infer sensible defaults
+    from the UA when values are omitted.
     """
     log = log or (lambda m: logger.info(m))
     quickjs_script = _quickjs_script_path()
     if not quickjs_script.exists():
-        log(f"Sentinel QuickJS 脚本不存在: {quickjs_script}")
+        log(f"Sentinel QuickJS script does not exist: {quickjs_script}")
         return None
 
     did = str(device_id or uuid.uuid4())
@@ -211,7 +214,7 @@ def get_sentinel_token_via_quickjs(
             if tag and tag not in languages:
                 languages.append(tag)
 
-    # ── 指纹一致性：platform / vendor 未显式传入时按 UA 推断，绝不写死 MacIntel ──
+    # Infer platform and vendor from the UA rather than hard-coding MacIntel.
     ua_l = (user_agent or "").lower()
     if not platform:
         if "iphone" in ua_l:
@@ -224,7 +227,7 @@ def get_sentinel_token_via_quickjs(
             platform = "Win32"
     if vendor is None:
         if "firefox" in ua_l:
-            vendor = ""                       # Firefox navigator.vendor 为空串
+            vendor = ""                       # Firefox exposes an empty navigator.vendor.
         elif "chrome" in ua_l:
             vendor = "Google Inc."
         else:
@@ -244,9 +247,9 @@ def get_sentinel_token_via_quickjs(
         "browser_type": browser_type or "",
         "device_pixel_ratio": float(device_pixel_ratio) if device_pixel_ratio else 1.0,
         "max_touch_points": int(max_touch_points),
-        "timezone": timezone or "UTC",  # IANA 时区名
+        "timezone": timezone or "UTC",  # IANA time-zone name
     }
-    # deviceMemory 仅 Chromium 暴露；None 时不下发该键，JS 侧保持 undefined
+    # Only Chromium exposes deviceMemory. Omit it for None so JS sees undefined.
     if device_memory is not None:
         env_payload["device_memory"] = int(device_memory)
 
@@ -262,7 +265,7 @@ def get_sentinel_token_via_quickjs(
         )
         request_p = str(requirements.get("request_p") or "").strip()
         if not request_p:
-            log("Sentinel QuickJS 失败: requirements 未返回 request_p")
+            log("Sentinel QuickJS failed: requirements did not return request_p")
             return None
 
         challenge = _fetch_sentinel_challenge(
@@ -270,7 +273,7 @@ def get_sentinel_token_via_quickjs(
         )
         c_value = str(challenge.get("token") or "").strip()
         if not c_value:
-            log("Sentinel QuickJS 失败: challenge token 为空")
+            log("Sentinel QuickJS failed: challenge token is empty")
             return None
 
         solve_payload = dict(env_payload)
@@ -290,43 +293,35 @@ def get_sentinel_token_via_quickjs(
 
         so_token_raw = str(solved.get("so_token") or "").strip()
 
-        # SO token 要不要，是**服务端在 challenge 里说了算**的，不是每个 flow 都有。
-        # sdk.js 里 SO 采集器的启动条件（去混淆）：
+        # The challenge determines whether an SO token is required; not every
+        # flow includes one. The de-obfuscated sdk.js collector condition is:
         #     challenge.so.required === true && typeof challenge.so.collector_dx === 'string'
-        # 实测 2026-08-06 三个 flow 的 /sentinel/req 响应：
-        #     authorize_continue    → 有 so 块, required=true
-        #     oauth_create_account  → 有 so 块, required=true
-        #     username_password_create → **顶层根本没有 so 键**
-        # 也就是说真实浏览器跑 username_password_create 同样不会有 SO token。
-        # 以前这里无条件要求 so_token 非空，把「服务端没要」误判成「我们没算出来」，
-        # 打出「中止以避免封号」——是误报。更糟的是调用方降级时会沿用上一个 flow 的
-        # SO token 继续发，等于给一个明说不需要 SO 的请求塞了个别的 flow 的凭证，
-        # 比不发更像异常特征。现在按服务端的要求判定。
+        # Observations from 2026-08-06: authorize_continue and
+        # oauth_create_account required SO, while username_password_create
+        # omitted the SO key entirely. Treating every empty SO token as failure
+        # produced false alarms and risked reusing a token from another flow.
         so_required = bool((challenge.get("so") or {}).get("required") is True)
 
         sdk_token = str(solved.get("token") or "").strip()
         if not sdk_token:
-            log("Sentinel QuickJS 失败: SDK token 为空，中止以避免封号")
+            log("Sentinel QuickJS failed: SDK token is empty; stopping to protect the account")
             return None
         if so_required and not so_token_raw:
-            # 服务端确实要了 SO token 但我们没算出来 —— 这才是真异常，保持中止
-            log("Sentinel QuickJS 失败: 服务端要求 SO token 但求解为空，中止以避免封号")
+            # This is a real failure: the server explicitly required SO.
+            log("Sentinel QuickJS failed: the server requires an SO token, but solving returned none; stopping to protect the account")
             return None
         log(f"Sentinel QuickJS OK (len={len(sdk_token)}, "
-            f"so={'Y' if so_token_raw else 'N/A(服务端未要求)'})")
+            f"so={'Y' if so_token_raw else 'N/A(not required by server)'})")
         return (sdk_token, so_token_raw)
     except Exception as e:
-        # ⚠️ 这里曾经是个纯 catch-all：任何异常都降级成一行 INFO 日志 + return None，
-        #    上层只能看到"主 token 缺失"，真因全被掩盖。2026-08-10 主人批量跑 10 个号，
-        #    其中一次失败日志是「Sentinel QuickJS 失败（主 token 缺失…）」，看着像 PoW
-        #    算不出来，实际是 /sentinel/req 那个 POST 撞了链路级 TLS 瞬断
-        #    （curl:(35)，全局 5.4% 偶发）—— 排查方向被带偏了一整轮。
-        #    网络类异常现在原样抛出去，让 registrar 的 classify_error 判成 network，
-        #    也让 http_client 的 TLS 重试有机会先兜住；真正的 JS/PoW 问题才 return None。
+        # This used to catch every exception and return None, masking transient
+        # TLS failures as missing-token or PoW failures. Propagate network
+        # errors so registrar can classify them correctly and http_client can
+        # apply its TLS retry policy. Only genuine JS/PoW failures return None.
         from http_client import _is_tls_handshake_error
 
         if _is_tls_handshake_error(e):
-            log(f"Sentinel 网络异常（非 PoW 问题，原样上抛）: {e}")
+            log(f"Sentinel network error (not a PoW issue; propagating unchanged): {e}")
             raise
-        log(f"Sentinel QuickJS 异常: {e}")
+        log(f"Sentinel QuickJS error: {e}")
         return None

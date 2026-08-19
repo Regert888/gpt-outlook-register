@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""WebUI 一键启动脚本：装依赖 → 跑 uvicorn。
+"""One-command WebUI launcher: install dependencies, then run Uvicorn.
 
-用法：
-    python start_webui.py             # 默认 127.0.0.1:8765
-    python start_webui.py --port 9000 # 自定义端口
-    python start_webui.py --host 0.0.0.0 --port 8765  # 内网监听
+Usage::
+    python start_webui.py             # default: 127.0.0.1:8765
+    python start_webui.py --port 9000 # custom port
+    python start_webui.py --host 0.0.0.0 --port 8765  # listen on the LAN
 """
 from __future__ import annotations
 
@@ -14,7 +14,7 @@ import sys
 import webbrowser
 from pathlib import Path
 
-# Windows 控制台 GBK 编码兼容：强制 UTF-8 输出
+# Force UTF-8 output for compatibility with Windows consoles using GBK.
 if sys.platform.startswith("win"):
     os.environ.setdefault("PYTHONIOENCODING", "utf-8")
     try:
@@ -28,18 +28,18 @@ ROOT = Path(__file__).resolve().parent
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--host", default="127.0.0.1", help="监听地址 (默认 127.0.0.1)")
-    ap.add_argument("--port", type=int, default=8765, help="监听端口 (默认 8765)")
-    ap.add_argument("--no-browser", action="store_true", help="不自动打开浏览器")
-    ap.add_argument("--reload", action="store_true", help="开发模式 (代码改动自动重启)")
+    ap.add_argument("--host", default="127.0.0.1", help="Listen address (default: 127.0.0.1)")
+    ap.add_argument("--port", type=int, default=8765, help="Listen port (default: 8765)")
+    ap.add_argument("--no-browser", action="store_true", help="Do not open a browser automatically")
+    ap.add_argument("--reload", action="store_true", help="Development mode with automatic reloads")
     args = ap.parse_args()
 
-    # 确保依赖装了
+    # Install optional launcher dependencies when missing.
     try:
         import fastapi  # noqa: F401
         import uvicorn  # noqa: F401
     except ImportError:
-        print("[!] 缺少依赖，正在安装 fastapi / uvicorn ...")
+        print("[!] Required packages are missing; installing FastAPI and Uvicorn...")
         import subprocess
         subprocess.check_call([
             sys.executable, "-m", "pip", "install",
@@ -52,8 +52,8 @@ def main():
     import uvicorn
 
     url = f"http://{args.host if args.host != '0.0.0.0' else '127.0.0.1'}:{args.port}/"
-    print(f"\n🔔 团子喵 WebUI 启动中...")
-    print(f"   访问: {url}\n")
+    print("\n🔔 GPT Auto Register WebUI is starting...")
+    print(f"   Open: {url}\n")
 
     if not args.no_browser:
         try:

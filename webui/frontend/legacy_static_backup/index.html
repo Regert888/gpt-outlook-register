@@ -1,9 +1,9 @@
 <!DOCTYPE html>
-<html lang="zh-CN">
+<html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1.0">
-<title>GPT Outlook Register · 团子喵 WebUI</title>
+<title>GPT Outlook Register · WebUI</title>
 <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
@@ -12,14 +12,14 @@
   <div class="brand">
     <span class="bell">🔔</span>
     <h1>GPT Outlook Register</h1>
-    <span class="sub">纯协议 · Outlook 接码 · <a href="https://www.ransuyun.com/" target="_blank" rel="noopener" class="brand-link">燃速云</a> 驱动</span>
+    <span class="sub">Protocol-based · Outlook verification · Powered by <a href="https://www.ransuyun.com/" target="_blank" rel="noopener" class="brand-link">Ransuyun</a></span>
   </div>
   <div class="stats" id="statsBar">
-    <span class="pill"><b>0</b> 总计</span>
-    <span class="pill ok"><b>0</b> 可用</span>
-    <span class="pill warn"><b>0</b> 进行中</span>
-    <span class="pill done"><b>0</b> 已完成</span>
-    <span class="pill bad"><b>0</b> 失败</span>
+    <span class="pill"><b>0</b> Total</span>
+    <span class="pill ok"><b>0</b> Available</span>
+    <span class="pill warn"><b>0</b> In use</span>
+    <span class="pill done"><b>0</b> Completed</span>
+    <span class="pill bad"><b>0</b> Failed</span>
   </div>
 </header>
 
@@ -30,377 +30,377 @@
 
 <main>
 
-  <!-- 左：批量导入 + 注册控制 -->
+  <!-- Left: bulk import and registration controls. -->
   <section class="card">
-    <h2>📥 批量导入接码号</h2>
-    <p class="hint">每行一个，4 段格式（用 <code>----</code> 分隔）：<br>
+    <h2>📥 Bulk Import Email Accounts</h2>
+    <p class="hint">One account per line, with four fields separated by <code>----</code>:<br>
        <code>email----password----client_id----refresh_token</code></p>
     <textarea id="importText" rows="8" placeholder="charles123@outlook.jp----P@ssw0rd----9e5f94bc-...----M.C538_..."></textarea>
     <div class="row">
-      <button id="btnImport" class="primary">导入到号池</button>
+      <button id="btnImport" class="primary">Import into Pool</button>
       <span id="importResult" class="result"></span>
     </div>
 
     <hr>
 
-    <h2>▶️ 触发注册</h2>
+    <h2>▶️ Start Registration</h2>
     <div class="form">
-      <label>邮箱 <small>(留空 = 自动 claim 下一个 available)</small>
-        <input id="regEmail" placeholder="留空 = 自动选号 / 或填指定邮箱">
+      <label>Email <small>(leave blank to claim the next available account)</small>
+        <input id="regEmail" placeholder="Leave blank for automatic selection, or enter a specific email">
       </label>
-      <label>代理 <small>(直连留空，Plus检查复用此代理)</small>
+      <label>Proxy <small>(leave blank for a direct connection; Plus checks reuse this proxy)</small>
         <input id="regProxy" placeholder="socks5://user:pass@host:1080">
       </label>
-      <label>OTP 等待秒数
+      <label>OTP timeout (seconds)
         <input id="regOtpTimeout" type="number" value="10" min="10" max="600">
       </label>
 
       <div class="row">
-        <button id="btnRun" class="primary">▶ 开始注册（单个）</button>
+        <button id="btnRun" class="primary">▶ Start Single Registration</button>
         <span id="runStatus" class="result"></span>
       </div>
 
       <div class="auto-bar">
-        <span class="auto-title">🤖 全自动批量</span>
-        <button id="btnAutoStart" class="primary">▶ 自动跑号池</button>
-        <button id="btnAutoPause" disabled>⏸ 暂停</button>
-        <button id="btnAutoResume" disabled>▶ 恢复</button>
-        <button id="btnAutoStop" disabled>⏹ 停止</button>
-        <label class="check inline-check" title="同时跑几个注册流程">
-          并发:<input id="autoConcurrency" type="number" value="1" min="1" max="20" style="width:60px;display:inline-block;margin-left:4px">
+        <span class="auto-title">🤖 Automatic Batch</span>
+        <button id="btnAutoStart" class="primary">▶ Run Account Pool</button>
+        <button id="btnAutoPause" disabled>⏸ Pause</button>
+        <button id="btnAutoResume" disabled>▶ Resume</button>
+        <button id="btnAutoStop" disabled>⏹ Stop</button>
+        <label class="check inline-check" title="Number of concurrent registration flows">
+          Concurrency:<input id="autoConcurrency" type="number" value="1" min="1" max="20" style="width:60px;display:inline-block;margin-left:4px">
         </label>
-        <label class="check inline-check" title="每个 worker 跑完一个号的冷却（防风控）">
-          冷却:<input id="autoCoolDown" type="number" value="3" min="0" max="120" style="width:60px;display:inline-block;margin-left:4px"> 秒
+        <label class="check inline-check" title="Cooldown after each worker finishes an account">
+          Cooldown:<input id="autoCoolDown" type="number" value="3" min="0" max="120" style="width:60px;display:inline-block;margin-left:4px"> seconds
         </label>
-        <label class="check inline-check" title="目标成功数：累计成功达标后自动停止；0 = 不限量">
-          目标:<input id="autoTargetCount" type="number" value="0" min="0" max="100000" style="width:70px;display:inline-block;margin-left:4px"> 个
-        </label>
-      </div>
-      <div class="row">
-        <label class="check inline-check" style="width:100%" title="多代理池：每行一个，worker 按顺序轮流取；如果留空则所有 worker 都用上面的「代理」字段">
-          <span style="white-space:nowrap">代理池:</span>
-          <textarea id="autoProxyPool" rows="3" placeholder="留空 = 所有 worker 用同一个代理&#10;每行一个代理，并发 N 时 worker 0~N 依次用&#10;例：&#10;socks5://127.0.0.1:7890&#10;socks5://127.0.0.1:7891&#10;http://1.2.3.4:8080" style="flex:1;font-family:monospace;font-size:12px;margin-left:4px"></textarea>
+        <label class="check inline-check" title="Stop automatically after this many successful registrations; 0 means unlimited">
+          Target:<input id="autoTargetCount" type="number" value="0" min="0" max="100000" style="width:70px;display:inline-block;margin-left:4px">
         </label>
       </div>
       <div class="row">
-        <span id="autoStatus" class="auto-status">⚪ 未运行</span>
+        <label class="check inline-check" style="width:100%" title="One proxy per line; workers rotate in order. Leave blank to use the proxy field above for all workers.">
+          <span style="white-space:nowrap">Proxy pool:</span>
+          <textarea id="autoProxyPool" rows="3" placeholder="Leave blank for all workers to use the same proxy&#10;One proxy per line; workers 0–N rotate in order&#10;Examples:&#10;socks5://127.0.0.1:7890&#10;socks5://127.0.0.1:7891&#10;http://1.2.3.4:8080" style="flex:1;font-family:monospace;font-size:12px;margin-left:4px"></textarea>
+        </label>
+      </div>
+      <div class="row">
+        <span id="autoStatus" class="auto-status">⚪ Stopped</span>
       </div>
     </div>
   </section>
 
-  <!-- 右：日志 + 列表 -->
+  <!-- Right: log and tables. -->
   <section class="card">
-    <h2>📜 实时日志</h2>
+    <h2>📜 Live Log</h2>
     <div id="logBox" class="log"></div>
 
     <div class="tabs">
-      <button class="tab active" data-tab="pool">号池</button>
-      <button class="tab" data-tab="registered">注册结果</button>
-      <button class="tab" data-tab="runs">运行记录</button>
-      <button class="tab" data-tab="mailcfg">📧 邮箱配置</button>
-      <button class="tab" data-tab="smscfg">📱 接码配置</button>
-      <button class="tab" data-tab="exportcfg">📤 自动导出</button>
+      <button class="tab active" data-tab="pool">Account Pool</button>
+      <button class="tab" data-tab="registered">Registration Results</button>
+      <button class="tab" data-tab="runs">Runs</button>
+      <button class="tab" data-tab="mailcfg">📧 Email Settings</button>
+      <button class="tab" data-tab="smscfg">📱 SMS Settings</button>
+      <button class="tab" data-tab="exportcfg">📤 Automatic Export</button>
     </div>
 
     <div class="tab-content" id="tab-pool">
       <div class="row">
         <select id="poolFilter">
-          <option value="">全部</option>
+          <option value="">All statuses</option>
           <option value="available">available</option>
           <option value="in_use">in_use</option>
           <option value="done">done</option>
           <option value="failed">failed</option>
         </select>
-        <button id="btnRefreshPool">刷新</button>
-        <button id="btnResetFailed" title="把所有 failed 号一键重置为 available">🔄 重试 failed</button>
-        <button id="btnReleaseStale" title="把卡在 in_use 超过 30 分钟的号释放回 available">♻️ 释放卡死号</button>
+        <button id="btnRefreshPool">Refresh</button>
+        <button id="btnResetFailed" title="Reset all failed accounts to available">🔄 Retry Failed</button>
+        <button id="btnReleaseStale" title="Release accounts that have remained in_use for more than 30 minutes">♻️ Release Stalled Accounts</button>
         <span id="poolActionResult" class="result"></span>
       </div>
       <div class="row">
-        <button id="btnResetSelected" title="把已勾选的 done/failed 号重置为 available" disabled>🔄 重置选中 (<span id="selCount2">0</span>)</button>
-        <button id="btnDeleteSelected" title="删除已勾选的号" disabled>🗑️ 删除选中 (<span id="selCount">0</span>)</button>
-        <select id="bulkDelStatus" title="按状态批量删除">
-          <option value="">— 按状态批量删 —</option>
-          <option value="failed">删全部 failed</option>
-          <option value="done">删全部 done</option>
-          <option value="available">删全部 available</option>
-          <option value="in_use">删全部 in_use</option>
-          <option value="all">删全部（危险）</option>
+        <button id="btnResetSelected" title="Reset selected done or failed accounts to available" disabled>🔄 Reset Selected (<span id="selCount2">0</span>)</button>
+        <button id="btnDeleteSelected" title="Delete selected accounts" disabled>🗑️ Delete Selected (<span id="selCount">0</span>)</button>
+        <select id="bulkDelStatus" title="Delete accounts by status">
+          <option value="">Delete by status</option>
+          <option value="failed">Delete all failed</option>
+          <option value="done">Delete all done</option>
+          <option value="available">Delete all available</option>
+          <option value="in_use">Delete all in_use</option>
+          <option value="all">Delete everything (dangerous)</option>
         </select>
-        <button id="btnBulkDelStatus">执行</button>
+        <button id="btnBulkDelStatus">Apply</button>
       </div>
       <table id="poolTable">
         <thead><tr>
-          <th><input type="checkbox" id="poolSelectAll" title="全选/全不选"></th>
-          <th>邮箱</th><th>状态</th><th>失败原因</th><th>操作</th>
+          <th><input type="checkbox" id="poolSelectAll" title="Select or clear all"></th>
+          <th>Email</th><th>Status</th><th>Failure reason</th><th>Actions</th>
         </tr></thead>
         <tbody></tbody>
       </table>
       <div id="poolPagination" class="pagination">
-        <button id="poolPrevPage" title="上一页">◀ 上一页</button>
-        <span id="poolPageInfo">第 1 页 / 共 1 页（0 条）</span>
-        <button id="poolNextPage" title="下一页">下一页 ▶</button>
+        <button id="poolPrevPage" title="Previous page">◀ Previous</button>
+        <span id="poolPageInfo">Page 1 of 1 (0 items)</span>
+        <button id="poolNextPage" title="Next page">Next ▶</button>
       </div>
     </div>
 
     <div class="tab-content hidden" id="tab-registered">
       <div class="row">
-        <button id="btnRefreshReg">刷新</button>
+        <button id="btnRefreshReg">Refresh</button>
         <select id="regFilter" style="margin-left:12px">
-          <option value="all">全部</option>
-          <option value="has_rt">有 RT</option>
-          <option value="no_rt">无 RT</option>
-          <option value="unchecked">未检测</option>
+          <option value="all">All</option>
+          <option value="has_rt">Has RT</option>
+          <option value="no_rt">No RT</option>
+          <option value="unchecked">Unchecked</option>
           <option value="free">Free</option>
-          <option value="plus">可领Plus</option>
-          <option value="banned">已封号</option>
+          <option value="plus">Plus eligible</option>
+          <option value="banned">Banned</option>
         </select>
-        <button id="btnDeleteSelectedReg" title="删除已勾选的凭证" disabled>🗑️ 删除选中 (<span id="selCountReg">0</span>)</button>
-        <button id="btnDeleteAllReg" title="清空所有注册结果（危险）">💥 清空全部</button>
-        <button id="btnCheckSelected" title="检测已勾选的号" disabled>🔍 检测选中 (<span id="selCountCheck">0</span>)</button>
-        <button id="btnCheckPlus" title="只检查当前页未检测的号">🔍 检查未检测</button>
-        <button id="btnRecheckPlus" title="重新检查当前页所有号" style="font-size:12px;opacity:.7">🔄 重新检查</button>
+        <button id="btnDeleteSelectedReg" title="Delete selected credentials" disabled>🗑️ Delete Selected (<span id="selCountReg">0</span>)</button>
+        <button id="btnDeleteAllReg" title="Delete all registration results (dangerous)">💥 Delete All</button>
+        <button id="btnCheckSelected" title="Check selected accounts" disabled>🔍 Check Selected (<span id="selCountCheck">0</span>)</button>
+        <button id="btnCheckPlus" title="Check unchecked accounts on the current page">🔍 Check Unchecked</button>
+        <button id="btnRecheckPlus" title="Recheck every account on the current page" style="font-size:12px;opacity:.7">🔄 Recheck All</button>
         <span id="checkPlusResult" class="result"></span>
         <span id="exportResult" class="result"></span>
       </div>
       <table id="regTable">
         <thead><tr>
-          <th><input type="checkbox" id="regSelectAll" title="全选/全不选"></th>
-          <th>邮箱</th><th>Plus状态</th><th>access_token</th><th>session_token</th><th>refresh_token</th><th>时间</th><th>操作</th>
+          <th><input type="checkbox" id="regSelectAll" title="Select or clear all"></th>
+          <th>Email</th><th>Plus status</th><th>access_token</th><th>session_token</th><th>refresh_token</th><th>Time</th><th>Actions</th>
         </tr></thead>
         <tbody></tbody>
       </table>
       <div id="regPagination" class="pagination">
-        <button id="regPrevPage" title="上一页">◀ 上一页</button>
-        <span id="regPageInfo">第 1 页 / 共 1 页（0 条）</span>
-        <button id="regNextPage" title="下一页">下一页 ▶</button>
+        <button id="regPrevPage" title="Previous page">◀ Previous</button>
+        <span id="regPageInfo">Page 1 of 1 (0 items)</span>
+        <button id="regNextPage" title="Next page">Next ▶</button>
       </div>
     </div>
 
     <div class="tab-content hidden" id="tab-runs">
       <div class="row">
-        <button id="btnRefreshRuns">刷新</button>
+        <button id="btnRefreshRuns">Refresh</button>
       </div>
       <table id="runTable">
-        <thead><tr><th>run_id</th><th>邮箱</th><th>状态</th><th>开始时间</th><th>错误</th></tr></thead>
+        <thead><tr><th>run_id</th><th>Email</th><th>Status</th><th>Started</th><th>Error</th></tr></thead>
         <tbody></tbody>
       </table>
     </div>
 
     <div class="tab-content hidden" id="tab-mailcfg">
-      <h3 style="margin:0 0 12px;color:var(--pink-dark)">📧 邮箱来源配置</h3>
+      <h3 style="margin:0 0 12px;color:var(--pink-dark)">📧 Email Provider Configuration</h3>
       <p class="hint">
-        OpenAI 注册需要邮箱收 OTP。可选 Outlook 接码池（从号池 claim），
-        或者用主人自己的 CF Worker 自建 catch-all 邮箱
-        (<a href="https://github.com/dreamhunter2333/cloudflare_temp_email" target="_blank" rel="noopener" class="brand-link">cloudflare_temp_email</a>)。
+        OpenAI registration requires an email address that can receive OTP codes. Use an Outlook account from the pool,
+        or a self-hosted catch-all mailbox on your own Cloudflare Worker
+        (<a href="https://github.com/dreamhunter2333/cloudflare_temp_email" target="_blank" rel="noopener" class="brand-link">cloudflare_temp_email</a>).
       </p>
       <div class="form">
         <fieldset>
-          <legend>邮箱来源</legend>
+          <legend>Email provider</legend>
           <label class="check">
             <input type="radio" name="mailSource" value="outlook" id="msOutlook">
-            Outlook 接码池 <small>（从号池 claim 一个 outlook 号注册）</small>
+            Outlook Account Pool <small>(claim an Outlook account from the pool)</small>
           </label>
           <label class="check">
             <input type="radio" name="mailSource" value="cf_temp" id="msCfTemp">
-            CF Temp Email <small>（cloudflare_temp_email 自建 catch-all）</small>
+            CF Temp Email <small>(self-hosted catch-all using cloudflare_temp_email)</small>
           </label>
         </fieldset>
 
         <div id="cfTempCfg" class="hidden">
-          <label>API URL <small>（Worker 部署地址，如 https://mail.example.com）</small>
+          <label>API URL <small>(Worker deployment URL, e.g. https://mail.example.com)</small>
             <input id="cfApiUrl" placeholder="https://mail.example.com">
           </label>
-          <label>Admin Token <small>（Worker 环境变量 ADMIN_PASSWORDS）</small>
-            <input id="cfAdminToken" placeholder="留空表示不修改（已设置）" type="password">
+          <label>Admin Token <small>(Worker environment variable ADMIN_PASSWORDS)</small>
+            <input id="cfAdminToken" placeholder="Leave blank to keep the configured value" type="password">
           </label>
-          <label>Catch-all 域名 <small>（如 example.com，邮件会发到 xxx@example.com）</small>
+          <label>Catch-all Domain <small>(e.g. example.com; mail is sent to xxx@example.com)</small>
             <input id="cfDomain" placeholder="example.com">
           </label>
           <p class="hint">
-            ⚠️ 主人需要在 Cloudflare Email Routing 配置 catch-all 转发到 Worker，
-            否则随机邮箱地址收不到 OpenAI 邮件。
+            ⚠️ Configure Cloudflare Email Routing to forward catch-all mail to the Worker.
+            Otherwise, generated addresses will not receive OpenAI messages.
           </p>
         </div>
 
         <div class="row">
-          <button id="btnSaveMailCfg" class="primary">💾 保存配置</button>
-          <button id="btnTestMail">🔌 测试 CF 连通性</button>
+          <button id="btnSaveMailCfg" class="primary">💾 Save Configuration</button>
+          <button id="btnTestMail">🔌 Test CF Connection</button>
           <span id="mailCfgResult" class="result"></span>
         </div>
       </div>
     </div>
 
     <div class="tab-content hidden" id="tab-smscfg">
-      <h3 style="margin:0 0 12px;color:var(--pink-dark)">📱 SMS 接码配置</h3>
+      <h3 style="margin:0 0 12px;color:var(--pink-dark)">📱 SMS Verification Configuration</h3>
       <div class="form">
         <label class="check">
           <input type="checkbox" id="smsEnabled">
-          <b>启用 SMS 接码</b> <small>（命中 add-phone 时自动租号，否则回退到环境变量路径）</small>
+          <b>Enable SMS verification</b> <small>(rent a number when the add-phone step appears; otherwise use the environment-variable fallback)</small>
         </label>
 
         <fieldset>
-          <legend>接码平台</legend>
+          <legend>SMS provider</legend>
           <label class="check">
             <input type="radio" name="smsProvider" value="smsbower" id="spSmsbower" checked>
-            SmsBower <small>（<a href="https://smsbower.app/cn?ref=499410" target="_blank" rel="noopener">前往注册</a>，支持号码复用 + 立即取消退款）</small>
+            SmsBower <small>(<a href="https://smsbower.app/en?ref=499410" target="_blank" rel="noopener">Register</a>; supports number reuse and immediate cancellation refunds)</small>
           </label>
           <label class="check">
             <input type="radio" name="smsProvider" value="herosms" id="spHerosms">
-            HeroSMS <small>（<a href="https://hero-sms.com/?ref=738021" target="_blank" rel="noopener">前往注册</a>，取消后 20 分钟自动退款）</small>
+            HeroSMS <small>(<a href="https://hero-sms.com/?ref=738021" target="_blank" rel="noopener">Register</a>; automatic refund 20 minutes after cancellation)</small>
           </label>
         </fieldset>
 
         <label>API Key
-          <input id="smsApiKey" placeholder="留空表示不修改（已设置）" type="password">
+          <input id="smsApiKey" placeholder="Leave blank to keep the configured value" type="password">
         </label>
 
         <div class="row">
-          <label style="flex:1">默认国家 <small>（不启用自动选号时强制用这个）</small>
+          <label style="flex:1">Default country <small>(used when automatic selection is disabled)</small>
             <select id="smsCountry"></select>
           </label>
-          <label style="flex:1">Service 代码 <small>（OpenAI = dr）</small>
+          <label style="flex:1">Service code <small>(OpenAI = dr)</small>
             <input id="smsService" placeholder="dr">
           </label>
         </div>
 
         <div class="row">
-          <label style="flex:1">号码最高单价 <small>（SmsBower，单位平台货币；空 = 不限）</small>
+          <label style="flex:1">Maximum price per number <small>(SmsBower platform currency; blank = unlimited)</small>
             <input id="smsMaxPrice" placeholder="0.5">
           </label>
-          <label style="flex:1">同号成功复用上限 <small>（SmsBower，默认 3）</small>
+          <label style="flex:1">Successful reuse limit per number <small>(SmsBower; default: 3)</small>
             <input id="smsPhoneSuccessMax" placeholder="3" type="number" min="0" max="10">
           </label>
         </div>
 
         <label class="check">
           <input type="checkbox" id="smsReusePhone">
-          <b>启用号码复用</b> <small>（SmsBower：同一个号在生命周期内复用多次，省钱）</small>
+          <b>Enable number reuse</b> <small>(SmsBower: reuse a number during its lifecycle to reduce cost)</small>
         </label>
 
         <fieldset>
-          <legend>自动选择最优国家（按价格 + 库存）</legend>
+          <legend>Automatic Country Selection (by price and stock)</legend>
           <label class="check">
             <input type="checkbox" id="smsAutoCountry">
-            <b>启用自动选国家</b> <small>（从下面"允许的国家"里按价格 + 库存自动挑最优）</small>
+            <b>Enable automatic country selection</b> <small>(choose the best allowed country by price and stock)</small>
           </label>
           <div class="row">
-            <label style="flex:1">最低库存
+            <label style="flex:1">Minimum stock
               <input id="smsAutoMinStock" placeholder="20" type="number" min="1">
             </label>
-            <label style="flex:1">最高单价（0 = 不限）
+            <label style="flex:1">Maximum price (0 = unlimited)
               <input id="smsAutoMaxPrice" placeholder="0">
             </label>
           </div>
 
           <label style="display:block;margin-top:8px">
-            允许使用的国家 <small>（多选；空 = 全部国家可用）</small>
+            Allowed countries <small>(multi-select; blank = all countries)</small>
           </label>
-          <input type="text" id="smsCountrySearch" placeholder="🔍 搜索国家名称或 ID..."
+          <input type="text" id="smsCountrySearch" placeholder="🔍 Search by country name or ID..."
                  style="width:100%;padding:8px;margin-bottom:8px;border:1px solid var(--pink-light);border-radius:6px;font-size:14px">
           <div id="smsAllowedCountriesBox"
                style="max-height:200px;overflow-y:auto;border:1px solid var(--pink-light);border-radius:8px;padding:8px;background:#fff;display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:4px">
-            <em style="grid-column:1/-1;color:#aaa;font-size:12px">加载中...</em>
+            <em style="grid-column:1/-1;color:#aaa;font-size:12px">Loading...</em>
           </div>
           <div class="row" style="margin-top:6px">
-            <button type="button" id="btnClearAllowedCountries">🗑️ 清空</button>
+            <button type="button" id="btnClearAllowedCountries">🗑️ Clear</button>
             <span id="smsAllowedCountryCount" style="font-size:12px;color:var(--pink-dark);margin-left:8px"></span>
           </div>
         </fieldset>
 
         <fieldset>
-          <legend>失败重试策略</legend>
+          <legend>Retry Policy</legend>
           <div class="row">
-            <label style="flex:1">最多换号次数 <small>（空 = 用平台默认: 默认 3；自定义请填正整数）</small>
-              <input id="smsMaxPhoneAttempts" placeholder="留空使用平台默认" type="number" min="1" max="20">
+            <label style="flex:1">Maximum replacement attempts <small>(blank = provider default, usually 3; custom values must be positive integers)</small>
+              <input id="smsMaxPhoneAttempts" placeholder="Leave blank to use the provider default" type="number" min="1" max="20">
             </label>
-            <label style="flex:1">单号等待秒数 <small>（默认 80 = 20s × 3 次 OpenAI resend + 20s 缓冲）</small>
+            <label style="flex:1">Timeout per number <small>(default: 80 seconds = three 20-second OpenAI resend intervals plus a 20-second buffer)</small>
               <input id="smsPerPhoneTimeout" placeholder="80" type="number" min="40" max="600">
             </label>
           </div>
           <p class="hint" style="margin:6px 0 0;font-size:12px">
-            💡 流程：每号窗口内每 20s 触发一次 OpenAI 端 resend（最多 3 次）。
-            失败时立刻 cancel 当前号 + 换新号继续，不浪费时间。
+            💡 During each number's window, request an OpenAI resend every 20 seconds, up to three times.
+            On failure, cancel the current number immediately and continue with a replacement.
           </p>
         </fieldset>
 
         <div class="row">
-          <button id="btnSaveSmsCfg" class="primary">💾 保存配置</button>
-          <button id="btnTestSms">🔌 测试余额</button>
+          <button id="btnSaveSmsCfg" class="primary">💾 Save Configuration</button>
+          <button id="btnTestSms">🔌 Test Balance</button>
           <span id="smsCfgResult" class="result"></span>
         </div>
       </div>
     </div>
 
     <div class="tab-content hidden" id="tab-exportcfg">
-      <h3 style="margin:0 0 12px;color:var(--pink-dark)">📤 注册完成后自动导出</h3>
+      <h3 style="margin:0 0 12px;color:var(--pink-dark)">📤 Automatic Export After Registration</h3>
       <p class="hint">
-        勾选启用后，每次注册成功并落库后，会把凭证导出到对应的面板。<br>
-        ⚠️ <b>没勾选时完全不执行</b>，不影响原有注册流程。
-        导出失败只记日志，不会让注册算 failed。
+        When enabled, credentials are exported to the selected dashboard after each successful registration is saved.<br>
+        ⚠️ <b>Disabled targets are never called</b>, so the existing registration flow is unaffected.
+        Export failures are logged and do not mark registration as failed.
       </p>
 
       <div class="form">
 
         <!-- ── CPA ── -->
         <fieldset>
-          <legend>🅰️ CPA 面板</legend>
+          <legend>🅰️ CPA Dashboard</legend>
           <label class="check">
             <input type="checkbox" id="cpaEnabled">
-            <b>启用 CPA 自动导出</b>
-            <small>（POST /v0/management/auth-files，导入 codex auth JSON）</small>
+            <b>Enable automatic CPA export</b>
+            <small>(POST /v0/management/auth-files; imports Codex auth JSON)</small>
           </label>
 
-          <label>CPA URL <small>（面板基地址，如 https://cpa.example.com）</small>
+          <label>CPA URL <small>(dashboard base URL, e.g. https://cpa.example.com)</small>
             <input id="cpaUrl" placeholder="https://cpa.example.com">
           </label>
-          <label>管理密钥 <small>（Authorization Bearer + X-Management-Key）</small>
-            <input id="cpaMgmtKey" placeholder="留空表示不修改（已设置）" type="password">
+          <label>Management key <small>(Authorization Bearer + X-Management-Key)</small>
+            <input id="cpaMgmtKey" placeholder="Leave blank to keep the configured value" type="password">
           </label>
 
-          <label>超时 (秒)
+          <label>Timeout (seconds)
             <input id="cpaTimeout" type="number" min="5" max="300" placeholder="30">
           </label>
 
           <div class="row">
-            <button id="btnTestCpa">🔌 测试 CPA 连通性</button>
+            <button id="btnTestCpa">🔌 Test CPA Connection</button>
             <span id="cpaTestResult" class="result"></span>
           </div>
         </fieldset>
 
         <!-- ── SUB2API ── -->
         <fieldset>
-          <legend>🅱️ SUB2API 订阅 API 管理面板</legend>
+          <legend>🅱️ SUB2API Subscription API Dashboard</legend>
           <label class="check">
             <input type="checkbox" id="sub2apiEnabled">
-            <b>启用 SUB2API 自动导出</b>
-            <small>（POST /api/v1/admin/accounts，x-api-key 鉴权）</small>
+            <b>Enable automatic SUB2API export</b>
+            <small>(POST /api/v1/admin/accounts; authenticated with x-api-key)</small>
           </label>
 
           <label>SUB2API URL
             <input id="sub2apiUrl" placeholder="https://sub2api.example.com">
           </label>
 
-          <label>API Key <small>（安全与认证-管理员 API Key）</small>
-            <input id="sub2apiApiKey" placeholder="留空表示不修改（已设置）" type="password">
+          <label>API Key <small>(Security & Authentication → Administrator API Key)</small>
+            <input id="sub2apiApiKey" placeholder="Leave blank to keep the configured value" type="password">
           </label>
 
-          <label>分组 IDs <small>（逗号分隔，例如 "2" 或 "1,2,3"，默认 2）</small>
+          <label>Group IDs <small>(comma-separated, e.g. "2" or "1,2,3"; default: 2)</small>
             <input id="sub2apiGroupIds" placeholder="2">
           </label>
 
-          <label>超时 (秒)
+          <label>Timeout (seconds)
             <input id="sub2apiTimeout" type="number" min="5" max="300" placeholder="30">
           </label>
 
           <div class="row">
-            <button id="btnTestSub2api">🔌 测试 SUB2API 连通性</button>
+            <button id="btnTestSub2api">🔌 Test SUB2API Connection</button>
             <span id="sub2apiTestResult" class="result"></span>
           </div>
         </fieldset>
 
         <div class="row">
-          <button id="btnSaveExportCfg" class="primary">💾 保存配置</button>
+          <button id="btnSaveExportCfg" class="primary">💾 Save Configuration</button>
           <span id="exportCfgResult" class="result"></span>
         </div>
       </div>
@@ -409,12 +409,12 @@
 
 </main>
 
-<!-- 凭证查看模态框 -->
+<!-- Credential viewer modal. -->
 <div class="modal hidden" id="credModal">
   <div class="modal-body">
     <div class="modal-head">
-      <h3 id="credTitle">凭证</h3>
-      <button id="credCopyJson">📋 复制全部 JSON</button>
+      <h3 id="credTitle">Credentials</h3>
+      <button id="credCopyJson">📋 Copy All JSON</button>
       <button id="credClose">✕</button>
     </div>
     <div id="credFields" class="cred-fields"></div>

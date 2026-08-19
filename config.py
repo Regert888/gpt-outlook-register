@@ -1,7 +1,8 @@
-"""最小化 Config（仅 browser_register.py 用到的字段）。
+"""Minimal configuration used by browser_register.py.
 
-剥离自原 CTF-reg/config.py，去掉 card / billing / stripe / captcha 等支付相关字段，
-仅保留注册阶段必需的 proxy 字段。
+Derived from the original CTF-reg/config.py with card, billing, Stripe,
+captcha, and other payment-related fields removed. Only the proxy setting
+required during registration remains.
 """
 from __future__ import annotations
 
@@ -11,7 +12,7 @@ from typing import Optional
 
 @dataclass
 class Config:
-    """ChatGPT 注册最小配置。"""
-    # 出口代理 URL，例：socks5://user:pass@host:port  或  socks5://127.0.0.1:18899
-    # 留 None 走系统直连
+    """Minimal ChatGPT registration configuration."""
+    # Egress proxy URL, for example socks5://user:pass@host:port or
+    # socks5://127.0.0.1:18899. Leave as None for a direct connection.
     proxy: Optional[str] = None
